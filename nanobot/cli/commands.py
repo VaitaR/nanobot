@@ -519,7 +519,27 @@ def gateway(
     config = _load_runtime_config(config, workspace)
     port = port if port is not None else config.gateway.port
 
+    # Set up rotating file logging via loguru.
+    # Replaces the default stderr handler (which start.sh captures to gateway.log)
+    # with a rotating file handler to prevent unbounded log growth.
+    from loguru import logger
+
+    log_cfg = config.gateway.logging
+    log_path = Path(log_cfg.file).expanduser()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    logger.remove()
+    logger.add(sys.stderr, level="WARNING")
+    logger.add(
+        str(log_path),
+        rotation=log_cfg.rotation,
+        retention=log_cfg.retention,
+        level=log_cfg.level,
+        encoding="utf-8",
+    )
+
     console.print(f"{__logo__} Starting nanobot gateway version {__version__} on port {port}...")
+    console.print(f"[dim]Log: {log_path} (rotate: {log_cfg.rotation}, retain: {log_cfg.retention})[/dim]")
     sync_workspace_templates(config.workspace_path)
     bus = MessageBus()
     provider = _make_provider(config)
@@ -662,6 +682,7 @@ def gateway(
         enabled=hb_cfg.enabled,
         timezone=config.agents.defaults.timezone,
     )
+    agent.heartbeat_service = heartbeat
 
     if channels.enabled_channels:
         console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")

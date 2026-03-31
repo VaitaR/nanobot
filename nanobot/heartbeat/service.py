@@ -176,12 +176,19 @@ class HeartbeatService:
         except Exception:
             logger.exception("Heartbeat execution failed")
 
-    async def trigger_now(self) -> str | None:
-        """Manually trigger a heartbeat."""
+    async def trigger_now(self) -> dict:
+        """Manually trigger a heartbeat and return a structured result.
+
+        Returns a dict with:
+            - ``action``: ``"skip"`` or ``"run"``
+            - ``tasks``: natural-language summary (empty for skip)
+            - ``result``: execution response (only for run)
+        """
         content = self._read_heartbeat_file()
         if not content:
-            return None
+            return {"action": "skip", "tasks": "", "result": "HEARTBEAT.md missing or empty"}
         action, tasks = await self._decide(content)
         if action != "run" or not self.on_execute:
-            return None
-        return await self.on_execute(tasks)
+            return {"action": "skip", "tasks": tasks, "result": ""}
+        result = await self.on_execute(tasks)
+        return {"action": "run", "tasks": tasks, "result": result or ""}

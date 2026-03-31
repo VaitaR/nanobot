@@ -96,12 +96,22 @@ class HeartbeatConfig(Base):
     keep_recent_messages: int = 8
 
 
+class GatewayLoggingConfig(Base):
+    """Gateway logging configuration (loguru rotating file handler)."""
+
+    file: str = "~/.nanobot/logs/gateway.log"
+    rotation: str = "10 MB"
+    retention: str = "7 days"
+    level: str = "DEBUG"
+
+
 class GatewayConfig(Base):
     """Gateway/server configuration."""
 
     host: str = "0.0.0.0"
     port: int = 18790
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
+    logging: GatewayLoggingConfig = Field(default_factory=GatewayLoggingConfig)
 
 
 class WebSearchConfig(Base):

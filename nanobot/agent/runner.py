@@ -214,6 +214,7 @@ class AgentRunner:
                 "name": tool_call.name,
                 "status": "error",
                 "detail": str(exc),
+                "arguments": dict(tool_call.arguments),
             }
             if spec.fail_on_tool_error:
                 return f"Error: {type(exc).__name__}: {exc}", event, exc
@@ -229,4 +230,5 @@ class AgentRunner:
             "name": tool_call.name,
             "status": "error" if isinstance(result, str) and result.startswith("Error") else "ok",
             "detail": detail,
+            "arguments": dict(tool_call.arguments),
         }, None

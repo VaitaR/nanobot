@@ -540,10 +540,16 @@ class TelegramChannel(BaseChannel):
 
         now = time.monotonic()
         if buf.message_id is None:
+            # Extract thread_id for forum groups (same pattern as send())
+            message_thread_id = meta.get("message_thread_id")
+            thread_kwargs = {}
+            if message_thread_id is not None:
+                thread_kwargs["message_thread_id"] = message_thread_id
             try:
                 sent = await self._call_with_retry(
                     self._app.bot.send_message,
                     chat_id=int_chat_id, text=buf.text,
+                    **thread_kwargs,
                 )
                 buf.message_id = sent.message_id
                 buf.last_edit = now

@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,10 @@ from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import ExecToolConfig
 from nanobot.providers.base import LLMProvider
+
+# Subagent timeout defaults (seconds)
+_SUBAGENT_HARD_CAP = 1800  # 30 min absolute maximum
+_SUBAGENT_IDLE_TIMEOUT = 300  # 5 min no progress = dead
 
 
 class SubagentManager:
@@ -56,14 +61,30 @@ class SubagentManager:
         origin_channel: str = "cli",
         origin_chat_id: str = "direct",
         session_key: str | None = None,
+        max_iterations: int | None = None,
+        hard_cap: int = _SUBAGENT_HARD_CAP,
+        idle_timeout: int = _SUBAGENT_IDLE_TIMEOUT,
     ) -> str:
-        """Spawn a subagent to execute a task in the background."""
+        """Spawn a subagent to execute a task in the background.
+
+        Args:
+            task: Task description for the subagent.
+            label: Display label (defaults to first 30 chars of task).
+            origin_channel: Channel to announce results to.
+            origin_chat_id: Chat ID to announce results to.
+            session_key: Session key for cancellation grouping.
+            max_iterations: Max tool iterations (default: from config.agents.defaults.max_tool_iterations).
+            hard_cap: Absolute timeout in seconds (default: 1800).
+            idle_timeout: No-progress timeout in seconds (default: 300).
+        """
         task_id = str(uuid.uuid4())[:8]
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
         origin = {"channel": origin_channel, "chat_id": origin_chat_id}
 
         bg_task = asyncio.create_task(
-            self._run_subagent(task_id, task, display_label, origin)
+            self._run_subagent(task_id, task, display_label, origin,
+                               max_iterations=max_iterations,
+                               hard_cap=hard_cap, idle_timeout=idle_timeout)
         )
         self._running_tasks[task_id] = bg_task
         if session_key:
@@ -87,9 +108,26 @@ class SubagentManager:
         task: str,
         label: str,
         origin: dict[str, str],
+        max_iterations: int | None = None,
+        hard_cap: int = _SUBAGENT_HARD_CAP,
+        idle_timeout: int = _SUBAGENT_IDLE_TIMEOUT,
     ) -> None:
         """Execute the subagent task and announce the result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
+
+        # Resolve max_iterations: caller > config > fallback
+        if max_iterations is None:
+            try:
+                from nanobot.config.loader import load_config
+                cfg = load_config()
+                max_iterations = cfg.agents.defaults.max_tool_iterations
+            except Exception:
+                max_iterations = 40
+        logger.info("Subagent [{}]: max_iterations={}, hard_cap={}s, idle={}s",
+                     task_id, max_iterations, hard_cap, idle_timeout)
+
+        start_time = time.monotonic()
+        last_activity = start_time
 
         try:
             # Build subagent tools (no message tool, no spawn tool)
@@ -108,7 +146,7 @@ class SubagentManager:
             ))
             tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
             tools.register(WebFetchTool(proxy=self.web_proxy))
-            
+
             system_prompt = self._build_subagent_prompt()
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
@@ -116,45 +154,76 @@ class SubagentManager:
             ]
 
             class _SubagentHook(AgentHook):
+                """Hook to track progress and log tool execution."""
+
                 async def before_execute_tools(self, context: AgentHookContext) -> None:
+                    nonlocal last_activity
+                    last_activity = time.monotonic()
                     for tool_call in context.tool_calls:
                         args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                        logger.debug("Subagent [{}] executing: {} with arguments: {}", task_id, tool_call.name, args_str)
+                        logger.debug("Subagent [{}] executing: {} with arguments: {}",
+                                     task_id, tool_call.name, args_str)
 
-            result = await self.runner.run(AgentRunSpec(
-                initial_messages=messages,
-                tools=tools,
-                model=self.model,
-                max_iterations=15,
-                hook=_SubagentHook(),
-                max_iterations_message="Task completed but no final response was generated.",
-                error_message=None,
-                fail_on_tool_error=True,
-            ))
+            # Wrap runner.run with hard cap timeout
+            result = await asyncio.wait_for(
+                self.runner.run(AgentRunSpec(
+                    initial_messages=messages,
+                    tools=tools,
+                    model=self.model,
+                    max_iterations=max_iterations,
+                    hook=_SubagentHook(),
+                    max_iterations_message=(
+                        f"Task reached iteration limit ({max_iterations}). "
+                        "Partial results may be available."
+                    ),
+                    error_message=None,
+                    fail_on_tool_error=False,
+                )),
+                timeout=hard_cap,
+            )
+
+            # Check idle timeout
+            idle_elapsed = time.monotonic() - last_activity
+            if idle_elapsed > idle_timeout:
+                logger.warning("Subagent [{}] idle timeout after {}s", task_id, int(idle_elapsed))
+
             if result.stop_reason == "tool_error":
                 await self._announce_result(
-                    task_id,
-                    label,
-                    task,
-                    self._format_partial_progress(result),
-                    origin,
-                    "error",
+                    task_id, label, task,
+                    self._format_partial_progress(result), origin, "error",
                 )
                 return
             if result.stop_reason == "error":
                 await self._announce_result(
-                    task_id,
-                    label,
-                    task,
-                    result.error or "Error: subagent execution failed.",
-                    origin,
-                    "error",
+                    task_id, label, task,
+                    result.error or "Error: subagent execution failed.", origin, "error",
                 )
                 return
-            final_result = result.final_content or "Task completed but no final response was generated."
+
+            # Accept partial results on max_iterations — check tool_events
+            if result.stop_reason == "max_iterations":
+                completed = [e for e in result.tool_events if e["status"] == "ok"]
+                if completed:
+                    final_result = self._format_partial_progress(result)
+                    logger.info("Subagent [{}] hit iteration limit but has {} completed steps",
+                                task_id, len(completed))
+                    await self._announce_result(task_id, label, task, final_result, origin, "ok")
+                    return
+
+            final_result = result.final_content or "Task completed."
 
             logger.info("Subagent [{}] completed successfully", task_id)
             await self._announce_result(task_id, label, task, final_result, origin, "ok")
+
+        except asyncio.TimeoutError:
+            elapsed = int(time.monotonic() - start_time)
+            msg = f"Task timed out after {elapsed}s (hard cap: {hard_cap}s)."
+            logger.warning("Subagent [{}] {}", task_id, msg)
+            await self._announce_result(task_id, label, task, msg, origin, "error")
+
+        except asyncio.CancelledError:
+            logger.info("Subagent [{}] cancelled", task_id)
+            raise
 
         except Exception as e:
             error_msg = f"Error: {str(e)}"

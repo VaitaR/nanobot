@@ -50,16 +50,41 @@ class SpawnTool(Tool):
                     "type": "string",
                     "description": "Optional short label for the task (for display)",
                 },
+                "max_iterations": {
+                    "type": "integer",
+                    "description": (
+                        "Max tool iterations for this subagent. "
+                        "Default: read from config (40). "
+                        "Use 15 for quick tasks, 50+ for long research/implementation."
+                    ),
+                },
+                "hard_cap": {
+                    "type": "integer",
+                    "description": (
+                        "Absolute timeout in seconds. Default: 1800 (30 min). "
+                        "Max allowed: 3600 (1 hour)."
+                    ),
+                },
             },
             "required": ["task"],
         }
 
-    async def execute(self, task: str, label: str | None = None, **kwargs: Any) -> str:
+    async def execute(self, task: str, label: str | None = None,
+                      max_iterations: int | None = None,
+                      hard_cap: int | None = None,
+                      **kwargs: Any) -> str:
         """Spawn a subagent to execute the given task."""
-        return await self._manager.spawn(
+        # Build kwargs — only pass non-None values so manager defaults apply
+        spawn_kwargs: dict[str, Any] = dict(
             task=task,
             label=label,
             origin_channel=self._origin_channel,
             origin_chat_id=self._origin_chat_id,
             session_key=self._session_key,
         )
+        if max_iterations is not None:
+            spawn_kwargs["max_iterations"] = max_iterations
+        # Cap hard_cap at 1 hour for safety; omit to use manager default (1800s)
+        if hard_cap is not None:
+            spawn_kwargs["hard_cap"] = min(hard_cap, 3600)
+        return await self._manager.spawn(**spawn_kwargs)
