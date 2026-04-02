@@ -112,40 +112,52 @@ class TestBudgetExceeded:
         return builder
 
     def test_budget_truncates_skills_summary(self, tmp_path: Path) -> None:
-        """Budget excludes only skills_summary."""
-        # Total chars ~ 1500 + separators. Budget ~ 250 tokens → 1000 chars.
-        builder = self._setup_full_builder(tmp_path, budget=250)
+        """Budget drops skills_summary first."""
+        # Total chars ~ 1500 + 4 separators = 1528 → 382 tokens. Budget=400 → 1600 chars.
+        # After dropping skills_summary (500+7=507): 1021 → 255 tokens ≤ 400. Keep the rest.
+        builder = self._setup_full_builder(tmp_path, budget=400)
         result = builder.build_system_prompt()
         assert "# Skills" not in result
         assert "# Memory" in result
         assert "# Active Skills" in result
 
     def test_budget_truncates_always_skills(self, tmp_path: Path) -> None:
-        """Budget excludes skills_summary and always_skills."""
-        # ~1200 non-skills-summary chars. Budget ~ 200 tokens → 800 chars.
-        builder = self._setup_full_builder(tmp_path, budget=200)
+        """Budget drops skills_summary and always_skills."""
+        # Total ~1528 chars → 382 tokens. Budget=250 → 1000 chars.
+        # After dropping skills_summary (507): 1021→255 tokens > 250.
+        # After dropping always_skills (300+7=307): 714→178 tokens ≤ 250.
+        builder = self._setup_full_builder(tmp_path, budget=250)
         result = builder.build_system_prompt()
         assert "# Skills" not in result
         assert "# Active Skills" not in result
         assert "# Memory" in result
 
     def test_budget_truncates_memory(self, tmp_path: Path) -> None:
-        """Budget excludes skills_summary, always_skills, and memory."""
-        # ~300 identity+bootstrap chars. Budget ~ 50 tokens → 200 chars.
+        """Budget drops skills_summary, always_skills, bootstrap; truncates memory."""
+        # Total ~1528 chars → 382 tokens. Budget=50 → 200 chars.
+        # Drop skills_summary (507): 1021→255 > 50.
+        # Drop always_skills (307): 714→178 > 50.
+        # Drop bootstrap (200+7=207): 507→126 > 50.
+        # Truncate memory: identity=100, need total ≤ 200. Memory budget = 200-100-7=93 chars.
         builder = self._setup_full_builder(tmp_path, budget=50)
         result = builder.build_system_prompt()
         assert "# Skills" not in result
         assert "# Active Skills" not in result
-        assert "# Memory" not in result
+        # Memory is truncated (still has header), not removed entirely
+        assert "# Memory" in result
+        # Memory should be heavily truncated (400 → ~93 chars)
+        memory_section = result.split("# Memory\n\n")[-1] if "# Memory\n\n" in result else ""
+        assert len(memory_section) < 200
 
     def test_identity_never_truncated(self, tmp_path: Path) -> None:
         """Even with a tiny budget, identity is always kept."""
         # Identity is 100 chars → 25 tokens. Budget = 25 tokens exactly.
+        # Total ~1528 → 382 tokens. Drops skills, always, bootstrap, truncates memory.
+        # After all drops: identity=100, memory truncated to fit. Memory budget ≈ 0 chars.
         builder = self._setup_full_builder(tmp_path, budget=25)
         result = builder.build_system_prompt()
         # Identity is always present (no header, just raw content)
         assert len(result) > 0
-        assert "# Memory" not in result
         assert "# Skills" not in result
 
     def test_memory_truncated_when_needed(self, tmp_path: Path) -> None:
@@ -206,15 +218,24 @@ class TestSeparatorOverhead:
 class TestTruncationWarnings:
     """Truncation should log warnings."""
 
-    def test_truncation_logs_warning(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
-        builder = _make_builder(tmp_path, system_prompt_max_tokens=10)
-        builder._get_identity = MagicMock(return_value=_gen_chars(100))  # type: ignore[method-assign]
-        builder._load_bootstrap_files = MagicMock(return_value=_gen_chars(200))  # type: ignore[method-assign]
-        builder.memory.get_memory_context = MagicMock(return_value=_gen_chars(300))  # type: ignore[union-attr]
-        builder.skills.get_always_skills = MagicMock(return_value=[])  # type: ignore[union-attr]
-        builder.skills.build_skills_summary = MagicMock(return_value=_gen_chars(400))  # type: ignore[union-attr]
+    def test_truncation_logs_warning(self, tmp_path: Path) -> None:
+        import io
+        from loguru import logger as _logger
 
-        with caplog.at_level("WARNING", logger="nanobot"):
+        # Add a string sink to capture warnings
+        buf = io.StringIO()
+        sink_id = _logger.add(buf, level="WARNING", filter=lambda r: "budget exceeded" in r["message"].lower())
+
+        try:
+            builder = _make_builder(tmp_path, system_prompt_max_tokens=250)
+            builder._get_identity = MagicMock(return_value=_gen_chars(100))  # type: ignore[method-assign]
+            builder._load_bootstrap_files = MagicMock(return_value=_gen_chars(200))  # type: ignore[method-assign]
+            builder.memory.get_memory_context = MagicMock(return_value=_gen_chars(400))  # type: ignore[union-attr]
+            builder.skills.get_always_skills = MagicMock(return_value=["s1"])  # type: ignore[union-attr]
+            builder.skills.load_skills_for_context = MagicMock(return_value=_gen_chars(300))  # type: ignore[union-attr]
+            builder.skills.build_skills_summary = MagicMock(return_value=_gen_chars(500))  # type: ignore[union-attr]
+
             builder.build_system_prompt()
-
-        assert any("System prompt budget exceeded" in r.message for r in caplog.records)
+            assert "System prompt budget exceeded" in buf.getvalue()
+        finally:
+            _logger.remove(sink_id)

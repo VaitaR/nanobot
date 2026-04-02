@@ -88,8 +88,8 @@ class ContextBuilder:
         if total_chars // _CHARS_PER_TOKEN <= budget:
             return parts
 
-        # Priority: identity (keep) > bootstrap > memory > always_skills > skills_summary
-        removable = ["skills_summary", "always_skills", "memory", "bootstrap"]
+        # Priority: identity (never removed/truncated) > bootstrap > memory (truncated) > always_skills > skills_summary
+        removable = ["skills_summary", "always_skills", "bootstrap"]
         result = list(parts)
 
         for label in removable:
@@ -108,12 +108,11 @@ class ContextBuilder:
                 section_chars,
             )
 
-        # If still over budget, truncate memory (the only section we truncate)
+        # Truncate memory if still over budget (identity is never touched)
         if total_chars // _CHARS_PER_TOKEN > budget:
             mem_idx = next((i for i, (l, _) in enumerate(result) if l == "memory"), None)
             if mem_idx is not None:
                 remaining = budget * _CHARS_PER_TOKEN
-                # Account for separators
                 remaining -= sum(len(c) for l, c in result if l != "memory")
                 remaining -= _SEPARATOR.__len__() * max(0, len(result) - 1)
                 # TODO: smart memory truncation (LLM summarization) instead of raw character cutoff

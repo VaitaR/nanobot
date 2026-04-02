@@ -19,7 +19,6 @@ from loguru import logger
 
 from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.agent.result_envelope import ResultEnvelope, extract_artifacts
-from nanobot.agent.verify import verify_envelope
 from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.task_lifecycle import (
@@ -32,6 +31,7 @@ from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTo
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
+from nanobot.agent.verify import verify_envelope
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import ExecToolConfig
@@ -40,6 +40,7 @@ from nanobot.providers.base import LLMProvider
 # Subagent timeout defaults (seconds)
 _SUBAGENT_HARD_CAP = 1800  # 30 min absolute maximum
 _SUBAGENT_IDLE_TIMEOUT = 300  # 5 min no progress = dead
+_WATCHDOG_POLL_INTERVAL = 30  # seconds between idle-activity checks
 
 
 class SubagentManager:
@@ -256,19 +257,66 @@ class SubagentManager:
                 wall_clock_cap=hard_cap,
             )
 
-            # Wall-clock safety net (1.5× hard cap) prevents pathological pauses
-            result = await asyncio.wait_for(self.runner.run(spec), timeout=hard_cap * 1.5)
+            # ── Execute with concurrent idle watchdog ────────────────────
+            run_task: asyncio.Task = asyncio.create_task(self.runner.run(spec))
+
+            async def _idle_watchdog() -> None:
+                """Cancel run_task if no progress detected for idle_timeout seconds."""
+                while not run_task.done():
+                    await asyncio.sleep(_WATCHDOG_POLL_INTERVAL)
+                    if not run_task.done() and (time.monotonic() - last_activity) > idle_timeout:
+                        logger.warning(
+                            "Subagent [{}] idle for {}s (timeout: {}s)",
+                            task_id, int(time.monotonic() - last_activity), idle_timeout,
+                        )
+                        run_task.cancel()
+                        return
+
+            watchdog: asyncio.Task = asyncio.create_task(_idle_watchdog())
+
+            try:
+                done, _pending = await asyncio.wait(
+                    {run_task, watchdog}, timeout=hard_cap,
+                )
+                if run_task in done:
+                    try:
+                        result = run_task.result()
+                    except asyncio.CancelledError:
+                        # Runner cancelled by idle watchdog
+                        idle_secs = int(time.monotonic() - last_activity)
+                        raise asyncio.TimeoutError(
+                            f"Task idle for {idle_secs}s without progress"
+                            f" (timeout: {idle_timeout}s)."
+                        )
+                else:
+                    # Wall-clock timeout — neither task completed in time
+                    run_task.cancel()
+                    watchdog.cancel()
+                    await asyncio.gather(run_task, watchdog, return_exceptions=True)
+                    elapsed = int(time.monotonic() - start_time)
+                    raise asyncio.TimeoutError(
+                        f"Task timed out after {elapsed}s (hard cap: {hard_cap}s)."
+                    )
+            except asyncio.CancelledError:
+                # External cancellation (e.g. cancel_by_session) — propagate
+                # to the runner so in-flight tool calls are interrupted.
+                run_task.cancel()
+                watchdog.cancel()
+                await asyncio.gather(run_task, watchdog, return_exceptions=True)
+                raise
+            finally:
+                if not watchdog.done():
+                    watchdog.cancel()
+                    try:
+                        await watchdog
+                    except (asyncio.CancelledError, Exception):
+                        pass
 
             # Phase 1: post-run checkpoint analysis
             if checkpoint_policy is not None:
                 await self._post_run_checkpoint(
                     task_id, label, task, origin, max_iterations, result, checkpoint_policy,
                 )
-
-            # Check idle timeout
-            idle_elapsed = time.monotonic() - last_activity
-            if idle_elapsed > idle_timeout:
-                logger.warning("Subagent [{}] idle timeout after {}s", task_id, int(idle_elapsed))
 
             if result.stop_reason == "tool_error":
                 if nb_task_id:
@@ -374,9 +422,8 @@ class SubagentManager:
                 origin,
             )
 
-        except asyncio.TimeoutError:
-            elapsed = int(time.monotonic() - start_time)
-            msg = f"Task timed out after {elapsed}s (hard cap: {hard_cap}s)."
+        except asyncio.TimeoutError as e:
+            msg = str(e) or f"Task timed out (hard cap: {hard_cap}s)."
             logger.warning("Subagent [{}] {}", task_id, msg)
             if nb_task_id:
                 await mark_task_delegation_failure(nb_task_id, msg)

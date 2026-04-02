@@ -1,8 +1,14 @@
 """Event types for the message bus."""
 
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
+
+
+def generate_request_id() -> str:
+    """Generate a short correlation ID for request tracing."""
+    return uuid.uuid4().hex[:12]
 
 
 @dataclass
@@ -17,6 +23,7 @@ class InboundMessage:
     media: list[str] = field(default_factory=list)  # Media URLs
     metadata: dict[str, Any] = field(default_factory=dict)  # Channel-specific data
     session_key_override: str | None = None  # Optional override for thread-scoped sessions
+    request_id: str | None = None  # OBS-001: correlation ID for request tracing
 
     @property
     def session_key(self) -> str:
