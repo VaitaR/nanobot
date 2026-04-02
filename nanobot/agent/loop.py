@@ -35,7 +35,13 @@ from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
-    from nanobot.config.schema import ChannelsConfig, CostPolicy, ExecToolConfig, WebSearchConfig
+    from nanobot.config.schema import (
+        ChannelsConfig,
+        ConfirmationRuleConfig,
+        CostPolicy,
+        ExecToolConfig,
+        WebSearchConfig,
+    )
     from nanobot.cron.service import CronService
 
 
@@ -72,6 +78,7 @@ class AgentLoop:
         channels_config: ChannelsConfig | None = None,
         timezone: str | None = None,
         cost_policy: CostPolicy | None = None,
+        confirmation_rules: list[ConfirmationRuleConfig] | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig, WebSearchConfig
 
@@ -99,7 +106,16 @@ class AgentLoop:
             system_prompt_max_tokens=system_prompt_max_tokens,
         )
         self.sessions = session_manager or SessionManager(workspace)
-        self.tools = ToolRegistry()
+
+        # Build confirmation policy from config rules
+        from nanobot.agent.tools.confirmation import ConfirmationPolicy
+        if confirmation_rules:
+            policy = ConfirmationPolicy.from_config(
+                [r.model_dump() for r in confirmation_rules]
+            )
+        else:
+            policy = None  # No confirmation rules → no gating
+        self.tools = ToolRegistry(confirmation_policy=policy)
         self.runner = AgentRunner(provider)
         self.subagents = SubagentManager(
             provider=provider,

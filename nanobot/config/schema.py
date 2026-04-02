@@ -154,6 +154,17 @@ class ExecToolConfig(Base):
     path_append: str = ""
     deny_patterns: list[str] = Field(default_factory=list)  # Extra patterns appended to shell.py defaults
 
+
+class ConfirmationRuleConfig(Base):
+    """A single confirmation rule for the confirmation policy.
+
+    Maps 1:1 to ``ConfirmationRule`` in ``nanobot/agent/tools/confirmation.py``.
+    """
+
+    tool: str = "*"  # Tool name to match, or "*" for all tools
+    pattern: str = ""  # Regex pattern matched against tool params
+    action: Literal["confirm", "allow", "deny"] = "confirm"
+
 class MCPServerConfig(Base):
     """MCP server connection configuration (stdio or HTTP)."""
 
@@ -173,6 +184,7 @@ class ToolsConfig(Base):
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
+    confirmation_rules: list[ConfirmationRuleConfig] = Field(default_factory=list)  # Empty = no confirmations; use built-in defaults
 
 
 class Config(BaseSettings):

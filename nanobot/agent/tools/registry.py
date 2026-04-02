@@ -1,8 +1,13 @@
 """Tool registry for dynamic tool management."""
 
-from typing import Any
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
 
 from nanobot.agent.tools.base import Tool
+
+if TYPE_CHECKING:
+    from nanobot.agent.tools.confirmation import ConfirmationPolicy
 
 
 class ToolRegistry:
@@ -12,8 +17,9 @@ class ToolRegistry:
     Allows dynamic registration and execution of tools.
     """
 
-    def __init__(self):
+    def __init__(self, confirmation_policy: ConfirmationPolicy | None = None):
         self._tools: dict[str, Tool] = {}
+        self._confirmation_policy = confirmation_policy
 
     def register(self, tool: Tool) -> None:
         """Register a tool."""
@@ -42,6 +48,16 @@ class ToolRegistry:
         tool = self._tools.get(name)
         if not tool:
             return f"Error: Tool '{name}' not found. Available: {', '.join(self.tool_names)}"
+
+        # --- Confirmation gate ---
+        if self._confirmation_policy is not None:
+            from nanobot.agent.tools.confirmation import CONFIRM_REQUIRED_PREFIX, DENIED_PREFIX
+
+            policy = self._confirmation_policy
+            if policy.is_denied(name, params):
+                return DENIED_PREFIX + policy.describe(name, params)
+            if policy.requires_confirmation(name, params):
+                return CONFIRM_REQUIRED_PREFIX + policy.describe(name, params)
 
         try:
             # Attempt to cast parameters to match schema types

@@ -1,12 +1,11 @@
 """CLI commands for nanobot."""
 
 import asyncio
-from contextlib import contextmanager, nullcontext
-
 import os
 import select
 import signal
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -465,6 +464,7 @@ def _load_runtime_config(config: str | None = None, workspace: str | None = None
 def _warn_deprecated_config_keys(config_path: Path | None) -> None:
     """Hint users to remove obsolete keys from their config file."""
     import json
+
     from nanobot.config.loader import get_config_path
 
     path = config_path or get_config_path()
@@ -571,6 +571,7 @@ def gateway(
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
         timezone=config.agents.defaults.timezone,
+        confirmation_rules=config.tools.confirmation_rules or None,
     )
 
     # Set cron callback (needs agent)
@@ -733,6 +734,7 @@ def gateway(
                     try:
                         await asyncio.sleep(8)  # Let channels connect first
                         import json
+
                         from nanobot import __version__
                         from nanobot.bus.events import OutboundMessage
 
@@ -844,6 +846,7 @@ def agent(
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
         timezone=config.agents.defaults.timezone,
+        confirmation_rules=config.tools.confirmation_rules or None,
     )
 
     # Shared reference for progress callbacks
