@@ -4,22 +4,24 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import os
 import time
 from contextlib import AsyncExitStack, nullcontext
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from loguru import logger
 
 from nanobot.agent.context import ContextBuilder
+from nanobot.agent.cost_guard import CostGuard
 from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.agent.memory import MemoryConsolidator
-from nanobot.agent.runner import AgentRunSpec, AgentRunner
-from nanobot.agent.subagent import SubagentManager
-from nanobot.agent.tools.cron import CronTool
+from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
+from nanobot.agent.subagent import SubagentManager
+from nanobot.agent.telemetry import TelemetryCollector
+from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
@@ -27,13 +29,13 @@ from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
-from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 from nanobot.bus.queue import MessageBus
+from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
-    from nanobot.config.schema import ChannelsConfig, ExecToolConfig, WebSearchConfig
+    from nanobot.config.schema import ChannelsConfig, CostPolicy, ExecToolConfig, WebSearchConfig
     from nanobot.cron.service import CronService
 
 
@@ -49,7 +51,7 @@ class AgentLoop:
     5. Sends responses back
     """
 
-    _TOOL_RESULT_MAX_CHARS = 16_000
+    _TOOL_RESULT_MAX_CHARS = 4_000
 
     def __init__(
         self,
@@ -68,6 +70,7 @@ class AgentLoop:
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
         timezone: str | None = None,
+        cost_policy: CostPolicy | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig, WebSearchConfig
 
@@ -85,6 +88,9 @@ class AgentLoop:
         self.restrict_to_workspace = restrict_to_workspace
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
+        self._cost_guard: CostGuard | None = (
+            CostGuard.from_config(cost_policy) if cost_policy else None
+        )
 
         self.context = ContextBuilder(workspace, timezone=timezone)
         self.sessions = session_manager or SessionManager(workspace)
@@ -124,6 +130,8 @@ class AgentLoop:
             get_tool_definitions=self.tools.get_definitions,
             max_completion_tokens=provider.generation.max_tokens,
         )
+        self.telemetry = TelemetryCollector(workspace)
+        self.heartbeat_service: Any | None = None  # set after construction by gateway
         self._register_default_tools()
         self.commands = CommandRouter()
         register_builtin_commands(self.commands)
@@ -173,12 +181,23 @@ class AgentLoop:
         finally:
             self._mcp_connecting = False
 
-    def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
+    def _set_tool_context(
+        self,
+        channel: str,
+        chat_id: str,
+        message_id: str | None = None,
+        message_thread_id: str | int | None = None,
+    ) -> None:
         """Update context for all tools that need routing info."""
         for name in ("message", "spawn", "cron"):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
-                    tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
+                    extra: list[Any] = []
+                    if name == "message" and message_id is not None:
+                        extra.append(message_id)
+                    if name == "spawn" and message_thread_id is not None:
+                        extra.append(message_thread_id)
+                    tool.set_context(channel, chat_id, *extra)
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
@@ -209,7 +228,8 @@ class AgentLoop:
         channel: str = "cli",
         chat_id: str = "direct",
         message_id: str | None = None,
-    ) -> tuple[str | None, list[str], list[dict]]:
+        message_thread_id: str | int | None = None,
+    ) -> tuple[str | None, list[str], list[dict], dict, str, str | None, list[dict]]:
         """Run the agent iteration loop.
 
         *on_stream*: called with each content delta during streaming.
@@ -252,7 +272,7 @@ class AgentLoop:
                 for tc in context.tool_calls:
                     args_str = json.dumps(tc.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tc.name, args_str[:200])
-                loop_self._set_tool_context(channel, chat_id, message_id)
+                loop_self._set_tool_context(channel, chat_id, message_id, message_thread_id)
 
             def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
                 return loop_self._strip_think(content)
@@ -265,13 +285,14 @@ class AgentLoop:
             hook=_LoopHook(),
             error_message="Sorry, I encountered an error calling the AI model.",
             concurrent_tools=True,
+            cost_guard=self._cost_guard,
         ))
         self._last_usage = result.usage
         if result.stop_reason == "max_iterations":
             logger.warning("Max iterations ({}) reached", self.max_iterations)
         elif result.stop_reason == "error":
             logger.error("LLM returned error: {}", (result.final_content or "")[:200])
-        return result.final_content, result.tools_used, result.messages
+        return result.final_content, result.tools_used, result.messages, result.usage, result.stop_reason, result.error, result.tool_events
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
@@ -327,6 +348,7 @@ class AgentLoop:
                             metadata={
                                 "_stream_delta": True,
                                 "_stream_id": _current_stream_id(),
+                                "message_thread_id": msg.metadata.get("message_thread_id"),
                             },
                         ))
 
@@ -339,6 +361,7 @@ class AgentLoop:
                                 "_stream_end": True,
                                 "_resuming": resuming,
                                 "_stream_id": _current_stream_id(),
+                                "message_thread_id": msg.metadata.get("message_thread_id"),
                             },
                         ))
                         stream_segment += 1
@@ -403,7 +426,8 @@ class AgentLoop:
             key = f"{channel}:{chat_id}"
             session = self.sessions.get_or_create(key)
             await self.memory_consolidator.maybe_consolidate_by_tokens(session)
-            self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
+            self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"),
+                                  msg.metadata.get("message_thread_id"))
             history = session.get_history(max_messages=0)
             current_role = "assistant" if msg.sender_id == "subagent" else "user"
             messages = self.context.build_messages(
@@ -411,15 +435,20 @@ class AgentLoop:
                 current_message=msg.content, channel=channel, chat_id=chat_id,
                 current_role=current_role,
             )
-            final_content, _, all_msgs = await self._run_agent_loop(
+            t0 = time.monotonic()
+            final_content, sys_tools_used, all_msgs, usage, stop_reason, run_error, tool_events = await self._run_agent_loop(
                 messages, channel=channel, chat_id=chat_id,
                 message_id=msg.metadata.get("message_id"),
+                message_thread_id=msg.metadata.get("message_thread_id"),
             )
+            skills, files_touched = self.telemetry.extract_from_events(tool_events)
+            self.telemetry.record_turn(ts=datetime.now(timezone.utc).isoformat(), session=key, channel=channel, chat_id=chat_id, model=self.model, usage=usage, duration_ms=int((time.monotonic() - t0) * 1000), stop_reason=stop_reason, error=run_error, tools_used=sys_tools_used, skills=skills, files_touched=files_touched)
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
             self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
             return OutboundMessage(channel=channel, chat_id=chat_id,
-                                  content=final_content or "Background task completed.")
+                                   content=final_content or "Background task completed.",
+                                   metadata=msg.metadata or {})
 
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
@@ -435,10 +464,12 @@ class AgentLoop:
 
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
-        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
+        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"),
+                              msg.metadata.get("message_thread_id"))
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
+                message_tool.set_turn_metadata(msg.metadata or {})
 
         history = session.get_history(max_messages=0)
         initial_messages = self.context.build_messages(
@@ -456,15 +487,19 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
 
-        final_content, _, all_msgs = await self._run_agent_loop(
+        t0 = time.monotonic()
+        final_content, tools_used, all_msgs, usage, stop_reason, run_error, tool_events = await self._run_agent_loop(
             initial_messages,
             on_progress=on_progress or _bus_progress,
             on_stream=on_stream,
             on_stream_end=on_stream_end,
             channel=msg.channel, chat_id=msg.chat_id,
             message_id=msg.metadata.get("message_id"),
+            message_thread_id=msg.metadata.get("message_thread_id"),
         )
 
+        skills, files_touched = self.telemetry.extract_from_events(tool_events)
+        self.telemetry.record_turn(ts=datetime.now(timezone.utc).isoformat(), session=key, channel=msg.channel, chat_id=msg.chat_id, model=self.model, usage=usage, duration_ms=int((time.monotonic() - t0) * 1000), stop_reason=stop_reason, error=run_error, tools_used=tools_used, skills=skills, files_touched=files_touched)
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
 

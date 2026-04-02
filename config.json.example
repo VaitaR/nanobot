@@ -1,0 +1,82 @@
+{
+  "providers": {
+    "_comment": "LLM provider API keys. Only configure the ones you use.",
+    "custom": {
+      "apiKey": "sk-your-key-here",
+      "apiBase": "https://api.example.com/v1"
+    },
+    "anthropic": {
+      "apiKey": ""
+    },
+    "openai": {
+      "apiKey": ""
+    },
+    "zhipu": {
+      "apiKey": ""
+    },
+    "openrouter": {
+      "apiKey": ""
+    },
+    "deepseek": {
+      "apiKey": ""
+    }
+  },
+  "agents": {
+    "defaults": {
+      "_comment": "Instance-specific: model, provider, and system prompt may differ per deployment.",
+      "model": "anthropic/claude-sonnet-4-20250514",
+      "provider": "auto",
+      "maxTokens": 8192,
+      "contextWindowTokens": 65536,
+      "temperature": 0.1,
+      "maxToolIterations": 40,
+      "timezone": "UTC",
+      "systemPrompt": "",
+      "workspace": "~/.nanobot/workspace"
+    }
+  },
+  "channels": {
+    "_comment": "Instance-specific: tokens and allowFrom differ per bot instance.",
+    "telegram": {
+      "enabled": false,
+      "token": "123456:ABC-DEF...",
+      "allowFrom": ["user_id_1"],
+      "groupPolicy": "mention",
+      "replyToMessage": false,
+      "poolSize": 5,
+      "streaming": true
+    }
+  },
+  "gateway": {
+    "host": "0.0.0.0",
+    "port": 18790,
+    "heartbeat": {
+      "enabled": true,
+      "intervalS": 1800,
+      "keepRecentMessages": 8
+    },
+    "logging": {
+      "file": "~/.nanobot/logs/gateway.log",
+      "rotation": "10 MB",
+      "retention": "7 days",
+      "level": "DEBUG"
+    }
+  },
+  "tools": {
+    "web": {
+      "search": {
+        "provider": "brave",
+        "apiKey": "",
+        "baseUrl": "",
+        "maxResults": 5
+      },
+      "proxy": null
+    },
+    "exec": {
+      "enable": true,
+      "timeout": 60,
+      "pathAppend": ""
+    },
+    "restrictToWorkspace": false
+  }
+}

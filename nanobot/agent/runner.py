@@ -3,13 +3,24 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from nanobot.agent.cost_guard import CostGuard
 from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.providers.base import LLMProvider, ToolCallRequest
 from nanobot.utils.helpers import build_assistant_message
+
+
+def _is_checkpoint_hook(hook: AgentHook) -> bool:
+    """Return True if *hook* is a :class:`CheckpointHook` (lazy import)."""
+    try:
+        from nanobot.checkpoint.hook import CheckpointHook
+        return isinstance(hook, CheckpointHook)
+    except ImportError:
+        return False
 
 _DEFAULT_MAX_ITERATIONS_MESSAGE = (
     "I reached the maximum number of tool call iterations ({max_iterations}) "
@@ -34,6 +45,8 @@ class AgentRunSpec:
     max_iterations_message: str | None = None
     concurrent_tools: bool = False
     fail_on_tool_error: bool = False
+    wall_clock_cap: int | None = None
+    cost_guard: CostGuard | None = None
 
 
 @dataclass(slots=True)
@@ -65,7 +78,40 @@ class AgentRunner:
         stop_reason = "completed"
         tool_events: list[dict[str, str]] = []
 
-        for iteration in range(spec.max_iterations):
+        # Compute initial effective max (may grow via CheckpointHook)
+        eff_max = self._effective_max(hook, spec)
+
+        execution_elapsed = 0.0
+        iteration = 0
+
+        while iteration < eff_max:
+            # --- Hard cap check (execution time only — pause time excluded) ---
+            if spec.wall_clock_cap is not None and execution_elapsed >= spec.wall_clock_cap:
+                stop_reason = "hard_cap"
+                break
+
+            # --- Checkpoint pause (blocks here if requested) ---
+            if _is_checkpoint_hook(hook) and hook.pause_requested:
+                action, _extra = await hook.do_pause()
+                eff_max = self._effective_max(hook, spec)
+                if hook.finalize_requested:
+                    messages.append({"role": "user", "content": hook.finalize_prompt})
+                elif hook.should_stop:
+                    stop_reason = "checkpoint_stop"
+                    break
+                # CONTINUE: fall through to normal iteration body
+
+            iter_start = time.monotonic()
+
+            # --- Cost guard check (before LLM call) ---
+            if spec.cost_guard is not None:
+                check = spec.cost_guard.check_before_call()
+                if not check.allowed:
+                    stop_reason = "cost_cap"
+                    final_content = check.reason or "Cost budget exceeded."
+                    execution_elapsed += time.monotonic() - iter_start
+                    break
+
             context = AgentHookContext(iteration=iteration, messages=messages)
             await hook.before_iteration(context)
             kwargs: dict[str, Any] = {
@@ -96,6 +142,8 @@ class AgentRunner:
                 "prompt_tokens": int(raw_usage.get("prompt_tokens", 0) or 0),
                 "completion_tokens": int(raw_usage.get("completion_tokens", 0) or 0),
             }
+            if spec.cost_guard is not None:
+                spec.cost_guard.record_usage(usage, model=spec.model)
             context.response = response
             context.usage = usage
             context.tool_calls = list(response.tool_calls)
@@ -124,6 +172,7 @@ class AgentRunner:
                     context.error = error
                     context.stop_reason = stop_reason
                     await hook.after_iteration(context)
+                    execution_elapsed += time.monotonic() - iter_start
                     break
                 for tool_call, result in zip(response.tool_calls, results):
                     messages.append({
@@ -133,6 +182,8 @@ class AgentRunner:
                         "content": result,
                     })
                 await hook.after_iteration(context)
+                execution_elapsed += time.monotonic() - iter_start
+                iteration += 1
                 continue
 
             if hook.wants_streaming():
@@ -147,6 +198,7 @@ class AgentRunner:
                 context.error = error
                 context.stop_reason = stop_reason
                 await hook.after_iteration(context)
+                execution_elapsed += time.monotonic() - iter_start
                 break
 
             messages.append(build_assistant_message(
@@ -158,6 +210,7 @@ class AgentRunner:
             context.final_content = final_content
             context.stop_reason = stop_reason
             await hook.after_iteration(context)
+            execution_elapsed += time.monotonic() - iter_start
             break
         else:
             stop_reason = "max_iterations"
@@ -173,6 +226,13 @@ class AgentRunner:
             error=error,
             tool_events=tool_events,
         )
+
+    @staticmethod
+    def _effective_max(hook: AgentHook, spec: AgentRunSpec) -> int:
+        """Return the current effective maximum iterations."""
+        if _is_checkpoint_hook(hook):
+            return hook.effective_max
+        return spec.max_iterations
 
     async def _execute_tools(
         self,
@@ -214,6 +274,7 @@ class AgentRunner:
                 "name": tool_call.name,
                 "status": "error",
                 "detail": str(exc),
+                "arguments": dict(tool_call.arguments),
             }
             if spec.fail_on_tool_error:
                 return f"Error: {type(exc).__name__}: {exc}", event, exc
@@ -229,4 +290,5 @@ class AgentRunner:
             "name": tool_call.name,
             "status": "error" if isinstance(result, str) and result.startswith("Error") else "ok",
             "detail": detail,
+            "arguments": dict(tool_call.arguments),
         }, None

@@ -90,6 +90,8 @@ async def cmd_help(ctx: CommandContext) -> OutboundMessage:
         "/stop — Stop the current task",
         "/restart — Restart the bot",
         "/status — Show bot status",
+        "/tasks [filter] — List tasks (open|in_progress|blocked|review|done|all)",
+        "/heartbeat — Trigger heartbeat check",
         "/help — Show available commands",
     ]
     return OutboundMessage(
@@ -100,11 +102,92 @@ async def cmd_help(ctx: CommandContext) -> OutboundMessage:
     )
 
 
+async def cmd_tasks(ctx: CommandContext) -> OutboundMessage:
+    """List workspace tasks, optionally filtered by status."""
+    status_map = {
+        "open": "📋", "in_progress": "🔄",
+        "blocked": "🚫", "review": "👁️", "done": "✅",
+    }
+    arg = ctx.args.strip().lower()
+    if arg in ("open", "in_progress", "blocked", "review", "done"):
+        status_filter = arg
+    elif arg == "all":
+        status_filter = "all"
+    else:
+        status_filter = "active"
+
+    try:
+        from nanobot_workspace.tasks import TaskStore
+        tasks = TaskStore().list_tasks(status_filter)
+    except Exception as exc:
+        return OutboundMessage(
+            channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+            content=f"Error loading tasks: {exc}",
+        )
+
+    if not tasks:
+        return OutboundMessage(
+            channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+            content="No tasks found.",
+        )
+
+    lines = [f"📋 Tasks ({status_filter}):"]
+    for t in tasks:
+        emoji = status_map.get(t.status, "❓")
+        short_id = t.id[:16]
+        lines.append(f"  {emoji} {short_id} — {t.title}")
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content="\n".join(lines),
+        metadata={"render_as": "text"},
+    )
+
+
+async def cmd_heartbeat(ctx: CommandContext) -> OutboundMessage:
+    """Manually trigger the heartbeat check and return the result."""
+    hb = ctx.loop.heartbeat_service
+    if hb is None:
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content="Heartbeat service is not available.",
+        )
+    try:
+        result = await hb.trigger_now()
+        action = result.get("action", "skip")
+        tasks = result.get("tasks", "")
+        response = result.get("result", "")
+        if action == "skip":
+            return OutboundMessage(
+                channel=ctx.msg.channel,
+                chat_id=ctx.msg.chat_id,
+                content=f"💓 Heartbeat: skip — no active tasks.\n{tasks}".strip(),
+            )
+        lines = [f"💓 Heartbeat: run\n\n📋 Tasks: {tasks}"]
+        if response:
+            lines.append(f"\n✅ Result:\n{response}")
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content="\n".join(lines),
+        )
+    except Exception as e:
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content=f"Heartbeat error: {e}",
+        )
+
+
 def register_builtin_commands(router: CommandRouter) -> None:
     """Register the default set of slash commands."""
     router.priority("/stop", cmd_stop)
     router.priority("/restart", cmd_restart)
     router.priority("/status", cmd_status)
     router.exact("/new", cmd_new)
+    router.exact("/heartbeat", cmd_heartbeat)
     router.exact("/status", cmd_status)
+    router.exact("/tasks", cmd_tasks)
+    router.prefix("/tasks ", cmd_tasks)
     router.exact("/help", cmd_help)

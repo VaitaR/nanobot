@@ -60,10 +60,10 @@ def test_save_turn_keeps_image_placeholder_without_meta() -> None:
     assert session.messages[0]["content"] == [{"type": "text", "text": "[image]"}]
 
 
-def test_save_turn_keeps_tool_results_under_16k() -> None:
+def test_save_turn_keeps_tool_results_under_limit() -> None:
     loop = _mk_loop()
     session = Session(key="test:tool-result")
-    content = "x" * 12_000
+    content = "x" * 3_000  # under _TOOL_RESULT_MAX_CHARS (4_000)
 
     loop._save_turn(
         session,

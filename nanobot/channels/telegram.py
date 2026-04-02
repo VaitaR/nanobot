@@ -6,12 +6,18 @@ import asyncio
 import re
 import time
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from loguru import logger
 from pydantic import Field
-from telegram import BotCommand, ReactionTypeEmoji, ReplyParameters, Update
+from telegram import (
+    BotCommand,
+    BotCommandScopeAllPrivateChats,
+    ReactionTypeEmoji,
+    ReplyParameters,
+    Update,
+)
 from telegram.error import BadRequest, TimedOut
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
@@ -199,6 +205,8 @@ class TelegramChannel(BaseChannel):
         BotCommand("help", "Show available commands"),
         BotCommand("restart", "Restart the bot"),
         BotCommand("status", "Show bot status"),
+        BotCommand("tasks", "List workspace tasks"),
+        BotCommand("heartbeat", "Trigger heartbeat check"),
     ]
 
     @classmethod
@@ -305,7 +313,11 @@ class TelegramChannel(BaseChannel):
         logger.info("Telegram bot @{} connected", bot_info.username)
 
         try:
-            await self._app.bot.set_my_commands(self.BOT_COMMANDS)
+            await self._app.bot.delete_my_commands(scope=BotCommandScopeAllPrivateChats())
+            await self._app.bot.set_my_commands(
+                self.BOT_COMMANDS,
+                scope=BotCommandScopeAllPrivateChats(),
+            )
             logger.debug("Telegram bot commands registered")
         except Exception as e:
             logger.warning("Failed to register bot commands: {}", e)
@@ -540,10 +552,16 @@ class TelegramChannel(BaseChannel):
 
         now = time.monotonic()
         if buf.message_id is None:
+            # Extract thread_id for forum groups (same pattern as send())
+            message_thread_id = meta.get("message_thread_id")
+            thread_kwargs = {}
+            if message_thread_id is not None:
+                thread_kwargs["message_thread_id"] = message_thread_id
             try:
                 sent = await self._call_with_retry(
                     self._app.bot.send_message,
                     chat_id=int_chat_id, text=buf.text,
+                    **thread_kwargs,
                 )
                 buf.message_id = sent.message_id
                 buf.last_edit = now
@@ -917,7 +935,7 @@ class TelegramChannel(BaseChannel):
     async def _on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Log polling / handler errors instead of silently swallowing them."""
         from telegram.error import NetworkError, TimedOut
-        
+
         if isinstance(context.error, (NetworkError, TimedOut)):
             logger.warning("Telegram network issue: {}", str(context.error))
         else:

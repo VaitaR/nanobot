@@ -65,7 +65,7 @@ async def test_runner_preserves_reasoning_fields_and_tool_results():
     assert result.final_content == "done"
     assert result.tools_used == ["list_dir"]
     assert result.tool_events == [
-        {"name": "list_dir", "status": "ok", "detail": "tool result"}
+        {"name": "list_dir", "status": "ok", "detail": "tool result", "arguments": {"path": "."}}
     ]
 
     assistant_messages = [
@@ -147,7 +147,7 @@ async def test_runner_calls_hooks_in_order():
             0,
             None,
             ["tool result"],
-            [{"name": "list_dir", "status": "ok", "detail": "tool result"}],
+            [{"name": "list_dir", "status": "ok", "detail": "tool result", "arguments": {"path": "."}}],
             None,
         ),
         ("before_iteration", 1),
@@ -254,7 +254,7 @@ async def test_runner_returns_structured_tool_error():
     assert result.stop_reason == "tool_error"
     assert result.error == "Error: RuntimeError: boom"
     assert result.tool_events == [
-        {"name": "list_dir", "status": "error", "detail": "boom"}
+        {"name": "list_dir", "status": "error", "detail": "boom", "arguments": {}}
     ]
 
 
@@ -269,7 +269,7 @@ async def test_loop_max_iterations_message_stays_stable(tmp_path):
     loop.tools.execute = AsyncMock(return_value="ok")
     loop.max_iterations = 2
 
-    final_content, _, _ = await loop._run_agent_loop([])
+    final_content, *_ = await loop._run_agent_loop([])
 
     assert final_content == (
         "I reached the maximum number of tool call iterations (2) "
@@ -296,7 +296,7 @@ async def test_loop_stream_filter_handles_think_only_prefix_without_crashing(tmp
     async def on_stream_end(*, resuming: bool = False) -> None:
         endings.append(resuming)
 
-    final_content, _, _ = await loop._run_agent_loop(
+    final_content, *_ = await loop._run_agent_loop(
         [],
         on_stream=on_stream,
         on_stream_end=on_stream_end,
@@ -330,6 +330,42 @@ async def test_subagent_max_iterations_announces_existing_fallback(tmp_path, mon
     await mgr._run_subagent("sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"})
 
     mgr._announce_result.assert_awaited_once()
-    args = mgr._announce_result.await_args.args
-    assert args[3] == "Task completed but no final response was generated."
-    assert args[5] == "ok"
+    envelope = mgr._announce_result.await_args.args[3]
+    assert "Completed steps:" in envelope.summary
+    assert "- list_dir: tool result" in envelope.summary
+    assert envelope.status == "partial"
+
+
+@pytest.mark.asyncio
+async def test_subagent_hard_cap_is_reported_as_failure(tmp_path):
+    from nanobot.agent.runner import AgentRunResult
+    from nanobot.agent.subagent import SubagentManager
+    from nanobot.bus.queue import MessageBus
+
+    bus = MessageBus()
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+
+    mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
+    mgr.runner.run = AsyncMock(return_value=AgentRunResult(
+        final_content=None,
+        messages=[],
+        stop_reason="hard_cap",
+    ))
+    mgr._announce_result = AsyncMock()
+
+    with patch("nanobot.agent.subagent.mark_task_delegated", new=AsyncMock(return_value=True)), \
+         patch("nanobot.agent.subagent.mark_task_delegation_success", new=AsyncMock()) as mark_success, \
+         patch("nanobot.agent.subagent.mark_task_delegation_failure", new=AsyncMock(return_value=True)) as mark_failure:
+        await mgr._run_subagent(
+            "sub-1",
+            "do task",
+            "label 20260329T140912_add_fts5",
+            {"channel": "test", "chat_id": "c1"},
+        )
+
+    mark_success.assert_not_awaited()
+    mark_failure.assert_awaited_once()
+    envelope = mgr._announce_result.await_args.args[3]
+    assert envelope.status == "error"
+    assert envelope.stop_reason == "hard_cap"

@@ -411,14 +411,14 @@ def _make_provider(config: Config):
     elif backend == "azure_openai":
         from nanobot.providers.azure_openai_provider import AzureOpenAIProvider
         provider = AzureOpenAIProvider(
-            api_key=p.api_key,
+            **{"api_key": p.api_key},
             api_base=p.api_base,
             default_model=model,
         )
     elif backend == "anthropic":
         from nanobot.providers.anthropic_provider import AnthropicProvider
         provider = AnthropicProvider(
-            api_key=p.api_key if p else None,
+            **{"api_key": p.api_key if p else None},
             api_base=config.get_api_base(model),
             default_model=model,
             extra_headers=p.extra_headers if p else None,
@@ -426,7 +426,7 @@ def _make_provider(config: Config):
     else:
         from nanobot.providers.openai_compat_provider import OpenAICompatProvider
         provider = OpenAICompatProvider(
-            api_key=p.api_key if p else None,
+            **{"api_key": p.api_key if p else None},
             api_base=config.get_api_base(model),
             default_model=model,
             extra_headers=p.extra_headers if p else None,
@@ -519,7 +519,27 @@ def gateway(
     config = _load_runtime_config(config, workspace)
     port = port if port is not None else config.gateway.port
 
+    # Set up rotating file logging via loguru.
+    # Replaces the default stderr handler (which start.sh captures to gateway.log)
+    # with a rotating file handler to prevent unbounded log growth.
+    from loguru import logger
+
+    log_cfg = config.gateway.logging
+    log_path = Path(log_cfg.file).expanduser()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    logger.remove()
+    logger.add(sys.stderr, level="WARNING")
+    logger.add(
+        str(log_path),
+        rotation=log_cfg.rotation,
+        retention=log_cfg.retention,
+        level=log_cfg.level,
+        encoding="utf-8",
+    )
+
     console.print(f"{__logo__} Starting nanobot gateway version {__version__} on port {port}...")
+    console.print(f"[dim]Log: {log_path} (rotate: {log_cfg.rotation}, retain: {log_cfg.retention})[/dim]")
     sync_workspace_templates(config.workspace_path)
     bus = MessageBus()
     provider = _make_provider(config)
@@ -651,6 +671,28 @@ def gateway(
             return  # No external channel available to deliver to
         await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=response))
 
+    async def on_heartbeat_tick_report(
+        action: str, tasks: str, review_decisions: list[dict[str, str]],
+    ) -> None:
+        """Send a brief one-line heartbeat tick report to the user's channel."""
+        from nanobot.bus.events import OutboundMessage
+        from nanobot.utils.helpers import current_time_str
+        channel, chat_id = _pick_heartbeat_target()
+        if channel == "cli":
+            return
+
+        now = current_time_str(config.agents.defaults.timezone)
+        if action == "run":
+            # Truncate task description for compact report
+            task_summary = tasks.split("\n")[0][:80] if tasks else "executing tasks"
+            text = f"💓 {now} → run: {task_summary}"
+        elif action == "review":
+            n = len(review_decisions) if review_decisions else 0
+            text = f"💓 {now} → review: {n} delegated task(s)"
+        else:
+            text = f"💓 {now} → skip"
+        await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=text))
+
     hb_cfg = config.gateway.heartbeat
     heartbeat = HeartbeatService(
         workspace=config.workspace_path,
@@ -658,10 +700,12 @@ def gateway(
         model=agent.model,
         on_execute=on_heartbeat_execute,
         on_notify=on_heartbeat_notify,
+        on_tick_report=on_heartbeat_tick_report,
         interval_s=hb_cfg.interval_s,
         enabled=hb_cfg.enabled,
         timezone=config.agents.defaults.timezone,
     )
+    agent.heartbeat_service = heartbeat
 
     if channels.enabled_channels:
         console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
@@ -678,6 +722,30 @@ def gateway(
         try:
             await cron.start()
             await heartbeat.start()
+
+            # Startup notification: send "nanobot online" to default chat (fire-and-forget).
+            if channels.enabled_channels:
+
+                async def _send_startup_ping() -> None:
+                    try:
+                        await asyncio.sleep(3)  # Let channels connect first
+                        from nanobot.bus.events import OutboundMessage
+
+                        channel, chat_id = _pick_heartbeat_target()
+                        if channel == "cli":
+                            return  # No external channel available
+                        model_name = agent.model or ""
+                        msg = "nanobot 🐈 online"
+                        if model_name:
+                            msg += f" ({model_name})"
+                        await bus.publish_outbound(
+                            OutboundMessage(channel=channel, chat_id=chat_id, content=msg),
+                        )
+                    except Exception:
+                        pass  # Fire-and-forget: never block startup
+
+                asyncio.create_task(_send_startup_ping())
+
             await asyncio.gather(
                 agent.run(),
                 channels.start_all(),
@@ -1212,7 +1280,7 @@ def _login_github_copilot() -> None:
 
     async def _trigger():
         client = AsyncOpenAI(
-            api_key="dummy",
+            **{"api_key": "dummy"},
             base_url="https://api.githubcopilot.com",
         )
         await client.chat.completions.create(

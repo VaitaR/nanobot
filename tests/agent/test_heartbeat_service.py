@@ -53,9 +53,10 @@ async def test_decide_returns_skip_when_no_tool_call(tmp_path) -> None:
         model="openai/gpt-4o-mini",
     )
 
-    action, tasks = await service._decide("heartbeat content")
+    action, tasks, review_decisions = await service._decide("heartbeat content")
     assert action == "skip"
     assert tasks == ""
+    assert review_decisions == []
 
 
 @pytest.mark.asyncio
@@ -89,7 +90,8 @@ async def test_trigger_now_executes_when_decision_is_run(tmp_path) -> None:
     )
 
     result = await service.trigger_now()
-    assert result == "done"
+    assert result["action"] == "run"
+    assert result["result"] == "done"
     assert called_with == ["check open tasks"]
 
 
@@ -120,7 +122,8 @@ async def test_trigger_now_returns_none_when_decision_is_skip(tmp_path) -> None:
         on_execute=_on_execute,
     )
 
-    assert await service.trigger_now() is None
+    result = await service.trigger_now()
+    assert result["action"] == "skip"
 
 
 @pytest.mark.asyncio
@@ -244,10 +247,11 @@ async def test_decide_retries_transient_error_then_succeeds(tmp_path, monkeypatc
         model="openai/gpt-4o-mini",
     )
 
-    action, tasks = await service._decide("heartbeat content")
+    action, tasks, review_decisions = await service._decide("heartbeat content")
 
     assert action == "run"
     assert tasks == "check open tasks"
+    assert review_decisions == []
     assert provider.calls == 2
     assert delays == [1]
 
@@ -286,4 +290,62 @@ async def test_decide_prompt_includes_current_time(tmp_path) -> None:
     user_msg = captured_messages[1]
     assert user_msg["role"] == "user"
     assert "Current Time:" in user_msg["content"]
+
+
+@pytest.mark.asyncio
+async def test_trigger_now_returns_structured_result(tmp_path) -> None:
+    """trigger_now always returns a dict with action, tasks, and result keys."""
+    (tmp_path / "HEARTBEAT.md").write_text("- [ ] do thing", encoding="utf-8")
+
+    # --- skip path ---
+    provider_skip = DummyProvider([
+        LLMResponse(
+            content="",
+            tool_calls=[
+                ToolCallRequest(id="hb_1", name="heartbeat",
+                                arguments={"action": "skip"}),
+            ],
+        )
+    ])
+    service_skip = HeartbeatService(
+        workspace=tmp_path, provider=provider_skip,
+        model="openai/gpt-4o-mini",
+    )
+    result_skip = await service_skip.trigger_now()
+    assert isinstance(result_skip, dict)
+    assert result_skip["action"] == "skip"
+    assert result_skip["result"] == ""
+
+    # --- run path ---
+    provider_run = DummyProvider([
+        LLMResponse(
+            content="",
+            tool_calls=[
+                ToolCallRequest(id="hb_1", name="heartbeat",
+                                arguments={"action": "run", "tasks": "fix bug"}),
+            ],
+        )
+    ])
+    async def _exec(tasks: str) -> str:
+        return "fixed"
+
+    service_run = HeartbeatService(
+        workspace=tmp_path, provider=provider_run,
+        model="openai/gpt-4o-mini", on_execute=_exec,
+    )
+    result_run = await service_run.trigger_now()
+    assert result_run["action"] == "run"
+    assert result_run["tasks"] == "fix bug"
+    assert result_run["result"] == "fixed"
+
+    # --- missing HEARTBEAT.md ---
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir()
+    service_empty = HeartbeatService(
+        workspace=empty_dir, provider=provider_skip,
+        model="openai/gpt-4o-mini",
+    )
+    result_empty = await service_empty.trigger_now()
+    assert result_empty["action"] == "skip"
+    assert "missing" in result_empty["result"]
 
