@@ -276,9 +276,16 @@ class HeartbeatService:
             - ``result``: execution response (only for run)
             - ``review_decisions``: list of review decisions
         """
+        # Send start ping
+        if self.on_tick_report:
+            await self.on_tick_report("start", "", None)
+
         content = self._read_heartbeat_file()
         if not content:
-            return {"action": "skip", "tasks": "", "result": "HEARTBEAT.md missing or empty", "review_decisions": []}
+            result = {"action": "skip", "tasks": "", "result": "HEARTBEAT.md missing or empty", "review_decisions": []}
+            if self.on_tick_report:
+                await self.on_tick_report("skip", "", None)
+            return result
 
         pending_review: list[dict[str, str]] = []
         try:
@@ -307,9 +314,16 @@ class HeartbeatService:
                     await mark_task_delegation_failure(tid, note or "heartbeat review: marked failed")
                     closed.append({"task_id": tid, "verdict": verdict, "ok": True})
             if closed:
+                if self.on_tick_report:
+                    await self.on_tick_report("review", tasks, review_decisions)
                 return {"action": "review", "tasks": tasks, "result": "", "review_decisions": closed}
 
         if action != "run" or not self.on_execute:
+            if self.on_tick_report:
+                await self.on_tick_report(action, tasks, None)
             return {"action": action, "tasks": tasks, "result": "", "review_decisions": []}
+
         result = await self.on_execute(tasks)
+        if self.on_tick_report:
+            await self.on_tick_report("run", tasks, None)
         return {"action": "run", "tasks": tasks, "result": result or "", "review_decisions": []}

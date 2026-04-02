@@ -61,6 +61,7 @@ class AgentLoop:
         model: str | None = None,
         max_iterations: int = 40,
         context_window_tokens: int = 65_536,
+        system_prompt_max_tokens: int = 0,
         web_search_config: WebSearchConfig | None = None,
         web_proxy: str | None = None,
         exec_config: ExecToolConfig | None = None,
@@ -92,7 +93,11 @@ class AgentLoop:
             CostGuard.from_config(cost_policy) if cost_policy else None
         )
 
-        self.context = ContextBuilder(workspace, timezone=timezone)
+        self.context = ContextBuilder(
+            workspace,
+            timezone=timezone,
+            system_prompt_max_tokens=system_prompt_max_tokens,
+        )
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
         self.runner = AgentRunner(provider)

@@ -50,6 +50,7 @@ class AgentDefaults(Base):
     )
     max_tokens: int = 8192
     context_window_tokens: int = 65_536
+    system_prompt_max_tokens: int = 0  # Max tokens for system prompt (0 = unlimited)
     temperature: float = 0.1
     max_tool_iterations: int = 40
     reasoning_effort: str | None = None  # low / medium / high - enables LLM thinking mode

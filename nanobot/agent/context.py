@@ -6,9 +6,14 @@ import platform
 from pathlib import Path
 from typing import Any
 
+from loguru import logger
+
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
 from nanobot.utils.helpers import build_assistant_message, current_time_str, detect_image_mime
+
+_CHARS_PER_TOKEN = 4  # rough estimate, consistent with memory.py
+_SEPARATOR = "\n\n---\n\n"
 
 
 class ContextBuilder:
@@ -17,40 +22,105 @@ class ContextBuilder:
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
 
-    def __init__(self, workspace: Path, timezone: str | None = None):
+    def __init__(
+        self,
+        workspace: Path,
+        timezone: str | None = None,
+        system_prompt_max_tokens: int = 0,
+    ):
         self.workspace = workspace
         self.timezone = timezone
+        self.system_prompt_max_tokens = system_prompt_max_tokens
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
 
     def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
-        parts = [self._get_identity()]
+        parts: list[tuple[str, str]] = []
+        parts.append(("identity", self._get_identity()))
 
         bootstrap = self._load_bootstrap_files()
         if bootstrap:
-            parts.append(bootstrap)
+            parts.append(("bootstrap", bootstrap))
 
         memory = self.memory.get_memory_context()
         if memory:
-            parts.append(f"# Memory\n\n{memory}")
+            parts.append(("memory", memory))
 
         always_skills = self.skills.get_always_skills()
         if always_skills:
             always_content = self.skills.load_skills_for_context(always_skills)
             if always_content:
-                parts.append(f"# Active Skills\n\n{always_content}")
+                parts.append(("always_skills", always_content))
 
         skills_summary = self.skills.build_skills_summary()
         if skills_summary:
-            parts.append(f"""# Skills
+            header = (
+                "The following skills extend your capabilities. "
+                "To use a skill, read its SKILL.md file using the read_file tool.\n"
+                'Skills with available="false" need dependencies installed first '
+                "- you can try installing them with apt/brew."
+            )
+            parts.append(("skills_summary", f"{header}\n\n{skills_summary}"))
 
-The following skills extend your capabilities. To use a skill, read its SKILL.md file using the read_file tool.
-Skills with available="false" need dependencies installed first - you can try installing them with apt/brew.
+        parts = self._enforce_budget(parts)
 
-{skills_summary}""")
+        formatted: list[str] = []
+        for label, content in parts:
+            if label == "memory":
+                formatted.append(f"# Memory\n\n{content}")
+            elif label == "always_skills":
+                formatted.append(f"# Active Skills\n\n{content}")
+            elif label == "skills_summary":
+                formatted.append(f"# Skills\n\n{content}")
+            else:
+                formatted.append(content)
+        return _SEPARATOR.join(formatted)
 
-        return "\n\n---\n\n".join(parts)
+    def _enforce_budget(self, parts: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        """Drop or truncate parts to fit within system_prompt_max_tokens."""
+        budget = self.system_prompt_max_tokens
+        if budget <= 0:
+            return parts
+
+        # Check if already within budget (including separator overhead)
+        total_chars = sum(len(c) for _, c in parts) + _SEPARATOR.__len__() * max(0, len(parts) - 1)
+        if total_chars // _CHARS_PER_TOKEN <= budget:
+            return parts
+
+        # Priority: identity (keep) > bootstrap > memory > always_skills > skills_summary
+        removable = ["skills_summary", "always_skills", "memory", "bootstrap"]
+        result = list(parts)
+
+        for label in removable:
+            if total_chars // _CHARS_PER_TOKEN <= budget:
+                break
+            idx = next((i for i, (l, _) in enumerate(result) if l == label), None)
+            if idx is None:
+                continue
+            section_chars = len(result[idx][1])
+            # Separator overhead for this section
+            total_chars -= section_chars + _SEPARATOR.__len__()
+            del result[idx]
+            logger.warning(
+                "System prompt budget exceeded: removed '{}' section ({} chars)",
+                label,
+                section_chars,
+            )
+
+        # If still over budget, truncate memory (the only section we truncate)
+        if total_chars // _CHARS_PER_TOKEN > budget:
+            mem_idx = next((i for i, (l, _) in enumerate(result) if l == "memory"), None)
+            if mem_idx is not None:
+                remaining = budget * _CHARS_PER_TOKEN
+                # Account for separators
+                remaining -= sum(len(c) for l, c in result if l != "memory")
+                remaining -= _SEPARATOR.__len__() * max(0, len(result) - 1)
+                # TODO: smart memory truncation (LLM summarization) instead of raw character cutoff
+                result[mem_idx] = ("memory", result[mem_idx][1][:max(0, remaining)])
+                logger.warning("System prompt budget: truncated memory section")
+
+        return result
 
     def _get_identity(self) -> str:
         """Get the core identity section."""
