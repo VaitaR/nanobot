@@ -289,6 +289,8 @@ class TelegramChannel(BaseChannel):
         self._app.add_handler(CommandHandler("stop", self._forward_command))
         self._app.add_handler(CommandHandler("restart", self._forward_command))
         self._app.add_handler(CommandHandler("status", self._forward_command))
+        self._app.add_handler(CommandHandler("tasks", self._forward_command))
+        self._app.add_handler(CommandHandler("heartbeat", self._forward_command))
         self._app.add_handler(CommandHandler("help", self._on_help))
 
         # Add message handler for text, photos, voice, documents

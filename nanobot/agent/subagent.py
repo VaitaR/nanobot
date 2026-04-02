@@ -658,6 +658,7 @@ class SubagentManager:
     def _build_subagent_prompt(self) -> str:
         """Build a focused system prompt for the subagent."""
         from nanobot.agent.context import ContextBuilder
+        from nanobot.agent.memory import MemoryStore
         from nanobot.agent.skills import SkillsLoader
 
         time_ctx = ContextBuilder._build_runtime_context(None, None)
@@ -672,6 +673,15 @@ Tools like 'read_file' and 'web_fetch' can return native image content. Read vis
 
 ## Workspace
 {self.workspace}"""]
+
+        # Inject long-term memory (truncated to 2000 chars to avoid prompt bloat)
+        memory_store = MemoryStore(self.workspace)
+        long_term = memory_store.read_long_term()
+        content = long_term.strip() if long_term else ""
+        if content:
+            if len(content) > 2000:
+                content = content[:2000] + "\n...(truncated)"
+            parts.append(f"## Memory Context\n\n{content}")
 
         skills_summary = SkillsLoader(self.workspace).build_skills_summary()
         if skills_summary:
