@@ -17,6 +17,7 @@ class Artifact:
     path: str  # file path or URL
     description: str  # human-readable label
     kind: str  # "file" | "diff" | "url" | "metric"
+    verified: bool = False  # post-execution check confirmed existence
 
 
 @dataclass(slots=True)

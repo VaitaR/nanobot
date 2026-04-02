@@ -682,7 +682,9 @@ def gateway(
             return
 
         now = current_time_str(config.agents.defaults.timezone)
-        if action == "run":
+        if action == "start":
+            text = f"💓 {now} → checking..."
+        elif action == "run":
             # Truncate task description for compact report
             task_summary = tasks.split("\n")[0][:80] if tasks else "executing tasks"
             text = f"💓 {now} → run: {task_summary}"

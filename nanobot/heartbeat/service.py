@@ -202,6 +202,10 @@ class HeartbeatService:
 
         logger.info("Heartbeat: checking for tasks...")
 
+        # Send start ping
+        if self.on_tick_report:
+            await self.on_tick_report("start", "", None)
+
         try:
             # Check for completed delegations that need review
             pending_review: list[dict[str, str]] = []
@@ -242,21 +246,20 @@ class HeartbeatService:
 
             if action != "run":
                 logger.info("Heartbeat: OK (nothing to report)")
-                return
+            else:
+                logger.info("Heartbeat: tasks found, executing...")
+                if self.on_execute:
+                    response = await self.on_execute(tasks)
 
-            logger.info("Heartbeat: tasks found, executing...")
-            if self.on_execute:
-                response = await self.on_execute(tasks)
-
-                if response:
-                    should_notify = await evaluate_response(
-                        response, tasks, self.provider, self.model,
-                    )
-                    if should_notify and self.on_notify:
-                        logger.info("Heartbeat: completed, delivering response")
-                        await self.on_notify(response)
-                    else:
-                        logger.info("Heartbeat: silenced by post-run evaluation")
+                    if response:
+                        should_notify = await evaluate_response(
+                            response, tasks, self.provider, self.model,
+                        )
+                        if should_notify and self.on_notify:
+                            logger.info("Heartbeat: completed, delivering response")
+                            await self.on_notify(response)
+                        else:
+                            logger.info("Heartbeat: silenced by post-run evaluation")
 
             # Send brief tick report to user
             if self.on_tick_report:

@@ -82,6 +82,7 @@ class MemoryStore:
         self.memory_file = self.memory_dir / "MEMORY.md"
         self.history_file = self.memory_dir / "HISTORY.md"
         self._consecutive_failures = 0
+        self._last_chunk_summary: str = ""
 
     def read_long_term(self) -> str:
         if self.memory_file.exists():
@@ -137,8 +138,14 @@ class MemoryStore:
             return True
 
         current_memory = self.read_long_term()
-        prompt = f"""Process this conversation and call the save_memory tool with your consolidation.
 
+        # Progressive summary chain: include previous chunk summary for continuity
+        prior_section = ""
+        if self._last_chunk_summary:
+            prior_section = f"\n## Previous Consolidation Summary\n{self._last_chunk_summary}\n"
+
+        prompt = f"""Process this conversation and call the save_memory tool with your consolidation.
+{prior_section}
 ## Current Long-term Memory
 {current_memory or "(empty)"}
 
@@ -214,6 +221,9 @@ class MemoryStore:
             if update != current_memory:
                 self.write_long_term(update)
 
+            # Progressive summary chain: save this chunk's history_entry as prior context
+            self._last_chunk_summary = entry
+
             self._consecutive_failures = 0
             logger.info("Memory consolidation done for {} messages", len(messages))
             return True
@@ -233,10 +243,11 @@ class MemoryStore:
     def _raw_archive(self, messages: list[dict]) -> None:
         """Fallback: dump raw messages to HISTORY.md without LLM summarization."""
         ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-        self.append_history(
-            f"[{ts}] [RAW] {len(messages)} messages\n"
-            f"{self._format_messages(messages)}"
-        )
+        raw_text = self._format_messages(messages)
+        entry = f"[{ts}] [RAW] {len(messages)} messages\n{raw_text}"
+        self.append_history(entry)
+        # Keep progressive chain alive even on raw archive
+        self._last_chunk_summary = f"[RAW fallback] {len(messages)} messages consolidated at {ts}"
         logger.warning(
             "Memory consolidation degraded: raw-archived {} messages", len(messages)
         )

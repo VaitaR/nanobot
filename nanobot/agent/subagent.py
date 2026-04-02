@@ -19,6 +19,7 @@ from loguru import logger
 
 from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.agent.result_envelope import ResultEnvelope, extract_artifacts
+from nanobot.agent.verify import verify_envelope
 from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.task_lifecycle import (
@@ -588,6 +589,9 @@ class SubagentManager:
         Complex, partial, or error results are routed through the main
         agent for interpretation.
         """
+        # Verify claimed artifacts exist on disk (detect illusion of execution)
+        envelope = verify_envelope(envelope)
+
         # Build metadata — propagate message_thread_id for topic routing
         metadata: dict[str, Any] = {}
         thread_id = origin.get("message_thread_id")

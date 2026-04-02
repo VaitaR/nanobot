@@ -1,15 +1,35 @@
 """Configuration loading utilities."""
 
 import json
+import os
+import re
 from pathlib import Path
+from typing import Any
 
 import pydantic
 from loguru import logger
 
 from nanobot.config.schema import Config
 
+# Pattern for env var references: exactly $VAR_NAME (no ${} syntax)
+_ENV_VAR_PATTERN = re.compile(r"^\$([A-Za-z_][A-Za-z0-9_]*)$")
+
 # Global variable to store current config path (for multi-instance support)
 _current_config_path: Path | None = None
+
+
+def _resolve_env_vars(data: Any) -> Any:
+    """Recursively resolve env var references ($VAR_NAME) in config values."""
+    if isinstance(data, dict):
+        return {k: _resolve_env_vars(v) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [_resolve_env_vars(item) for item in data]
+    elif isinstance(data, str) and _ENV_VAR_PATTERN.fullmatch(data):
+        env_val = os.environ.get(data[1:], "")  # strip leading $
+        if not env_val:
+            logger.debug(f"Config env var reference {data} not set, using empty string")
+        return env_val
+    return data
 
 
 def set_config_path(path: Path) -> None:
@@ -41,6 +61,7 @@ def load_config(config_path: Path | None = None) -> Config:
         try:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
+            data = _resolve_env_vars(data)
             data = _migrate_config(data)
             return Config.model_validate(data)
         except (json.JSONDecodeError, ValueError, pydantic.ValidationError) as e:
