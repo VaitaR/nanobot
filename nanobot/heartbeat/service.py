@@ -83,6 +83,7 @@ class HeartbeatService:
         self.model = model
         self.on_execute = on_execute
         self.on_notify = on_notify
+        self.on_tick_report: Callable[[str], Coroutine[Any, Any, None]] | None = None
         self.interval_s = interval_s
         self.enabled = enabled
         self.timezone = timezone
@@ -254,6 +255,10 @@ class HeartbeatService:
                         await self.on_notify(response)
                     else:
                         logger.info("Heartbeat: silenced by post-run evaluation")
+
+            # Send brief tick report to user
+            if self.on_tick_report:
+                await self.on_tick_report(action, tasks, review_decisions)
         except Exception:
             logger.exception("Heartbeat execution failed")
 

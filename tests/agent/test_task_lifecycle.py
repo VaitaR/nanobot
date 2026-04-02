@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -13,6 +14,7 @@ from nanobot.agent.task_lifecycle import (
     mark_task_delegated,
     mark_task_delegation_failure,
     mark_task_delegation_success,
+    query_pending_review,
 )
 
 # ── extract_task_id ──────────────────────────────────────────────────────────
@@ -199,3 +201,33 @@ class TestCLITimeout:
             assert await mark_task_delegated("20260329T140912_add_fts5") is False
             assert await mark_task_delegation_success("20260329T140912_add_fts5") is False
             assert await mark_task_delegation_failure("20260329T140912_add_fts5", "err") is False
+
+
+class TestQueryPendingReview:
+    @pytest.mark.asyncio
+    async def test_scans_open_tasks_when_in_progress_empty(self):
+        task_id = "20260329T140912_open_delegated"
+
+        async def fake_shell(cmd, *, stdout, stderr):
+            proc = AsyncMock()
+            proc.returncode = 0
+            if "list --status in_progress --json" in cmd:
+                proc.communicate = AsyncMock(return_value=(b"[]", b""))
+            elif "list --status open --json" in cmd:
+                payload = [{"id": task_id, "title": "Recover delegated task", "status": "open"}]
+                proc.communicate = AsyncMock(return_value=(json.dumps(payload).encode("utf-8"), b""))
+            elif f"show {task_id}" in cmd:
+                proc.communicate = AsyncMock(
+                    return_value=(
+                        b"[delegated] delegated to subagent\n[progress] delegation completed successfully\n",
+                        b"",
+                    )
+                )
+            else:
+                proc.communicate = AsyncMock(return_value=(b"", b""))
+            return proc
+
+        with patch("nanobot.agent.task_lifecycle.asyncio.create_subprocess_shell", side_effect=fake_shell):
+            pending = await query_pending_review()
+
+        assert pending == [{"id": task_id, "title": "Recover delegated task", "status": "open"}]

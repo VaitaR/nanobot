@@ -334,3 +334,38 @@ async def test_subagent_max_iterations_announces_existing_fallback(tmp_path, mon
     assert "Completed steps:" in envelope.summary
     assert "- list_dir: tool result" in envelope.summary
     assert envelope.status == "partial"
+
+
+@pytest.mark.asyncio
+async def test_subagent_hard_cap_is_reported_as_failure(tmp_path):
+    from nanobot.agent.runner import AgentRunResult
+    from nanobot.agent.subagent import SubagentManager
+    from nanobot.bus.queue import MessageBus
+
+    bus = MessageBus()
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+
+    mgr = SubagentManager(provider=provider, workspace=tmp_path, bus=bus)
+    mgr.runner.run = AsyncMock(return_value=AgentRunResult(
+        final_content=None,
+        messages=[],
+        stop_reason="hard_cap",
+    ))
+    mgr._announce_result = AsyncMock()
+
+    with patch("nanobot.agent.subagent.mark_task_delegated", new=AsyncMock(return_value=True)), \
+         patch("nanobot.agent.subagent.mark_task_delegation_success", new=AsyncMock()) as mark_success, \
+         patch("nanobot.agent.subagent.mark_task_delegation_failure", new=AsyncMock(return_value=True)) as mark_failure:
+        await mgr._run_subagent(
+            "sub-1",
+            "do task",
+            "label 20260329T140912_add_fts5",
+            {"channel": "test", "chat_id": "c1"},
+        )
+
+    mark_success.assert_not_awaited()
+    mark_failure.assert_awaited_once()
+    envelope = mgr._announce_result.await_args.args[3]
+    assert envelope.status == "error"
+    assert envelope.stop_reason == "hard_cap"

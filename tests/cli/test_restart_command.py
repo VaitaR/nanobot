@@ -188,3 +188,24 @@ class TestRestartCommand:
 
         assert response is not None
         assert response.metadata == {"render_as": "text"}
+
+    @pytest.mark.asyncio
+    async def test_tasks_handles_missing_workspace_dependency(self):
+        loop, _bus = _make_loop()
+
+        import builtins
+
+        real_import = builtins.__import__
+
+        def _failing_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "nanobot_workspace.tasks":
+                raise ModuleNotFoundError("No module named 'nanobot_workspace'")
+            return real_import(name, globals, locals, fromlist, level)
+
+        with patch("builtins.__import__", side_effect=_failing_import):
+            response = await loop._process_message(
+                InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="/tasks")
+            )
+
+        assert response is not None
+        assert "Error loading tasks:" in response.content

@@ -154,9 +154,6 @@ async def query_pending_review() -> list[dict[str, str]]:
         logger.warning("query_pending_review error: %s", exc)
         return []
 
-    if not tasks:
-        return []
-
     # Also check open tasks that might have delegation events but weren't
     # moved to in_progress (e.g. subagent didn't call mark_task_delegated).
     cmd_open = _build_cmd("list --status open --json")

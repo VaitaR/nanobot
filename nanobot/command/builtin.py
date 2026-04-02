@@ -104,8 +104,6 @@ async def cmd_help(ctx: CommandContext) -> OutboundMessage:
 
 async def cmd_tasks(ctx: CommandContext) -> OutboundMessage:
     """List workspace tasks, optionally filtered by status."""
-    from nanobot_workspace.tasks import TaskStore
-
     status_map = {
         "open": "📋", "in_progress": "🔄",
         "blocked": "🚫", "review": "👁️", "done": "✅",
@@ -119,6 +117,7 @@ async def cmd_tasks(ctx: CommandContext) -> OutboundMessage:
         status_filter = "active"
 
     try:
+        from nanobot_workspace.tasks import TaskStore
         tasks = TaskStore().list_tasks(status_filter)
     except Exception as exc:
         return OutboundMessage(

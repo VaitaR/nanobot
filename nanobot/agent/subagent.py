@@ -319,6 +319,44 @@ class SubagentManager:
                         origin,
                     )
                     return
+                if nb_task_id:
+                    await mark_task_delegation_failure(
+                        nb_task_id,
+                        "max_iterations reached without completed tool steps",
+                    )
+                await self._announce_result(
+                    task_id, label, task,
+                    self._build_envelope(
+                        result.final_content or "Task reached iteration limit without completing any steps.",
+                        "error",
+                        tool_events=result.tool_events,
+                        stop_reason="max_iterations",
+                    ),
+                    origin,
+                )
+                return
+
+            if result.stop_reason != "completed":
+                stop_reason = result.stop_reason or "unknown"
+                failure_msg = result.final_content or f"Subagent stopped before completion (reason: {stop_reason})."
+                logger.warning("Subagent [{}] stopped with non-success reason: {}", task_id, stop_reason)
+                if nb_task_id:
+                    await mark_task_delegation_failure(
+                        nb_task_id,
+                        f"subagent stopped with reason: {stop_reason}",
+                    )
+                await self._announce_result(
+                    task_id, label, task,
+                    self._build_envelope(
+                        failure_msg,
+                        "error",
+                        tool_events=result.tool_events,
+                        stop_reason=stop_reason,
+                        error=result.error,
+                    ),
+                    origin,
+                )
+                return
 
             final_result = result.final_content or "Task completed."
 
