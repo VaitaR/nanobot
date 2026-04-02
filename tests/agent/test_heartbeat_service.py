@@ -53,9 +53,10 @@ async def test_decide_returns_skip_when_no_tool_call(tmp_path) -> None:
         model="openai/gpt-4o-mini",
     )
 
-    action, tasks = await service._decide("heartbeat content")
+    action, tasks, review_decisions = await service._decide("heartbeat content")
     assert action == "skip"
     assert tasks == ""
+    assert review_decisions == []
 
 
 @pytest.mark.asyncio
@@ -246,10 +247,11 @@ async def test_decide_retries_transient_error_then_succeeds(tmp_path, monkeypatc
         model="openai/gpt-4o-mini",
     )
 
-    action, tasks = await service._decide("heartbeat content")
+    action, tasks, review_decisions = await service._decide("heartbeat content")
 
     assert action == "run"
     assert tasks == "check open tasks"
+    assert review_decisions == []
     assert provider.calls == 2
     assert delays == [1]
 
