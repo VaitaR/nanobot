@@ -251,12 +251,12 @@ class TestSubagentCancellation:
         await mgr._run_subagent("sub-1", "do task", "label", {"channel": "test", "chat_id": "c1"})
 
         mgr._announce_result.assert_awaited_once()
-        args = mgr._announce_result.await_args.args
-        assert "Completed steps:" in args[3]
-        assert "- list_dir: first result" in args[3]
-        assert "Failure:" in args[3]
-        assert "- list_dir: boom" in args[3]
-        assert args[5] == "error"
+        envelope = mgr._announce_result.await_args.args[3]
+        assert "Completed steps:" in envelope.summary
+        assert "- list_dir: first result" in envelope.summary
+        assert "Failure:" in envelope.summary
+        assert "- list_dir: boom" in envelope.summary
+        assert envelope.status == "partial"
 
     @pytest.mark.asyncio
     async def test_cancel_by_session_cancels_running_subagent_tool(self, monkeypatch, tmp_path):
