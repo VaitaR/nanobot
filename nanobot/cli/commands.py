@@ -728,8 +728,25 @@ def gateway(
 
                 async def _send_startup_ping() -> None:
                     try:
-                        await asyncio.sleep(3)  # Let channels connect first
+                        await asyncio.sleep(8)  # Let channels connect first
+                        import json
+                        from nanobot import __version__
                         from nanobot.bus.events import OutboundMessage
+
+                        # If /restart was used, confirm it to the originating chat.
+                        marker = config.workspace_path / "restart_pending.json"
+                        if marker.exists():
+                            try:
+                                data = json.loads(marker.read_text())
+                                marker.unlink()
+                                await bus.publish_outbound(OutboundMessage(
+                                    channel=data.get("channel", "cli"),
+                                    chat_id=data.get("chat_id", "direct"),
+                                    content=f"✅ nanobot restarted (v{__version__})",
+                                ))
+                                return
+                            except Exception:
+                                pass
 
                         channel, chat_id = _pick_heartbeat_target()
                         if channel == "cli":

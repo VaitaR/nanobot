@@ -31,10 +31,19 @@ async def cmd_stop(ctx: CommandContext) -> OutboundMessage:
 
 async def cmd_restart(ctx: CommandContext) -> OutboundMessage:
     """Restart the process in-place via os.execv."""
+    import json
+
     msg = ctx.msg
 
     async def _do_restart():
         await asyncio.sleep(1)
+        # Write a marker so the new process can confirm the restart to the user.
+        try:
+            if ctx.loop and hasattr(ctx.loop, "workspace"):
+                marker = ctx.loop.workspace / "restart_pending.json"
+                marker.write_text(json.dumps({"channel": msg.channel, "chat_id": msg.chat_id}))
+        except Exception:
+            pass
         os.execv(sys.executable, [sys.executable, "-m", "nanobot"] + sys.argv[1:])
 
     asyncio.create_task(_do_restart())
