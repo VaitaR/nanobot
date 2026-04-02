@@ -36,6 +36,11 @@ class ExecTool(Tool):
             r">\s*/dev/sd",                  # write to disk
             r"\b(shutdown|reboot|poweroff)\b",  # system power
             r":\(\)\s*\{.*\};\s*:",          # fork bomb
+            # Never unload/remove the gateway — kills the process with no recovery path.
+            # launchd will NOT restart after bootout/unload (it unregisters the service).
+            r"launchctl\s+(bootout|unload|remove).*nanobot.{0,30}gateway",
+            # Never kill the gateway process directly via signal — launchd may not restart cleanly.
+            r"pkill.{0,30}nanobot.{0,20}gateway|killall.{0,10}nanobot",
         ]
         self.allow_patterns = allow_patterns or []
         self.restrict_to_workspace = restrict_to_workspace

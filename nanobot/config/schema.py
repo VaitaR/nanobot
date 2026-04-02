@@ -151,6 +151,7 @@ class ExecToolConfig(Base):
     enable: bool = True
     timeout: int = 60
     path_append: str = ""
+    deny_patterns: list[str] = Field(default_factory=list)  # Extra patterns appended to shell.py defaults
 
 class MCPServerConfig(Base):
     """MCP server connection configuration (stdio or HTTP)."""
