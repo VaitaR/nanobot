@@ -699,6 +699,30 @@ def gateway(
         try:
             await cron.start()
             await heartbeat.start()
+
+            # Startup notification: send "nanobot online" to default chat (fire-and-forget).
+            if channels.enabled_channels:
+
+                async def _send_startup_ping() -> None:
+                    try:
+                        await asyncio.sleep(3)  # Let channels connect first
+                        from nanobot.bus.events import OutboundMessage
+
+                        channel, chat_id = _pick_heartbeat_target()
+                        if channel == "cli":
+                            return  # No external channel available
+                        model_name = agent.model or ""
+                        msg = "nanobot 🐈 online"
+                        if model_name:
+                            msg += f" ({model_name})"
+                        await bus.publish_outbound(
+                            OutboundMessage(channel=channel, chat_id=chat_id, content=msg),
+                        )
+                    except Exception:
+                        pass  # Fire-and-forget: never block startup
+
+                asyncio.create_task(_send_startup_ping())
+
             await asyncio.gather(
                 agent.run(),
                 channels.start_all(),

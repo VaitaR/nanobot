@@ -2,6 +2,8 @@
 .assets
 .docs
 .env
+config.json
+!config.json.example
 *.pyc
 dist/
 build/

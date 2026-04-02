@@ -28,6 +28,18 @@ class ChannelsConfig(Base):
     send_max_retries: int = Field(default=3, ge=0, le=10)  # Max delivery attempts (initial send included)
 
 
+class CostPolicy(Base):
+    """Token budget enforcement for agent runs.
+
+    All ``0`` / ``0.0`` defaults mean *no limit* — zero-config backward compatible.
+    """
+
+    max_tokens_per_turn: int = 0  # Max total tokens (prompt+completion) per single LLM call; 0 = no limit
+    max_tokens_per_session: int = 0  # Cumulative tokens across all turns in a session; 0 = no limit
+    max_cost_usd: float = 0.0  # Estimated USD cost cap per session; 0 = no limit
+    rate_limit_rpm: int = 0  # Max LLM calls per minute (sliding window); 0 = no limit
+
+
 class AgentDefaults(Base):
     """Default agent configuration."""
 
@@ -42,6 +54,7 @@ class AgentDefaults(Base):
     max_tool_iterations: int = 40
     reasoning_effort: str | None = None  # low / medium / high - enables LLM thinking mode
     timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
+    cost_policy: CostPolicy = Field(default_factory=CostPolicy)
 
 
 class AgentsConfig(Base):
