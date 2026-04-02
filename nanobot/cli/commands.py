@@ -700,11 +700,11 @@ def gateway(
         model=agent.model,
         on_execute=on_heartbeat_execute,
         on_notify=on_heartbeat_notify,
-        on_tick_report=on_heartbeat_tick_report,
         interval_s=hb_cfg.interval_s,
         enabled=hb_cfg.enabled,
         timezone=config.agents.defaults.timezone,
     )
+    heartbeat.on_tick_report = on_heartbeat_tick_report
     agent.heartbeat_service = heartbeat
 
     if channels.enabled_channels:

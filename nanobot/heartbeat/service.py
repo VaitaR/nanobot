@@ -83,6 +83,8 @@ class HeartbeatService:
         self.model = model
         self.on_execute = on_execute
         self.on_notify = on_notify
+        # on_tick_report is set as an attribute AFTER construction, not a constructor param.
+        # Do NOT add it to __init__ signature — set it as: heartbeat.on_tick_report = fn
         self.on_tick_report: Callable[[str], Coroutine[Any, Any, None]] | None = None
         self.interval_s = interval_s
         self.enabled = enabled

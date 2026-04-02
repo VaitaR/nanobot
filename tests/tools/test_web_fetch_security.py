@@ -66,7 +66,8 @@ async def test_web_fetch_result_contains_untrusted_flag():
 
     data = json.loads(result)
     assert data.get("untrusted") is True
-    assert "[External content" in data.get("text", "")
+    assert "<untrusted_web_content" in data.get("text", "")
+    assert "</untrusted_web_content>" in data.get("text", "")
 
 
 @pytest.mark.asyncio
