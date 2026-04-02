@@ -16,12 +16,14 @@ class SpawnTool(Tool):
         self._origin_channel = "cli"
         self._origin_chat_id = "direct"
         self._session_key = "cli:direct"
+        self._message_thread_id: str | int | None = None
 
-    def set_context(self, channel: str, chat_id: str) -> None:
+    def set_context(self, channel: str, chat_id: str, message_thread_id: str | int | None = None) -> None:
         """Set the origin context for subagent announcements."""
         self._origin_channel = channel
         self._origin_chat_id = chat_id
         self._session_key = f"{channel}:{chat_id}"
+        self._message_thread_id = message_thread_id
 
     @property
     def name(self) -> str:
@@ -54,8 +56,9 @@ class SpawnTool(Tool):
                     "type": "integer",
                     "description": (
                         "Max tool iterations for this subagent. "
-                        "Default: read from config (40). "
-                        "Use 15 for quick tasks, 50+ for long research/implementation."
+                        "Default: read from config. "
+                        "Use 15 for quick tasks, 30 for medium, 50+ for long research/implementation. "
+                        "Prefer tighter budgets — split large tasks into phases if possible."
                     ),
                 },
                 "hard_cap": {
@@ -82,6 +85,8 @@ class SpawnTool(Tool):
             origin_chat_id=self._origin_chat_id,
             session_key=self._session_key,
         )
+        if self._message_thread_id is not None:
+            spawn_kwargs["message_thread_id"] = self._message_thread_id
         if max_iterations is not None:
             spawn_kwargs["max_iterations"] = max_iterations
         # Cap hard_cap at 1 hour for safety; omit to use manager default (1800s)

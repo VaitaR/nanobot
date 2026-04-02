@@ -21,6 +21,7 @@ class MessageTool(Tool):
         self._default_chat_id = default_chat_id
         self._default_message_id = default_message_id
         self._sent_in_turn: bool = False
+        self._metadata: dict[str, Any] = {}
 
     def set_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Set the current message context."""
@@ -35,6 +36,10 @@ class MessageTool(Tool):
     def start_turn(self) -> None:
         """Reset per-turn send tracking."""
         self._sent_in_turn = False
+
+    def set_turn_metadata(self, metadata: dict[str, Any]) -> None:
+        """Store full inbound metadata for the current turn (e.g. message_thread_id)."""
+        self._metadata = metadata or {}
 
     @property
     def name(self) -> str:
@@ -101,6 +106,8 @@ class MessageTool(Tool):
             media=media or [],
             metadata={
                 "message_id": message_id,
+                **{k: v for k, v in self._metadata.items()
+                   if k in ("message_thread_id", "is_forum")},
             },
         )
 
