@@ -47,7 +47,10 @@ class _FakeBot:
         self.get_me_calls += 1
         return SimpleNamespace(id=999, username="nanobot_test")
 
-    async def set_my_commands(self, commands) -> None:
+    async def delete_my_commands(self, scope=None) -> None:
+        self.commands = None
+
+    async def set_my_commands(self, commands, scope=None) -> None:
         self.commands = commands
 
     async def send_message(self, **kwargs):
