@@ -138,10 +138,8 @@ class AgentRunner:
                 response = await self.provider.chat_with_retry(**kwargs)
 
             raw_usage = response.usage or {}
-            usage = {
-                "prompt_tokens": int(raw_usage.get("prompt_tokens", 0) or 0),
-                "completion_tokens": int(raw_usage.get("completion_tokens", 0) or 0),
-            }
+            usage["prompt_tokens"] += int(raw_usage.get("prompt_tokens", 0) or 0)
+            usage["completion_tokens"] += int(raw_usage.get("completion_tokens", 0) or 0)
             if spec.cost_guard is not None:
                 spec.cost_guard.record_usage(usage, model=spec.model)
             context.response = response
