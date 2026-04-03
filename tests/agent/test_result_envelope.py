@@ -137,24 +137,33 @@ class TestAnnounceResultRouting:
 
     @pytest.mark.asyncio
     async def test_short_ok_goes_to_outbound(self):
+        import os
+        import tempfile
+
         mgr, bus = _make_manager()
         origin = {"channel": "cli", "chat_id": "direct"}
-        envelope = ResultEnvelope(
-            status="ok",
-            summary="Created the new module.",
-            artifacts=[
-                Artifact(path="/tmp/new.py", description="new file", kind="file"),
-            ],
-        )
+        # Create a real temp file so verify_envelope doesn't downgrade to partial
+        tmp = tempfile.NamedTemporaryFile(suffix=".py", delete=False, mode="w")
+        tmp.write("# test\n")
+        tmp.close()
+        try:
+            envelope = ResultEnvelope(
+                status="ok",
+                summary="Created the new module.",
+                artifacts=[
+                    Artifact(path=tmp.name, description="new file", kind="file"),
+                ],
+            )
+            await mgr._announce_result("t1", "label", "do thing", envelope, origin)
 
-        await mgr._announce_result("t1", "label", "do thing", envelope, origin)
-
-        # Should have published exactly one outbound message
-        out = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
-        assert "[label] Created the new module." in out.content
-        assert "/tmp/new.py" in out.content
-        # Nothing in inbound
-        assert bus.inbound_size == 0
+            # Should have published exactly one outbound message
+            out = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+            assert "[label] Created the new module." in out.content
+            assert tmp.name in out.content
+            # Nothing in inbound
+            assert bus.inbound_size == 0
+        finally:
+            os.unlink(tmp.name)
 
     @pytest.mark.asyncio
     async def test_long_ok_goes_to_inbound(self):

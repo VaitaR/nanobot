@@ -41,5 +41,7 @@ class OutboundMessage:
     reply_to: str | None = None
     media: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    reply_markup: dict[str, Any] | None = None  # Inline keyboard markup (Telegram)
+    edit_message_id: int | None = None  # Edit an existing message's markup
 
 

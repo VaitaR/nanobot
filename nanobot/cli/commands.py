@@ -625,10 +625,37 @@ def gateway(
     # Create channel manager
     channels = ChannelManager(config, bus)
 
+    # Wire checkpoint resolver for Telegram inline keyboard callbacks (Phase 3)
+    tg_channel = channels.get_channel("telegram")
+    if tg_channel is not None and hasattr(tg_channel, "_checkpoint_resolver"):
+        tg_channel._checkpoint_resolver = agent.subagents.resolve_checkpoint
+
     def _pick_heartbeat_target() -> tuple[str, str]:
-        """Pick a routable channel/chat target for heartbeat-triggered messages."""
+        """Pick a routable channel/chat target for heartbeat-triggered messages.
+
+        Uses a fixed target from config to ensure heartbeat notifications
+        always reach the owner, not whichever session was most recent.
+        Falls back to the first enabled Telegram chat if no config value.
+        """
+        # 1. Check config for explicit target
+        hb_notify = getattr(config.gateway, "heartbeat", None)
+        if hb_notify:
+            target_chat = getattr(hb_notify, "notify_chat", None)
+            if target_chat and ":" in target_chat:
+                ch, cid = target_chat.split(":", 1)
+                return ch, cid
+
+        # 2. Fallback: first Telegram allowFrom user
+        tg_cfg = getattr(config.channels, "telegram", None)
+        if isinstance(tg_cfg, dict):
+            allow = tg_cfg.get("allowFrom") or tg_cfg.get("allow_from")
+        else:
+            allow = getattr(tg_cfg, "allowFrom", None) or getattr(tg_cfg, "allow_from", None)
+        if allow:
+            return "telegram", str(allow[0])
+
+        # 3. Last resort: first enabled non-internal session
         enabled = set(channels.enabled_channels)
-        # Prefer the most recently updated non-internal session on an enabled channel.
         for item in session_manager.list_sessions():
             key = item.get("key") or ""
             if ":" not in key:
@@ -638,7 +665,6 @@ def gateway(
                 continue
             if channel in enabled and chat_id:
                 return channel, chat_id
-        # Fallback keeps prior behavior but remains explicit.
         return "cli", "direct"
 
     # Create heartbeat service

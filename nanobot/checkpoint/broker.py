@@ -16,6 +16,8 @@ if TYPE_CHECKING:
     from nanobot.checkpoint.policy import ReviewPolicy
     from nanobot.checkpoint.snapshot import CheckpointSnapshot
 
+_CALLBACK_PREFIX = "chk:"
+
 
 class CheckpointBroker:
     """Coordinates checkpoint pauses between the runner and the user.
@@ -37,6 +39,8 @@ class CheckpointBroker:
         self._pending_events: dict[str, asyncio.Event] = {}
         self._pending_results: dict[str, tuple[UserAction, int]] = {}
         self._on_status: Callable[[str, str], Any] | None = None
+        self._last_escalation_chat_id: str | None = None
+        self._last_escalation_message_id: int | None = None
 
     # -- public API ----------------------------------------------------------
 
@@ -119,10 +123,11 @@ class CheckpointBroker:
     # -- internal helpers ----------------------------------------------------
 
     async def _send_escalation(self, snapshot: CheckpointSnapshot, reason: str) -> None:
-        """Send a text-only escalation alert via the outbound bus."""
+        """Send an escalation alert with inline keyboard buttons."""
         recent_tools = ", ".join(
             f"{tc.tool_name}" for tc in snapshot.tool_calls[-5:]
         ) or "(none)"
+        remaining = max(0, snapshot.max_iterations - snapshot.total_iterations)
         alert = (
             f"⚠️ Checkpoint review needed\n\n"
             f"Iteration: {snapshot.total_iterations}/{snapshot.max_iterations}\n"
@@ -130,35 +135,40 @@ class CheckpointBroker:
             f"Errors: {snapshot.error_count}\n"
             f"Recent tools: {recent_tools}\n\n"
             f"Reason: {reason}\n\n"
-            f"The subagent is paused. Auto-continuing in "
-            f"{self._policy.review_timeout}s if no response."
+            f"Auto-continuing in {self._policy.review_timeout}s if no response."
         )
+        keyboard = self._build_keyboard(snapshot.task_id, remaining)
         await self._bus.publish_outbound(OutboundMessage(
             channel=self._origin.get("channel", "cli"),
             chat_id=self._origin.get("chat_id", "direct"),
             content=alert,
+            reply_markup=keyboard,
+            metadata={"_checkpoint_escalation": True},
         ))
 
     async def _send_details(self, snapshot: CheckpointSnapshot) -> None:
-        """Send a detailed snapshot summary (DETAILS sub-flow)."""
+        """Send a detailed snapshot summary with inline keyboard (DETAILS sub-flow)."""
         tool_lines = "\n".join(
             f"  {i + 1}. {tc.tool_name}: {tc.detail}"
             for i, tc in enumerate(snapshot.tool_calls[-10:])
         )
         file_lines = "\n".join(f"  - {f}" for f in sorted(snapshot.files_touched)[:10])
+        remaining = max(0, snapshot.max_iterations - snapshot.total_iterations)
         details = (
             f"📋 Checkpoint details\n\n"
             f"Iteration: {snapshot.total_iterations}/{snapshot.max_iterations}\n"
             f"Errors: {snapshot.error_count}\n\n"
             f"Tool calls (last 10):\n{tool_lines or '  (none)'}\n\n"
             f"Files touched:\n{file_lines or '  (none)'}\n\n"
-            f"Last LLM output: {snapshot.last_llm_outputs[-1] if snapshot.last_llm_outputs else '(none)'}\n\n"
-            f"Respond to continue, stop, or mark done."
+            f"Last LLM output: {snapshot.last_llm_outputs[-1] if snapshot.last_llm_outputs else '(none)'}"
         )
+        keyboard = self._build_keyboard(snapshot.task_id, remaining)
         await self._bus.publish_outbound(OutboundMessage(
             channel=self._origin.get("channel", "cli"),
             chat_id=self._origin.get("chat_id", "direct"),
             content=details,
+            reply_markup=keyboard,
+            metadata={"_checkpoint_escalation": True},
         ))
 
     async def _send_timeout_notification(self, snapshot: CheckpointSnapshot) -> None:
@@ -173,3 +183,48 @@ class CheckpointBroker:
             chat_id=self._origin.get("chat_id", "direct"),
             content=notification,
         ))
+
+    @staticmethod
+    def _build_keyboard(task_id: str, remaining_iterations: int) -> dict[str, Any]:
+        """Build an inline keyboard markup dict for checkpoint escalation.
+
+        Layout: [Continue +N] / [Done] [Stop] [Details]
+        Callback data protocol: chk:<task_id>:<action>[:param]
+        """
+        prefix = _CALLBACK_PREFIX
+        cont = min(remaining_iterations, 10) if remaining_iterations > 0 else 5
+        return {
+            "inline_keyboard": [
+                [
+                    {"text": f"▶ Continue +{cont}", "callback_data": f"{prefix}{task_id}:continue:{cont}"},
+                ],
+                [
+                    {"text": "✅ Done", "callback_data": f"{prefix}{task_id}:done"},
+                    {"text": "⏹ Stop", "callback_data": f"{prefix}{task_id}:stop"},
+                    {"text": "📋 Details", "callback_data": f"{prefix}{task_id}:details"},
+                ],
+            ],
+        }
+
+    @staticmethod
+    def parse_callback_data(data: str) -> tuple[str, str, int | None] | None:
+        """Parse a checkpoint callback data string.
+
+        Returns ``(task_id, action, param)`` or ``None`` if not a checkpoint callback.
+
+        Protocol: ``chk:<task_id>:<action>[:param]``
+        """
+        if not data or not data.startswith(_CALLBACK_PREFIX):
+            return None
+        parts = data[len(_CALLBACK_PREFIX):].split(":")
+        if len(parts) < 2:
+            return None
+        task_id = parts[0]
+        action = parts[1]
+        param: int | None = None
+        if len(parts) >= 3:
+            try:
+                param = int(parts[2])
+            except ValueError:
+                param = None
+        return (task_id, action, param)

@@ -144,6 +144,7 @@ class CheckpointHook(AgentHook):
             error_count=self._error_count,
             loop_detected=(loop is not None),
             stuck_score=0.0,
+            task_id=self._task_id,
         )
 
     # -- properties ----------------------------------------------------------

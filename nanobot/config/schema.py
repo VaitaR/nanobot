@@ -108,6 +108,7 @@ class HeartbeatConfig(Base):
     enabled: bool = True
     interval_s: int = 30 * 60  # 30 minutes
     keep_recent_messages: int = 8
+    notify_chat: str = ""  # "telegram:111933519" — fixed target for heartbeat pings
 
 
 class GatewayLoggingConfig(Base):

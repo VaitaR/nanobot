@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 from pathlib import Path
+from typing import Callable
 
 # Default builtin skills directory (relative to this file)
 BUILTIN_SKILLS_DIR = Path(__file__).parent.parent / "skills"
@@ -98,12 +99,23 @@ class SkillsLoader:
 
         return "\n\n---\n\n".join(parts) if parts else ""
 
-    def build_skills_summary(self) -> str:
+    def build_skills_summary(
+        self,
+        enhancer: Callable[[str], str] | None = None,
+    ) -> str:
         """
         Build a summary of all skills (name, description, path, availability).
 
         This is used for progressive loading - the agent can read the full
         skill content using read_file when needed.
+
+        Parameters
+        ----------
+        enhancer:
+            Optional callback ``(skill_name: str) -> enhanced_description``.
+            When provided, it replaces the frontmatter description so that
+            external enhancement logic (e.g. evolution notes) can inject
+            richer descriptions without coupling core to workspace packages.
 
         Returns:
             XML-formatted skills summary.
@@ -119,7 +131,7 @@ class SkillsLoader:
         for s in all_skills:
             name = escape_xml(s["name"])
             path = s["path"]
-            desc = escape_xml(self._get_skill_description(s["name"]))
+            desc = escape_xml(enhancer(s["name"]) if enhancer else self._get_skill_description(s["name"]))
             skill_meta = self._get_skill_meta(s["name"])
             available = self._check_requirements(skill_meta)
 

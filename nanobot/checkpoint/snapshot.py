@@ -27,3 +27,4 @@ class CheckpointSnapshot:
     error_count: int = 0
     loop_detected: bool = False
     stuck_score: float = 0.0
+    task_id: str = ""  # nanobot-tasks ID for callback routing (Phase 3)

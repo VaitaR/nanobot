@@ -14,12 +14,22 @@ from pydantic import Field
 from telegram import (
     BotCommand,
     BotCommandScopeAllPrivateChats,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     ReactionTypeEmoji,
     ReplyParameters,
     Update,
 )
 from telegram.error import BadRequest, TimedOut
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 from telegram.request import HTTPXRequest
 
 from nanobot.bus.events import OutboundMessage
@@ -229,6 +239,7 @@ class TelegramChannel(BaseChannel):
         self._bot_user_id: int | None = None
         self._bot_username: str | None = None
         self._stream_bufs: dict[str, _StreamBuf] = {}  # chat_id -> streaming state
+        self._checkpoint_resolver: Any | None = None  # (task_id, action, param) -> bool
 
     def is_allowed(self, sender_id: str) -> bool:
         """Preserve Telegram's legacy id|username allowlist matching."""
@@ -302,6 +313,9 @@ class TelegramChannel(BaseChannel):
             )
         )
 
+        # Add callback query handler for inline keyboard buttons (Phase 3 checkpoints)
+        self._app.add_handler(CallbackQueryHandler(self._on_callback_query))
+
         logger.info("Starting Telegram bot (polling mode)...")
 
         # Initialize and start polling
@@ -326,7 +340,7 @@ class TelegramChannel(BaseChannel):
 
         # Start polling (this runs until stopped)
         await self._app.updater.start_polling(
-            allowed_updates=["message"],
+            allowed_updates=["message", "callback_query"],
             drop_pending_updates=True  # Ignore old messages on startup
         )
 
@@ -446,7 +460,25 @@ class TelegramChannel(BaseChannel):
         # Send text content
         if msg.content and msg.content != "[empty message]":
             for chunk in split_message(msg.content, TELEGRAM_MAX_MESSAGE_LEN):
-                await self._send_text(chat_id, chunk, reply_params, thread_kwargs)
+                await self._send_text(
+                    chat_id, chunk, reply_params, thread_kwargs,
+                    reply_markup=msg.reply_markup,
+                )
+
+        # Edit reply markup on an existing message (e.g. remove keyboard after resolve)
+        if msg.edit_message_id is not None:
+            try:
+                await self._call_with_retry(
+                    self._app.bot.edit_message_reply_markup,
+                    chat_id=chat_id,
+                    message_id=msg.edit_message_id,
+                    reply_markup=None,
+                )
+            except BadRequest as e:
+                if "message is not modified" in str(e).lower():
+                    pass
+                else:
+                    logger.warning("Failed to edit reply markup: {}", e)
 
     async def _call_with_retry(self, fn, *args, **kwargs):
         """Call an async Telegram API function with retry on pool/network timeout."""
@@ -469,14 +501,17 @@ class TelegramChannel(BaseChannel):
         text: str,
         reply_params=None,
         thread_kwargs: dict | None = None,
+        reply_markup: dict | None = None,
     ) -> None:
         """Send a plain text message with HTML fallback."""
+        markup = self._build_inline_markup(reply_markup) if reply_markup else None
         try:
             html = _markdown_to_telegram_html(text)
             await self._call_with_retry(
                 self._app.bot.send_message,
                 chat_id=chat_id, text=html, parse_mode="HTML",
                 reply_parameters=reply_params,
+                reply_markup=markup,
                 **(thread_kwargs or {}),
             )
         except Exception as e:
@@ -487,6 +522,7 @@ class TelegramChannel(BaseChannel):
                     chat_id=chat_id,
                     text=text,
                     reply_parameters=reply_params,
+                    reply_markup=markup,
                     **(thread_kwargs or {}),
                 )
             except Exception as e2:
@@ -933,6 +969,60 @@ class TelegramChannel(BaseChannel):
             pass
         except Exception as e:
             logger.debug("Typing indicator stopped for {}: {}", chat_id, e)
+
+    @staticmethod
+    def _build_inline_markup(markup_dict: dict) -> InlineKeyboardMarkup | None:
+        """Convert a plain dict markup to InlineKeyboardMarkup.
+
+        Input format matches Telegram Bot API:
+        ``{"inline_keyboard": [[{"text": "...", "callback_data": "..."}]]}``
+        """
+        rows = markup_dict.get("inline_keyboard")
+        if not rows:
+            return None
+        keyboard = []
+        for row in rows:
+            buttons = []
+            for btn in row:
+                buttons.append(InlineKeyboardButton(
+                    text=btn.get("text", ""),
+                    callback_data=btn.get("callback_data"),
+                ))
+            if buttons:
+                keyboard.append(buttons)
+        return InlineKeyboardMarkup(keyboard) if keyboard else None
+
+    async def _on_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle inline keyboard button presses (checkpoint callbacks)."""
+        query: CallbackQuery | None = update.callback_query
+        if not query or not query.data or not self._checkpoint_resolver:
+            return
+
+        # Parse callback data: chk:<task_id>:<action>[:param]
+        from nanobot.checkpoint.broker import CheckpointBroker
+
+        parsed = CheckpointBroker.parse_callback_data(query.data)
+        if parsed is None:
+            return
+
+        task_id, action_str, param = parsed
+
+        try:
+            resolved = self._checkpoint_resolver(task_id, action_str, param)
+        except Exception as e:
+            logger.error("Checkpoint resolver error: {}", e)
+            await query.answer("⚠️ Error processing callback", show_alert=True)
+            return
+
+        if resolved:
+            await query.answer()
+            # Remove the keyboard from the original message
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except BadRequest:
+                pass  # Message may already be edited
+        else:
+            await query.answer("Checkpoint no longer pending", show_alert=True)
 
     async def _on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Log polling / handler errors instead of silently swallowing them."""
