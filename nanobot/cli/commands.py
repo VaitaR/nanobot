@@ -760,6 +760,7 @@ def gateway(
                     try:
                         await asyncio.sleep(8)  # Let channels connect first
                         import json
+                        from datetime import UTC, datetime
 
                         from nanobot import __version__
                         from nanobot.bus.events import OutboundMessage
@@ -779,11 +780,32 @@ def gateway(
                             except Exception:
                                 pass
 
+                        # If restart_gateway tool was used, show reason in startup ping.
+                        tool_marker = config.workspace_path / ".restart-pending"
+                        last_restart_marker = config.workspace_path / ".last-restart"
+                        tool_reason: str | None = None
+                        if tool_marker.exists():
+                            try:
+                                td = json.loads(tool_marker.read_text())
+                                tool_reason = td.get("reason", "")
+                                last_restart_marker.write_text(tool_marker.read_text())
+                                tool_marker.unlink()
+                            except Exception:
+                                pass
+                        else:
+                            # Always record last restart time, even for manual/launchd restarts.
+                            last_restart_marker.write_text(json.dumps({
+                                "reason": "manual",
+                                "timestamp": datetime.now(UTC).isoformat(),
+                            }))
+
                         channel, chat_id = _pick_heartbeat_target()
                         if channel == "cli":
                             return  # No external channel available
                         model_name = agent.model or ""
                         msg = "nanobot 🐈 online"
+                        if tool_reason:
+                            msg += f" (restart reason: {tool_reason})"
                         if model_name:
                             msg += f" ({model_name})"
                         await bus.publish_outbound(

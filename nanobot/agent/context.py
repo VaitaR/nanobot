@@ -1,6 +1,7 @@
 """Context builder for assembling agent prompts."""
 
 import base64
+import json
 import mimetypes
 import platform
 from pathlib import Path
@@ -171,11 +172,22 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
     @staticmethod
     def _build_runtime_context(
         channel: str | None, chat_id: str | None, timezone: str | None = None,
+        workspace: Path | None = None,
     ) -> str:
         """Build untrusted runtime metadata block for injection before the user message."""
         lines = [f"Current Time: {current_time_str(timezone)}"]
         if channel and chat_id:
             lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
+        if workspace is not None:
+            last_restart = workspace / ".last-restart"
+            if last_restart.exists():
+                try:
+                    rd = json.loads(last_restart.read_text(encoding="utf-8"))
+                    ts = rd.get("timestamp", "?")
+                    reason = rd.get("reason", "?")
+                    lines.append(f"Last restart: {ts} — {reason}")
+                except Exception:
+                    pass
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
 
     def _load_bootstrap_files(self) -> str:
@@ -201,7 +213,7 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         current_role: str = "user",
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
-        runtime_ctx = self._build_runtime_context(channel, chat_id, self.timezone)
+        runtime_ctx = self._build_runtime_context(channel, chat_id, self.timezone, workspace=self.workspace)
         user_content = self._build_user_content(current_message, media)
 
         # Merge runtime context and user content into a single user message
