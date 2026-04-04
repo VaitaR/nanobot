@@ -34,6 +34,35 @@ class ContextBuilder:
         self.system_prompt_max_tokens = system_prompt_max_tokens
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
+        self._skill_enhancer = self._init_skill_enhancer()
+
+    @staticmethod
+    def _init_skill_enhancer():
+        """Try to create a skill description enhancer from workspace modules.
+
+        Returns a callable ``(skill_name: str) -> str | None`` that enriches
+        skill descriptions with applied evolution notes.  Returns ``None`` to
+        fall back to the default frontmatter description.
+        """
+        try:
+            from nanobot_workspace.proactive.skill_router import SkillRouter
+
+            workspace_skills = Path.home() / ".nanobot" / "workspace" / "skills"
+            router = SkillRouter(
+                skills_base_path=workspace_skills,
+                description_loader=lambda name: "",
+            )
+
+            def _enhance(skill_name: str) -> str | None:
+                results = router.get_enhanced_descriptions([skill_name])
+                enhanced = results.get(skill_name, "")
+                return enhanced if enhanced else None
+            return _enhance
+        except ImportError:
+            return None
+        except Exception as exc:
+            logger.warning("SkillRouter init failed, disabling: {}", exc)
+            return None
 
     def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
@@ -54,7 +83,7 @@ class ContextBuilder:
             if always_content:
                 parts.append(("always_skills", always_content))
 
-        skills_summary = self.skills.build_skills_summary()
+        skills_summary = self.skills.build_skills_summary(enhancer=self._skill_enhancer)
         if skills_summary:
             header = (
                 "The following skills extend your capabilities. "

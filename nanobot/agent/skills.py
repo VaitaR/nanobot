@@ -131,7 +131,11 @@ class SkillsLoader:
         for s in all_skills:
             name = escape_xml(s["name"])
             path = s["path"]
-            desc = escape_xml(enhancer(s["name"]) if enhancer else self._get_skill_description(s["name"]))
+            desc = escape_xml(
+                (enhancer(s["name"]) or self._get_skill_description(s["name"]))
+                if enhancer
+                else self._get_skill_description(s["name"])
+            )
             skill_meta = self._get_skill_meta(s["name"])
             available = self._check_requirements(skill_meta)
 

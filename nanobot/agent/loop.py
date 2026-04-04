@@ -242,6 +242,28 @@ class AgentLoop:
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
+    def _maybe_wrap_hook(self, hook: AgentHook) -> AgentHook:
+        """Optionally wrap the base hook with workspace extensions.
+
+        Tries to import and create workspace-powered hook wrappers
+        (e.g. EvolutionHook).  On any failure, returns *hook* unchanged.
+        """
+        try:
+            from nanobot_workspace.agent.loop_hooks import create_evolution_hook
+
+            evolved = create_evolution_hook(
+                base_hook=hook,
+                provider=self.provider,
+                model=self.model,
+            )
+            if evolved is not None:
+                return evolved
+        except ImportError:
+            pass
+        except Exception as exc:
+            logger.warning("Workspace hook wrapping failed: {}", exc)
+        return hook
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
@@ -301,12 +323,15 @@ class AgentLoop:
             def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
                 return loop_self._strip_think(content)
 
+        hook = _LoopHook()
+        hook = self._maybe_wrap_hook(hook)
+
         result = await self.runner.run(AgentRunSpec(
             initial_messages=initial_messages,
             tools=self.tools,
             model=self.model,
             max_iterations=self.max_iterations,
-            hook=_LoopHook(),
+            hook=hook,
             error_message="Sorry, I encountered an error calling the AI model.",
             concurrent_tools=True,
             cost_guard=self._cost_guard,
