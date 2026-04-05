@@ -492,7 +492,7 @@ class SubagentManager:
         task: str,
         origin: dict[str, Any],
         decision: "ReviewDecision",
-    ) -> None:
+    ) -> str:
         """Send a text-only escalation alert via the outbound bus."""
         alert = (
             f"⚠️ Subagent checkpoint alert [{label}]\n\n"
@@ -501,10 +501,15 @@ class SubagentManager:
             f"Confidence: {decision.confidence:.0%}\n\n"
             f"The coordinator should review this task and decide whether to retry."
         )
+        metadata: dict[str, Any] = {}
+        thread_id = origin.get("message_thread_id")
+        if thread_id is not None:
+            metadata["message_thread_id"] = thread_id
         await self.bus.publish_outbound(OutboundMessage(
             channel=origin.get("channel", "cli"),
             chat_id=origin.get("chat_id", "direct"),
             content=alert,
+            metadata=metadata,
         ))
 
     @staticmethod

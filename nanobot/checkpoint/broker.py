@@ -138,12 +138,16 @@ class CheckpointBroker:
             f"Auto-continuing in {self._policy.review_timeout}s if no response."
         )
         keyboard = self._build_keyboard(snapshot.task_id, remaining)
+        metadata: dict[str, Any] = {"_checkpoint_escalation": True}
+        thread_id = self._origin.get("message_thread_id")
+        if thread_id is not None:
+            metadata["message_thread_id"] = thread_id
         await self._bus.publish_outbound(OutboundMessage(
             channel=self._origin.get("channel", "cli"),
             chat_id=self._origin.get("chat_id", "direct"),
             content=alert,
             reply_markup=keyboard,
-            metadata={"_checkpoint_escalation": True},
+            metadata=metadata,
         ))
 
     async def _send_details(self, snapshot: CheckpointSnapshot) -> None:
@@ -163,12 +167,16 @@ class CheckpointBroker:
             f"Last LLM output: {snapshot.last_llm_outputs[-1] if snapshot.last_llm_outputs else '(none)'}"
         )
         keyboard = self._build_keyboard(snapshot.task_id, remaining)
+        metadata: dict[str, Any] = {"_checkpoint_escalation": True}
+        thread_id = self._origin.get("message_thread_id")
+        if thread_id is not None:
+            metadata["message_thread_id"] = thread_id
         await self._bus.publish_outbound(OutboundMessage(
             channel=self._origin.get("channel", "cli"),
             chat_id=self._origin.get("chat_id", "direct"),
             content=details,
             reply_markup=keyboard,
-            metadata={"_checkpoint_escalation": True},
+            metadata=metadata,
         ))
 
     async def _send_timeout_notification(self, snapshot: CheckpointSnapshot) -> None:
@@ -178,10 +186,15 @@ class CheckpointBroker:
             f"No response within {self._policy.review_timeout}s. "
             f"Subagent resuming at iteration {snapshot.total_iterations}/{snapshot.max_iterations}."
         )
+        metadata: dict[str, Any] = {}
+        thread_id = self._origin.get("message_thread_id")
+        if thread_id is not None:
+            metadata["message_thread_id"] = thread_id
         await self._bus.publish_outbound(OutboundMessage(
             channel=self._origin.get("channel", "cli"),
             chat_id=self._origin.get("chat_id", "direct"),
             content=notification,
+            metadata=metadata,
         ))
 
     @staticmethod
