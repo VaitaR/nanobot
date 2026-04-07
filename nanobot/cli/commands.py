@@ -599,6 +599,7 @@ def gateway(
         timezone=config.agents.defaults.timezone,
         confirmation_rules=config.tools.confirmation_rules or None,
         permission_policy=dict(config.tools.permission_policy) or None,
+        compaction_config=config.agents.defaults.compaction,
     )
 
     # Set cron callback (needs agent)
@@ -923,6 +924,7 @@ def agent(
         timezone=config.agents.defaults.timezone,
         confirmation_rules=config.tools.confirmation_rules or None,
         permission_policy=dict(config.tools.permission_policy) or None,
+        compaction_config=config.agents.defaults.compaction,
     )
 
     # Shared reference for progress callbacks

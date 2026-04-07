@@ -8,13 +8,16 @@ import secrets
 import string
 import uuid
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 import json_repair
+import structlog
 from openai import AsyncOpenAI
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+
+log = structlog.get_logger(__name__)
 
 if TYPE_CHECKING:
     from nanobot.providers.registry import ProviderSpec
@@ -553,6 +556,30 @@ class OpenAICompatProvider(LLMProvider):
         msg = f"Error: {body.strip()[:500]}" if body and body.strip() else f"Error calling LLM: {e}"
         return LLMResponse(content=msg, finish_reason="error")
 
+
+def _log_messages_on_error(
+    messages: list[dict] | None,
+    error: Exception,
+) -> None:
+    """Log message structure when a provider error occurs (diagnostic)."""
+    if not messages:
+        return
+    # Summarize role sequence and flag anomalies
+    roles = [m.get("role", "?") for m in messages]
+    empty = [
+        i for i, m in enumerate(messages)
+        if not m.get("content") and not m.get("tool_calls") and m.get("role") != "tool"
+    ]
+    body = str(getattr(error, "doc", None) or getattr(getattr(error, "response", None), "text", None) or error)
+    log.warning(
+        "provider.error_messages",
+        error=body[:200],
+        msg_count=len(messages),
+        roles=roles,
+        empty_indices=empty or None,
+        last_roles=roles[-6:],
+    )
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -574,6 +601,7 @@ class OpenAICompatProvider(LLMProvider):
         try:
             return self._parse(await self._client.chat.completions.create(**kwargs))
         except Exception as e:
+            _log_messages_on_error(kwargs.get("messages"), e)
             return self._handle_error(e)
 
     async def chat_stream(
@@ -604,6 +632,7 @@ class OpenAICompatProvider(LLMProvider):
                         await on_content_delta(text)
             return self._parse_chunks(chunks)
         except Exception as e:
+            _log_messages_on_error(kwargs.get("messages"), e)
             return self._handle_error(e)
 
     def get_default_model(self) -> str:

@@ -40,6 +40,20 @@ class CostPolicy(Base):
     rate_limit_rpm: int = 0  # Max LLM calls per minute (sliding window); 0 = no limit
 
 
+class CompactionConfig(Base):
+    """Context compaction settings for long sessions.
+
+    When history tokens exceed the threshold, older messages are summarized
+    into a compact system message using keyword extraction (no LLM calls).
+    """
+
+    enabled: bool = True
+    token_budget: int = 0  # 0 = auto (derived from context_window_tokens)
+    safety_margin: int = 8_000
+    keep_recent: int = 10
+    compaction_threshold: float = 0.75  # Fire when tokens > threshold * effective_budget
+
+
 class AgentDefaults(Base):
     """Default agent configuration."""
 
@@ -56,6 +70,7 @@ class AgentDefaults(Base):
     reasoning_effort: str | None = None  # low / medium / high - enables LLM thinking mode
     timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
     cost_policy: CostPolicy = Field(default_factory=CostPolicy)
+    compaction: CompactionConfig = Field(default_factory=CompactionConfig)
 
 
 class AgentsConfig(Base):
