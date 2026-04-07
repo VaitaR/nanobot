@@ -5,8 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
+from nanobot.bus.events import OutboundMessage
+
 if TYPE_CHECKING:
-    from nanobot.bus.events import InboundMessage, OutboundMessage
+    from nanobot.bus.events import InboundMessage
     from nanobot.session.manager import Session
 
 Handler = Callable[["CommandContext"], Awaitable["OutboundMessage | None"]]
@@ -22,6 +24,15 @@ class CommandContext:
     raw: str
     args: str = ""
     loop: Any = None
+
+    def outbound(self, content: str, **extra_meta: Any) -> OutboundMessage:
+        """Create an OutboundMessage preserving inbound metadata (e.g. message_thread_id)."""
+        return OutboundMessage(
+            channel=self.msg.channel,
+            chat_id=self.msg.chat_id,
+            content=content,
+            metadata={**(self.msg.metadata or {}), **extra_meta},
+        )
 
 
 class CommandRouter:

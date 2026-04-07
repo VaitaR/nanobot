@@ -33,6 +33,7 @@ from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 from nanobot.providers.base import LLMProvider
+from nanobot.react.signal_detector import SignalDetector
 from nanobot.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
@@ -80,6 +81,7 @@ class AgentLoop:
         timezone: str | None = None,
         cost_policy: CostPolicy | None = None,
         confirmation_rules: list[ConfirmationRuleConfig] | None = None,
+        permission_policy: dict[str, str] | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig, WebSearchConfig
 
@@ -152,8 +154,73 @@ class AgentLoop:
             get_tool_definitions=self.tools.get_definitions,
             max_completion_tokens=provider.generation.max_tokens,
         )
+        # --- Workspace: schedule one-time memory maintenance ---
+        self.memory_consolidator.schedule_maintenance()
         self.telemetry = TelemetryCollector(workspace)
+        # --- SignalDetector: graceful degradation ---
+        try:
+            self.signal_detector = SignalDetector()
+            logger.debug("SignalDetector initialised in AgentLoop")
+        except Exception as exc:
+            logger.warning("SignalDetector init failed, skipping signal detection: {}", exc)
+            self.signal_detector = None
+        # --- PermissionEngine: graceful degradation ---
+        try:
+            from nanobot.react.permission_engine import Permission, PermissionEngine
+            custom_policy: dict[str, Permission] = {}
+            if permission_policy:
+                for tool_name, level_str in permission_policy.items():
+                    try:
+                        custom_policy[tool_name] = Permission(level_str.lower())
+                    except ValueError:
+                        logger.warning(
+                            "Unknown permission level '{}' for tool '{}', ignoring",
+                            level_str, tool_name,
+                        )
+            self.permission_engine = PermissionEngine(policy=custom_policy)
+            logger.debug(
+                "PermissionEngine initialised with {} override(s)",
+                len(custom_policy),
+            )
+        except Exception as exc:
+            logger.warning("PermissionEngine init failed, defaulting to ALLOW-all: {}", exc)
+            self.permission_engine = None
         self.heartbeat_service: Any | None = None  # set after construction by gateway
+        # --- Workspace modules: graceful degradation ---
+        self._evolution_hook_factory: Any | None = None
+        try:
+            from nanobot_workspace.agent.loop_hooks import create_evolution_hook  # noqa: WPS433
+            self._evolution_hook_factory = create_evolution_hook
+            logger.debug("Workspace evolution hook factory available")
+        except Exception as exc:
+            logger.debug("Workspace evolution hook unavailable: {}", exc)
+
+        self._diagnose_failure: Any | None = None
+        try:
+            from nanobot_workspace.observability.feedback_loop import (
+                diagnose_failure as _diag,  # noqa: WPS433
+            )
+            self._diagnose_failure = _diag
+            logger.debug("Workspace feedback loop available")
+        except Exception as exc:
+            logger.debug("Workspace feedback loop unavailable: {}", exc)
+
+        self._rotate_sessions: Any | None = None
+        try:
+            from nanobot_workspace.memory.sessions import rotate_sessions as _rs  # noqa: WPS433
+            self._rotate_sessions = _rs
+            logger.debug("Workspace session rotation available")
+        except Exception as exc:
+            logger.debug("Workspace session rotation unavailable: {}", exc)
+
+        self._ws_notify: Any | None = None
+        try:
+            from nanobot_workspace.proactive import notify as _wn  # noqa: WPS433
+            self._ws_notify = _wn
+            logger.debug("Workspace notify bridge available")
+        except Exception as exc:
+            logger.debug("Workspace notify bridge unavailable: {}", exc)
+
         self._register_default_tools()
         self.commands = CommandRouter()
         register_builtin_commands(self.commands)
@@ -242,28 +309,6 @@ class AgentLoop:
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
-    def _maybe_wrap_hook(self, hook: AgentHook) -> AgentHook:
-        """Optionally wrap the base hook with workspace extensions.
-
-        Tries to import and create workspace-powered hook wrappers
-        (e.g. EvolutionHook).  On any failure, returns *hook* unchanged.
-        """
-        try:
-            from nanobot_workspace.agent.loop_hooks import create_evolution_hook
-
-            evolved = create_evolution_hook(
-                base_hook=hook,
-                provider=self.provider,
-                model=self.model,
-            )
-            if evolved is not None:
-                return evolved
-        except ImportError:
-            pass
-        except Exception as exc:
-            logger.warning("Workspace hook wrapping failed: {}", exc)
-        return hook
-
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
@@ -323,8 +368,21 @@ class AgentLoop:
             def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
                 return loop_self._strip_think(content)
 
-        hook = _LoopHook()
-        hook = self._maybe_wrap_hook(hook)
+        _base_hook = _LoopHook()
+        # --- Workspace evolution hook: wrap base hook ---
+        hook = _base_hook
+        if self._evolution_hook_factory is not None:
+            try:
+                _evo_hook = self._evolution_hook_factory(
+                    base_hook=_base_hook,
+                    provider=self.provider,
+                    model=self.model,
+                    cooldown_seconds=300.0,
+                )
+                if _evo_hook is not None:
+                    hook = _evo_hook
+            except Exception as exc:
+                logger.warning("Failed to create workspace evolution hook: {}", exc)
 
         result = await self.runner.run(AgentRunSpec(
             initial_messages=initial_messages,
@@ -335,6 +393,7 @@ class AgentLoop:
             error_message="Sorry, I encountered an error calling the AI model.",
             concurrent_tools=True,
             cost_guard=self._cost_guard,
+            permission_engine=self.permission_engine,
         ))
         self._last_usage = result.usage
         if result.stop_reason == "max_iterations":
@@ -348,6 +407,15 @@ class AgentLoop:
         self._running = True
         await self._connect_mcp()
         logger.info("Agent loop started")
+        # --- Workspace: background maintenance on startup ---
+        if self._rotate_sessions is not None:
+            async def _ws_session_rotation() -> None:
+                try:
+                    self._rotate_sessions()
+                    logger.info("Workspace session rotation complete")
+                except Exception as exc:
+                    logger.warning("Workspace session rotation failed: {}", exc)
+            self._schedule_background(_ws_session_rotation())
 
         while self._running:
             try:
@@ -415,9 +483,38 @@ class AgentLoop:
                         ))
                         stream_segment += 1
 
-                response = await self._process_message(
-                    msg, on_stream=on_stream, on_stream_end=on_stream_end,
-                )
+                try:
+                    response = await asyncio.wait_for(
+                        self._process_message(
+                            msg, on_stream=on_stream, on_stream_end=on_stream_end,
+                        ),
+                        timeout=300,  # 5-minute hard cap per message
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(
+                        "Message processing timed out after 300s for session {}",
+                        msg.session_key,
+                    )
+                    self.telemetry.record_turn(
+                        ts=datetime.now(timezone.utc).isoformat(),
+                        session=msg.session_key,
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        model=self.model,
+                        usage={},
+                        duration_ms=300_000,
+                        stop_reason="timeout",
+                        error="Message processing timed out after 300s",
+                        tools_used=[],
+                        skills=[],
+                        files_touched=[],
+                    )
+                    await self.bus.publish_outbound(OutboundMessage(
+                        channel=msg.channel, chat_id=msg.chat_id,
+                        content="Request timed out (5 min limit). Try a shorter or simpler request.",
+                        metadata=msg.metadata or {},
+                    ))
+                    response = None
                 if response is not None:
                     await self.bus.publish_outbound(response)
                 elif msg.channel == "cli":
@@ -428,11 +525,13 @@ class AgentLoop:
             except asyncio.CancelledError:
                 logger.info("Task cancelled for session {}", msg.session_key)
                 raise
-            except Exception:
+            except Exception as exc:
                 logger.exception("Error processing message for session {}", msg.session_key)
+                error_detail = f"{type(exc).__name__}: {exc}"
                 await self.bus.publish_outbound(OutboundMessage(
                     channel=msg.channel, chat_id=msg.chat_id,
-                    content="Sorry, I encountered an error.",
+                    content=f"System error: {error_detail[:400]}",
+                    metadata=msg.metadata or {},
                 ))
 
     async def close_mcp(self) -> None:
@@ -477,6 +576,11 @@ class AgentLoop:
             await self.memory_consolidator.maybe_consolidate_by_tokens(session)
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"),
                                   msg.metadata.get("message_thread_id"))
+            # Initialise MessageTool so intermediate sends preserve topic routing
+            if message_tool := self.tools.get("message"):
+                if isinstance(message_tool, MessageTool):
+                    message_tool.start_turn()
+                    message_tool.set_turn_metadata(msg.metadata or {})
             history = session.get_history(max_messages=0)
             current_role = "assistant" if msg.sender_id == "subagent" else "user"
             messages = self.context.build_messages(
@@ -492,6 +596,12 @@ class AgentLoop:
             )
             skills, files_touched = self.telemetry.extract_from_events(tool_events)
             self.telemetry.record_turn(ts=datetime.now(timezone.utc).isoformat(), session=key, channel=channel, chat_id=chat_id, model=self.model, usage=usage, duration_ms=int((time.monotonic() - t0) * 1000), stop_reason=stop_reason, error=run_error, tools_used=sys_tools_used, skills=skills, files_touched=files_touched)
+            # --- Workspace feedback loop: diagnose failures ---
+            if run_error and self._diagnose_failure is not None:
+                try:
+                    self._diagnose_failure(f"system:{key}", run_error)
+                except Exception:
+                    pass
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
             self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
@@ -547,8 +657,26 @@ class AgentLoop:
             message_thread_id=msg.metadata.get("message_thread_id"),
         )
 
+        # --- SignalDetector: detect failure/correction patterns ---
+        if self.signal_detector is not None:
+            try:
+                meta_for_signal = {
+                    "channel": msg.channel, "chat_id": msg.chat_id,
+                    "session": key, "tools_used": tools_used,
+                    "stop_reason": stop_reason,
+                }
+                await self.signal_detector.detect_and_feed(msg.content, metadata=meta_for_signal)
+            except Exception:
+                pass  # silently skip — signal detection is non-critical
+
         skills, files_touched = self.telemetry.extract_from_events(tool_events)
         self.telemetry.record_turn(ts=datetime.now(timezone.utc).isoformat(), session=key, channel=msg.channel, chat_id=msg.chat_id, model=self.model, usage=usage, duration_ms=int((time.monotonic() - t0) * 1000), stop_reason=stop_reason, error=run_error, tools_used=tools_used, skills=skills, files_touched=files_touched)
+        # --- Workspace feedback loop: diagnose failures ---
+        if run_error and self._diagnose_failure is not None:
+            try:
+                self._diagnose_failure(f"session:{key}", run_error)
+            except Exception:
+                pass
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
 
@@ -563,7 +691,10 @@ class AgentLoop:
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
 
         meta = dict(msg.metadata or {})
-        if on_stream is not None:
+        # Only mark as streamed when streaming completed normally — error/limit
+        # responses are never delivered via the stream and must be sent as a
+        # regular message so the user actually sees the failure reason.
+        if on_stream is not None and stop_reason == "completed":
             meta["_streamed"] = True
         return OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=final_content,

@@ -7,10 +7,13 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from loguru import logger
+
 from nanobot.agent.cost_guard import CostGuard
 from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.providers.base import LLMProvider, ToolCallRequest
+from nanobot.react.permission_engine import PermissionEngine
 from nanobot.utils.helpers import build_assistant_message
 
 
@@ -47,6 +50,7 @@ class AgentRunSpec:
     fail_on_tool_error: bool = False
     wall_clock_cap: int | None = None
     cost_guard: CostGuard | None = None
+    permission_engine: PermissionEngine | None = None
 
 
 @dataclass(slots=True)
@@ -172,6 +176,12 @@ class AgentRunner:
                     await hook.after_iteration(context)
                     execution_elapsed += time.monotonic() - iter_start
                     break
+                # If all tool calls were blocked by PermissionEngine, stop.
+                if new_events and all(e.get("status") == "denied" for e in new_events):
+                    final_content = "All requested tool calls were denied by permission policy."
+                    await hook.after_iteration(context)
+                    execution_elapsed += time.monotonic() - iter_start
+                    break
                 for tool_call, result in zip(response.tool_calls, results):
                     messages.append({
                         "role": "tool",
@@ -237,15 +247,51 @@ class AgentRunner:
         spec: AgentRunSpec,
         tool_calls: list[ToolCallRequest],
     ) -> tuple[list[Any], list[dict[str, str]], BaseException | None]:
+        # --- Permission gate: filter blocked tool calls ---
+        effective_calls = tool_calls
+        if spec.permission_engine is not None:
+            call_tuples = [
+                (tc.name, dict(tc.arguments))
+                for tc in tool_calls
+            ]
+            allowed, blocked = spec.permission_engine.filter_calls(call_tuples)
+            if blocked:
+                allowed_names = {name for name, _ in allowed}
+                blocked_names = [name for name, _ in call_tuples if name not in allowed_names]
+                logger.info(
+                    "PermissionEngine blocked {} tool(s): {}",
+                    len(blocked), ", ".join(blocked_names),
+                )
+            if len(allowed) < len(tool_calls):
+                # Rebuild the tool_calls list with only allowed calls.
+                allowed_set = {(name, tuple(sorted(args.items()))) for name, args in allowed}
+                effective_calls = [
+                    tc for tc in tool_calls
+                    if (tc.name, tuple(sorted(dict(tc.arguments).items()))) in allowed_set
+                ]
+            if not effective_calls:
+                # All calls blocked — return synthetic denial results.
+                results: list[Any] = []
+                events: list[dict[str, str]] = []
+                for _, tc in zip(blocked, tool_calls[: len(blocked)]):
+                    results.append(f"Permission denied: {blocked[len(results)].reason}")
+                    events.append({
+                        "name": tc.name,
+                        "status": "denied",
+                        "detail": blocked[len(events)].reason,
+                        "arguments": dict(tc.arguments),
+                    })
+                return results, events, None
+
         if spec.concurrent_tools:
             tool_results = await asyncio.gather(*(
                 self._run_tool(spec, tool_call)
-                for tool_call in tool_calls
+                for tool_call in effective_calls
             ))
         else:
             tool_results = [
                 await self._run_tool(spec, tool_call)
-                for tool_call in tool_calls
+                for tool_call in effective_calls
             ]
 
         results: list[Any] = []

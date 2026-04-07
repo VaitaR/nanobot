@@ -8,6 +8,7 @@ import secrets
 import string
 import uuid
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone, timedelta
 from typing import TYPE_CHECKING, Any
 
 import json_repair
@@ -31,6 +32,26 @@ _DEFAULT_OPENROUTER_HEADERS = {
     "X-OpenRouter-Title": "nanobot",
     "X-OpenRouter-Categories": "cli-agent,personal-agent",
 }
+
+# GLM peak-hour throttling: 14:00–18:00 UTC+8 these models cost 3× quota.
+# During that window substitute them with glm-4.7 (1× cost).
+_GLM_PEAK_MODELS: frozenset[str] = frozenset({"glm-5", "glm-5.1", "glm-5-turbo"})
+_GLM_PEAK_FALLBACK = "glm-4.7"
+_TZ_UTC8 = timezone(timedelta(hours=8))
+
+
+def _glm_peak_model(model: str) -> str:
+    """Return *model* unchanged, or the off-peak fallback during GLM peak hours.
+
+    Peak window: 14:00–18:00 UTC+8 (= 06:00–10:00 UTC).
+    Affected models: glm-5, glm-5.1, glm-5-turbo.
+    """
+    if model.lower() not in _GLM_PEAK_MODELS:
+        return model
+    hour = datetime.now(_TZ_UTC8).hour
+    if 14 <= hour < 18:
+        return _GLM_PEAK_FALLBACK
+    return model
 
 
 def _short_tool_id() -> str:
@@ -231,7 +252,7 @@ class OpenAICompatProvider(LLMProvider):
         reasoning_effort: str | None,
         tool_choice: str | dict[str, Any] | None,
     ) -> dict[str, Any]:
-        model_name = model or self.default_model
+        model_name = _glm_peak_model(model or self.default_model)
         spec = self._spec
 
         if spec and spec.supports_prompt_caching:

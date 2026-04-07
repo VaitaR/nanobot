@@ -84,6 +84,7 @@ class SubagentManager:
         hard_cap: int = _SUBAGENT_HARD_CAP,
         idle_timeout: int = _SUBAGENT_IDLE_TIMEOUT,
         checkpoint_policy: "ReviewPolicy | None" = None,
+        executor: str | None = None,
     ) -> str:
         """Spawn a subagent to execute a task in the background.
 
@@ -98,7 +99,23 @@ class SubagentManager:
             hard_cap: Absolute timeout in seconds (default: 1800).
             idle_timeout: No-progress timeout in seconds (default: 300).
             checkpoint_policy: Optional review policy for checkpoint review.
+            executor: Optional executor alias (e.g. "glm-5.1", "openrouter",
+                      "claude-native", "codex-5.4").  If omitted, the manager's
+                      default provider/model is used.
+
+        Raises:
+            ValueError: If *executor* is not a known alias.
         """
+        # ── Validate executor alias early (fail fast) ─────────────────
+        if executor is not None:
+            from nanobot.agent.executor import get_known_executors
+
+            if executor not in get_known_executors():
+                available = ", ".join(get_known_executors())
+                raise ValueError(
+                    f"Unknown executor '{executor}'. Known executors: {available}"
+                )
+
         task_id = str(uuid.uuid4())[:8]
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
         origin: dict[str, Any] = {
@@ -111,7 +128,8 @@ class SubagentManager:
             self._run_subagent(task_id, task, display_label, origin,
                                max_iterations=max_iterations,
                                hard_cap=hard_cap, idle_timeout=idle_timeout,
-                               checkpoint_policy=checkpoint_policy)
+                               checkpoint_policy=checkpoint_policy,
+                               executor=executor)
         )
         self._running_tasks[task_id] = bg_task
         if session_key:
@@ -130,6 +148,38 @@ class SubagentManager:
         logger.info("Spawned subagent [{}]: {}", task_id, display_label)
         return f"Subagent [{display_label}] started (id: {task_id}). I'll notify you when it completes."
 
+    async def _run_cli_executor(
+        self,
+        task_id: str,
+        task: str,
+        label: str,
+        origin: dict[str, Any],
+        ex_info: Any,  # ExecutorInfo from executor.py
+        max_iterations: int | None = None,
+        hard_cap: int = 1800,
+        idle_timeout: int = 300,
+    ) -> None:
+        """Run a CLI-based executor (claude, codex) via canonical execute_acpx."""
+        from nanobot.agent.execution import execute_acpx
+
+        alias = ex_info.alias
+        acpx_agent = ex_info.acpx_agent
+        logger.info("Subagent [{}]: CLI executor '{}', acpx_agent={}, model={}", task_id, alias, acpx_agent, ex_info.model)
+
+        if acpx_agent is None:
+            logger.error("Subagent [{}]: executor '{}' has no acpx_agent mapping", task_id, alias)
+            await self._announce_result(origin, task, label, False,
+                                        f"Executor '{alias}' has no acpx_agent mapping", time.monotonic(), task_id)
+            return
+
+        start_time = time.monotonic()
+
+        result = await execute_acpx(acpx_agent, task, self.workspace, timeout_s=hard_cap)
+
+        logger.info("Subagent [{}]: CLI executor finished, success={}", task_id, result.success)
+        await self._announce_result(origin, task, label, result.success,
+                                    result.summary, start_time, task_id)
+
     async def _run_subagent(
         self,
         task_id: str,
@@ -140,9 +190,36 @@ class SubagentManager:
         hard_cap: int = _SUBAGENT_HARD_CAP,
         idle_timeout: int = _SUBAGENT_IDLE_TIMEOUT,
         checkpoint_policy: "ReviewPolicy | None" = None,
+        executor: str | None = None,
     ) -> None:
         """Execute the subagent task and announce the result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
+
+        # ── Resolve executor ────────────────────────────────────────────
+        effective_provider = self.provider
+        effective_model = self.model
+
+        if executor is not None:
+            from nanobot.agent.executor import resolve_executor
+
+            try:
+                from nanobot.config.loader import load_config
+                cfg = load_config()
+            except Exception:
+                cfg = None
+
+            ex_info = resolve_executor(executor, cfg)
+            if ex_info.is_cli:
+                # CLI-based executors: delegate via ACPX subprocess
+                return await self._run_cli_executor(
+                    task_id, task, label, origin,
+                    ex_info, max_iterations=max_iterations,
+                    hard_cap=hard_cap, idle_timeout=idle_timeout,
+                )
+            if ex_info.provider is not None:
+                effective_provider = ex_info.provider
+            effective_model = ex_info.model
+            logger.info("Subagent [{}] using executor '{}': model={}", task_id, executor, effective_model)
 
         # ── Task lifecycle tracking ─────────────────────────────────────
         nb_task_id = extract_task_id(label)
@@ -242,10 +319,11 @@ class SubagentManager:
                 run_hook = _SubagentHook()
 
             # ── Execute ─────────────────────────────────────────────────
+            runner = AgentRunner(effective_provider)
             spec = AgentRunSpec(
                 initial_messages=messages,
                 tools=tools,
-                model=self.model,
+                model=effective_model,
                 max_iterations=max_iterations,
                 hook=run_hook,
                 max_iterations_message=(
@@ -258,7 +336,7 @@ class SubagentManager:
             )
 
             # ── Execute with concurrent idle watchdog ────────────────────
-            run_task: asyncio.Task = asyncio.create_task(self.runner.run(spec))
+            run_task: asyncio.Task = asyncio.create_task(runner.run(spec))
 
             async def _idle_watchdog() -> None:
                 """Cancel run_task if no progress detected for idle_timeout seconds."""
@@ -742,6 +820,26 @@ Tools like 'read_file' and 'web_fetch' can return native image content. Read vis
         skills_summary = SkillsLoader(self.workspace).build_skills_summary()
         if skills_summary:
             parts.append(f"## Skills\n\nRead SKILL.md with read_file to use a skill.\n\n{skills_summary}")
+
+        # Inject quality gates — every subagent must verify before finishing
+        parts.append("""## Quality Gates (MANDATORY before finishing)
+
+Before you report the task as complete, you MUST run these checks:
+
+1. **Linter**: `cd <repo_root> && uv run ruff check src/ tests/` — must have ZERO errors
+   - Fix any errors before finishing
+   - If you introduced no new errors, confirm with a comment
+
+2. **Formatter**: `cd <repo_root> && uv run ruff format --check src/ tests/` — must pass
+   - If it fails, run `uv run ruff format src/ tests/` to auto-fix
+
+3. **Tests**: `cd <repo_root> && uv run pytest tests/ -q` — ALL tests must pass
+   - Even if your task didn't touch test files, existing tests must not break
+   - If a test breaks because of your changes, fix the root cause
+
+If any check fails, fix the issue and re-run. Do NOT report success with failing checks.
+
+Repo root: /root/Projects/nanobot""")
 
         return "\n\n".join(parts)
 

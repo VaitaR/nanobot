@@ -238,7 +238,7 @@ class TelegramChannel(BaseChannel):
         self._message_threads: dict[tuple[str, int], int] = {}
         self._bot_user_id: int | None = None
         self._bot_username: str | None = None
-        self._stream_bufs: dict[str, _StreamBuf] = {}  # chat_id -> streaming state
+        self._stream_bufs: dict[str, _StreamBuf] = {}  # stream_key -> streaming state
         self._checkpoint_resolver: Any | None = None  # (task_id, action, param) -> bool
 
     def is_allowed(self, sender_id: str) -> bool:
@@ -541,8 +541,14 @@ class TelegramChannel(BaseChannel):
         int_chat_id = int(chat_id)
         stream_id = meta.get("_stream_id")
 
+        message_thread_id = meta.get("message_thread_id")
+        reply_to_message_id = meta.get("message_id") or meta.get("reply_to_message_id")
+        if message_thread_id is None and reply_to_message_id is not None:
+            message_thread_id = self._message_threads.get((chat_id, reply_to_message_id))
+        stream_key = f"{chat_id}:{message_thread_id}:{stream_id}"
+
         if meta.get("_stream_end"):
-            buf = self._stream_bufs.get(chat_id)
+            buf = self._stream_bufs.get(stream_key)
             if not buf or not buf.message_id or not buf.text:
                 return
             if stream_id is not None and buf.stream_id is not None and buf.stream_id != stream_id:
@@ -558,7 +564,7 @@ class TelegramChannel(BaseChannel):
             except Exception as e:
                 if self._is_not_modified_error(e):
                     logger.debug("Final stream edit already applied for {}", chat_id)
-                    self._stream_bufs.pop(chat_id, None)
+                    self._stream_bufs.pop(stream_key, None)
                     return
                 logger.debug("Final stream edit failed (HTML), trying plain: {}", e)
                 try:
@@ -570,17 +576,17 @@ class TelegramChannel(BaseChannel):
                 except Exception as e2:
                     if self._is_not_modified_error(e2):
                         logger.debug("Final stream plain edit already applied for {}", chat_id)
-                        self._stream_bufs.pop(chat_id, None)
+                        self._stream_bufs.pop(stream_key, None)
                         return
                     logger.warning("Final stream edit failed: {}", e2)
                     raise  # Let ChannelManager handle retry
-            self._stream_bufs.pop(chat_id, None)
+            self._stream_bufs.pop(stream_key, None)
             return
 
-        buf = self._stream_bufs.get(chat_id)
+        buf = self._stream_bufs.get(stream_key)
         if buf is None or (stream_id is not None and buf.stream_id is not None and buf.stream_id != stream_id):
             buf = _StreamBuf(stream_id=stream_id)
-            self._stream_bufs[chat_id] = buf
+            self._stream_bufs[stream_key] = buf
         elif buf.stream_id is None:
             buf.stream_id = stream_id
         buf.text += delta
@@ -591,8 +597,7 @@ class TelegramChannel(BaseChannel):
         now = time.monotonic()
         if buf.message_id is None:
             # Extract thread_id for forum groups (same pattern as send())
-            message_thread_id = meta.get("message_thread_id")
-            thread_kwargs = {}
+            thread_kwargs: dict[str, Any] = {}
             if message_thread_id is not None:
                 thread_kwargs["message_thread_id"] = message_thread_id
             try:

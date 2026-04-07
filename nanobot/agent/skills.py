@@ -7,6 +7,8 @@ import shutil
 from pathlib import Path
 from typing import Callable
 
+from nanobot.agent.dynamic_slots import resolve_dynamic_slots
+
 # Default builtin skills directory (relative to this file)
 BUILTIN_SKILLS_DIR = Path(__file__).parent.parent / "skills"
 
@@ -70,13 +72,15 @@ class SkillsLoader:
         # Check workspace first
         workspace_skill = self.workspace_skills / name / "SKILL.md"
         if workspace_skill.exists():
-            return workspace_skill.read_text(encoding="utf-8")
+            content = workspace_skill.read_text(encoding="utf-8")
+            return resolve_dynamic_slots(content)
 
         # Check built-in
         if self.builtin_skills:
             builtin_skill = self.builtin_skills / name / "SKILL.md"
             if builtin_skill.exists():
-                return builtin_skill.read_text(encoding="utf-8")
+                content = builtin_skill.read_text(encoding="utf-8")
+                return resolve_dynamic_slots(content)
 
         return None
 

@@ -17,6 +17,11 @@ from nanobot.channels.telegram import TELEGRAM_REPLY_CONTEXT_MAX_LEN, TelegramCh
 from nanobot.channels.telegram import TelegramConfig
 
 
+def _stream_key(chat_id: str, message_thread_id=None, stream_id=None) -> str:
+    """Compute the composite stream buffer key used by TelegramChannel.send_delta."""
+    return f"{chat_id}:{message_thread_id}:{stream_id}"
+
+
 class _FakeHTTPXRequest:
     instances: list["_FakeHTTPXRequest"] = []
 
@@ -337,12 +342,13 @@ async def test_send_delta_stream_end_raises_and_keeps_buffer_on_failure() -> Non
     )
     channel._app = _FakeApp(lambda: None)
     channel._app.bot.edit_message_text = AsyncMock(side_effect=RuntimeError("boom"))
-    channel._stream_bufs["123"] = _StreamBuf(text="hello", message_id=7, last_edit=0.0)
+    key = _stream_key("123")
+    channel._stream_bufs[key] = _StreamBuf(text="hello", message_id=7, last_edit=0.0)
 
     with pytest.raises(RuntimeError, match="boom"):
         await channel.send_delta("123", "", {"_stream_end": True})
 
-    assert "123" in channel._stream_bufs
+    assert key in channel._stream_bufs
 
 
 @pytest.mark.asyncio
@@ -355,11 +361,12 @@ async def test_send_delta_stream_end_treats_not_modified_as_success() -> None:
     )
     channel._app = _FakeApp(lambda: None)
     channel._app.bot.edit_message_text = AsyncMock(side_effect=BadRequest("Message is not modified"))
-    channel._stream_bufs["123"] = _StreamBuf(text="hello", message_id=7, last_edit=0.0, stream_id="s:0")
+    key = _stream_key("123", stream_id="s:0")
+    channel._stream_bufs[key] = _StreamBuf(text="hello", message_id=7, last_edit=0.0, stream_id="s:0")
 
     await channel.send_delta("123", "", {"_stream_end": True, "_stream_id": "s:0"})
 
-    assert "123" not in channel._stream_bufs
+    assert key not in channel._stream_bufs
 
 
 @pytest.mark.asyncio
@@ -369,7 +376,8 @@ async def test_send_delta_new_stream_id_replaces_stale_buffer() -> None:
         MessageBus(),
     )
     channel._app = _FakeApp(lambda: None)
-    channel._stream_bufs["123"] = _StreamBuf(
+    old_key = _stream_key("123", stream_id="old:0")
+    channel._stream_bufs[old_key] = _StreamBuf(
         text="hello",
         message_id=7,
         last_edit=0.0,
@@ -378,7 +386,8 @@ async def test_send_delta_new_stream_id_replaces_stale_buffer() -> None:
 
     await channel.send_delta("123", "world", {"_stream_delta": True, "_stream_id": "new:0"})
 
-    buf = channel._stream_bufs["123"]
+    new_key = _stream_key("123", stream_id="new:0")
+    buf = channel._stream_bufs[new_key]
     assert buf.text == "world"
     assert buf.stream_id == "new:0"
     assert buf.message_id == 1
@@ -393,12 +402,13 @@ async def test_send_delta_incremental_edit_treats_not_modified_as_success() -> N
         MessageBus(),
     )
     channel._app = _FakeApp(lambda: None)
-    channel._stream_bufs["123"] = _StreamBuf(text="hello", message_id=7, last_edit=0.0, stream_id="s:0")
+    key = _stream_key("123", stream_id="s:0")
+    channel._stream_bufs[key] = _StreamBuf(text="hello", message_id=7, last_edit=0.0, stream_id="s:0")
     channel._app.bot.edit_message_text = AsyncMock(side_effect=BadRequest("Message is not modified"))
 
     await channel.send_delta("123", "", {"_stream_delta": True, "_stream_id": "s:0"})
 
-    assert channel._stream_bufs["123"].last_edit > 0.0
+    assert channel._stream_bufs[key].last_edit > 0.0
 
 
 def test_derive_topic_session_key_uses_thread_id() -> None:

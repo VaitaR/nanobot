@@ -7,12 +7,11 @@ import os
 import sys
 
 from nanobot import __version__
-from nanobot.bus.events import OutboundMessage
 from nanobot.command.router import CommandContext, CommandRouter
 from nanobot.utils.helpers import build_status_content
 
 
-async def cmd_stop(ctx: CommandContext) -> OutboundMessage:
+async def cmd_stop(ctx: CommandContext):
     """Cancel all active tasks and subagents for the session."""
     loop = ctx.loop
     msg = ctx.msg
@@ -26,10 +25,10 @@ async def cmd_stop(ctx: CommandContext) -> OutboundMessage:
     sub_cancelled = await loop.subagents.cancel_by_session(msg.session_key)
     total = cancelled + sub_cancelled
     content = f"Stopped {total} task(s)." if total else "No active task to stop."
-    return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=content)
+    return ctx.outbound(content)
 
 
-async def cmd_restart(ctx: CommandContext) -> OutboundMessage:
+async def cmd_restart(ctx: CommandContext):
     """Restart the process in-place via os.execv."""
     import json
 
@@ -47,10 +46,10 @@ async def cmd_restart(ctx: CommandContext) -> OutboundMessage:
         os.execv(sys.executable, [sys.executable, "-m", "nanobot"] + sys.argv[1:])
 
     asyncio.create_task(_do_restart())
-    return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content="Restarting...")
+    return ctx.outbound("Restarting...")
 
 
-async def cmd_status(ctx: CommandContext) -> OutboundMessage:
+async def cmd_status(ctx: CommandContext):
     """Build an outbound status message for a session."""
     loop = ctx.loop
     session = ctx.session or loop.sessions.get_or_create(ctx.key)
@@ -61,21 +60,19 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
         pass
     if ctx_est <= 0:
         ctx_est = loop._last_usage.get("prompt_tokens", 0)
-    return OutboundMessage(
-        channel=ctx.msg.channel,
-        chat_id=ctx.msg.chat_id,
-        content=build_status_content(
+    return ctx.outbound(
+        build_status_content(
             version=__version__, model=loop.model,
             start_time=loop._start_time, last_usage=loop._last_usage,
             context_window_tokens=loop.context_window_tokens,
             session_msg_count=len(session.get_history(max_messages=0)),
             context_tokens_estimate=ctx_est,
         ),
-        metadata={"render_as": "text"},
+        render_as="text",
     )
 
 
-async def cmd_new(ctx: CommandContext) -> OutboundMessage:
+async def cmd_new(ctx: CommandContext):
     """Start a fresh session."""
     loop = ctx.loop
     session = ctx.session or loop.sessions.get_or_create(ctx.key)
@@ -85,13 +82,10 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
     loop.sessions.invalidate(session.key)
     if snapshot:
         loop._schedule_background(loop.memory_consolidator.archive_messages(snapshot))
-    return OutboundMessage(
-        channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
-        content="New session started.",
-    )
+    return ctx.outbound("New session started.")
 
 
-async def cmd_help(ctx: CommandContext) -> OutboundMessage:
+async def cmd_help(ctx: CommandContext):
     """Return available slash commands."""
     lines = [
         "🐈 nanobot commands:",
@@ -103,15 +97,10 @@ async def cmd_help(ctx: CommandContext) -> OutboundMessage:
         "/heartbeat — Trigger heartbeat check",
         "/help — Show available commands",
     ]
-    return OutboundMessage(
-        channel=ctx.msg.channel,
-        chat_id=ctx.msg.chat_id,
-        content="\n".join(lines),
-        metadata={"render_as": "text"},
-    )
+    return ctx.outbound("\n".join(lines), render_as="text")
 
 
-async def cmd_tasks(ctx: CommandContext) -> OutboundMessage:
+async def cmd_tasks(ctx: CommandContext):
     """List workspace tasks, optionally filtered by status."""
     status_map = {
         "open": "📋", "in_progress": "🔄",
@@ -129,64 +118,37 @@ async def cmd_tasks(ctx: CommandContext) -> OutboundMessage:
         from nanobot_workspace.tasks import TaskStore
         tasks = TaskStore().list_tasks(status_filter)
     except Exception as exc:
-        return OutboundMessage(
-            channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
-            content=f"Error loading tasks: {exc}",
-        )
+        return ctx.outbound(f"Error loading tasks: {exc}")
 
     if not tasks:
-        return OutboundMessage(
-            channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
-            content="No tasks found.",
-        )
+        return ctx.outbound("No tasks found.")
 
     lines = [f"📋 Tasks ({status_filter}):"]
     for t in tasks:
         emoji = status_map.get(t.status, "❓")
         short_id = t.id[:16]
         lines.append(f"  {emoji} {short_id} — {t.title}")
-    return OutboundMessage(
-        channel=ctx.msg.channel,
-        chat_id=ctx.msg.chat_id,
-        content="\n".join(lines),
-        metadata={"render_as": "text"},
-    )
+    return ctx.outbound("\n".join(lines), render_as="text")
 
 
-async def cmd_heartbeat(ctx: CommandContext) -> OutboundMessage:
+async def cmd_heartbeat(ctx: CommandContext):
     """Manually trigger the heartbeat check and return the result."""
     hb = ctx.loop.heartbeat_service
     if hb is None:
-        return OutboundMessage(
-            channel=ctx.msg.channel,
-            chat_id=ctx.msg.chat_id,
-            content="Heartbeat service is not available.",
-        )
+        return ctx.outbound("Heartbeat service is not available.")
     try:
         result = await hb.trigger_now()
         action = result.get("action", "skip")
         tasks = result.get("tasks", "")
         response = result.get("result", "")
         if action == "skip":
-            return OutboundMessage(
-                channel=ctx.msg.channel,
-                chat_id=ctx.msg.chat_id,
-                content=f"💓 Heartbeat: skip — no active tasks.\n{tasks}".strip(),
-            )
+            return ctx.outbound(f"💓 Heartbeat: skip — no active tasks.\n{tasks}".strip())
         lines = [f"💓 Heartbeat: run\n\n📋 Tasks: {tasks}"]
         if response:
             lines.append(f"\n✅ Result:\n{response}")
-        return OutboundMessage(
-            channel=ctx.msg.channel,
-            chat_id=ctx.msg.chat_id,
-            content="\n".join(lines),
-        )
+        return ctx.outbound("\n".join(lines))
     except Exception as e:
-        return OutboundMessage(
-            channel=ctx.msg.channel,
-            chat_id=ctx.msg.chat_id,
-            content=f"Heartbeat error: {e}",
-        )
+        return ctx.outbound(f"Heartbeat error: {e}")
 
 
 def register_builtin_commands(router: CommandRouter) -> None:

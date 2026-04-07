@@ -175,7 +175,13 @@ class ChannelManager:
         Returns:
             tuple of (merged_message, list_of_non_matching_messages)
         """
-        target_key = (first_msg.channel, first_msg.chat_id)
+        first_meta = first_msg.metadata or {}
+        target_key = (
+            first_msg.channel,
+            first_msg.chat_id,
+            first_meta.get("message_thread_id"),
+            first_meta.get("_stream_id"),
+        )
         combined_content = first_msg.content
         final_metadata = dict(first_msg.metadata or {})
         non_matching: list[OutboundMessage] = []
@@ -189,7 +195,13 @@ class ChannelManager:
                 break
 
             # Check if this message belongs to the same stream
-            same_target = (next_msg.channel, next_msg.chat_id) == target_key
+            next_meta = next_msg.metadata or {}
+            same_target = (
+                next_msg.channel,
+                next_msg.chat_id,
+                next_meta.get("message_thread_id"),
+                next_meta.get("_stream_id"),
+            ) == target_key
             is_delta = next_msg.metadata and next_msg.metadata.get("_stream_delta")
             is_end = next_msg.metadata and next_msg.metadata.get("_stream_end")
 

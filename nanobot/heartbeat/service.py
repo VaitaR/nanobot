@@ -8,64 +8,19 @@ from typing import TYPE_CHECKING, Any, Callable, Coroutine
 
 from loguru import logger
 
+from nanobot.heartbeat.drain import (
+    HEARTBEAT_SYSTEM_PROMPT,
+    HEARTBEAT_TOOL,
+    collect_pending,
+    mark_delivered,
+)
+
 if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
 
-_HEARTBEAT_TOOL = [
-    {
-        "type": "function",
-        "function": {
-            "name": "heartbeat",
-            "description": "Report heartbeat decision after reviewing tasks.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["skip", "run", "review"],
-                        "description": (
-                            "skip = nothing to do, "
-                            "run = has active tasks to spawn/work on, "
-                            "review = subagent completed a task, decide done/failed"
-                        ),
-                    },
-                    "tasks": {
-                        "type": "string",
-                        "description": "Natural-language summary of active tasks (required for run/review)",
-                    },
-                    "review_decision": {
-                        "type": "array",
-                        "description": "For review action: list of {task_id, verdict, note}. verdict: done or failed.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "task_id": {"type": "string"},
-                                "verdict": {"type": "string", "enum": ["done", "failed"]},
-                                "note": {"type": "string"},
-                            },
-                            "required": ["task_id", "verdict", "note"],
-                        },
-                    },
-                },
-                "required": ["action"],
-            },
-        },
-    }
-]
-
 
 class HeartbeatService:
-    """
-    Periodic heartbeat service that wakes the agent to check for tasks.
-
-    Phase 1 (decision): reads HEARTBEAT.md and asks the LLM — via a virtual
-    tool call — whether there are active tasks.  This avoids free-text parsing
-    and the unreliable HEARTBEAT_OK token.
-
-    Phase 2 (execution): only triggered when Phase 1 returns ``run``.  The
-    ``on_execute`` callback runs the task through the full agent loop and
-    returns the result to deliver.
-    """
+    """Periodic heartbeat: LLM decides skip/run/review, then executes if needed."""
 
     def __init__(
         self,
@@ -83,8 +38,7 @@ class HeartbeatService:
         self.model = model
         self.on_execute = on_execute
         self.on_notify = on_notify
-        # on_tick_report is set as an attribute AFTER construction, not a constructor param.
-        # Do NOT add it to __init__ signature — set it as: heartbeat.on_tick_report = fn
+        # Set as attribute AFTER construction, NOT in __init__ signature.
         self.on_tick_report: Callable[[str], Coroutine[Any, Any, None]] | None = None
         self.interval_s = interval_s
         self.enabled = enabled
@@ -104,16 +58,52 @@ class HeartbeatService:
                 return None
         return None
 
-    async def _decide(
-        self,
-        content: str,
-        pending_review: list[dict[str, str]] | None = None,
-    ) -> tuple[str, str, list[dict[str, str]]]:
-        """Phase 1: ask LLM to decide skip/run/review via virtual tool call.
+    # ------------------------------------------------------------------
+    # Review helpers
+    # ------------------------------------------------------------------
 
-        Returns (action, tasks, review_decisions).
-        review_decisions is a list of dicts with task_id, verdict, note.
+    @staticmethod
+    async def _fetch_pending_review() -> list[dict[str, str]]:
+        """Query completed delegations needing review."""
+        try:
+            from nanobot.agent.task_lifecycle import query_pending_review
+            return await query_pending_review()
+        except Exception:
+            return []
+
+    @staticmethod
+    async def _process_reviews(review_decisions: list[dict[str, str]]) -> list[dict]:
+        """Process review decisions: close tasks or mark failures.
+
+        Returns list of processed results for reporting.
         """
+        if not review_decisions:
+            return []
+        from nanobot.agent.task_lifecycle import close_task, mark_task_delegation_failure
+
+        results: list[dict] = []
+        for dec in review_decisions:
+            tid, verdict, note = dec.get("task_id", ""), dec.get("verdict", ""), dec.get("note", "")
+            if not tid:
+                continue
+            if verdict == "done" and note:
+                ok = await close_task(tid, note)
+                logger.info("Heartbeat: closed task {} as {}", tid[:20], "done" if ok else "failed")
+                results.append({"task_id": tid, "verdict": verdict, "ok": ok})
+            elif verdict == "failed":
+                await mark_task_delegation_failure(tid, note or "heartbeat review: marked failed")
+                logger.info("Heartbeat: marked task {} as failed", tid[:20])
+                results.append({"task_id": tid, "verdict": verdict, "ok": True})
+        return results
+
+    # ------------------------------------------------------------------
+    # Phase 1: Decide
+    # ------------------------------------------------------------------
+
+    async def _decide(
+        self, content: str, pending_review: list[dict[str, str]] | None = None,
+    ) -> tuple[str, str, list[dict[str, str]]]:
+        """Ask LLM to decide skip/run/review. Returns (action, tasks, review_decisions)."""
         from nanobot.utils.helpers import current_time_str
 
         user_content = (
@@ -121,66 +111,69 @@ class HeartbeatService:
             "Review the following HEARTBEAT.md and decide whether there are active tasks.\n\n"
             f"{content}"
         )
-
         if pending_review:
-            review_block = "\n\n## Pending Review — subagent-delegated tasks that completed\n"
-            review_block += "These tasks were delegated to subagents which have finished. "
-            review_block += "Review the task descriptions and decide: mark as done (success) or failed.\n\n"
-            for t in pending_review:
-                review_block += f"- **{t['id']}**: {t['title']}\n"
-            user_content += review_block
+            user_content += (
+                "\n\n## Pending Review — completed subagent tasks\n"
+                "Decide: mark done (success) or failed.\n"
+                + "\n".join(f"- **{t['id']}**: {t['title']}" for t in pending_review)
+            )
 
         response = await self.provider.chat_with_retry(
             messages=[
-                {"role": "system", "content": (
-                    "You are a heartbeat agent. Call the heartbeat tool to report your decision.\n\n"
-                    "Actions:\n"
-                    "- skip: nothing to do\n"
-                    "- run: there are active tasks to work on (spawn subagent, do research, etc.)\n"
-                    "- review: a subagent completed a delegated task and you need to decide done/failed\n\n"
-                    "For review action, include review_decision array with task_id, verdict (done/failed), "
-                    "and note (validation evidence). Only mark done if the subagent likely succeeded "
-                    "(tests passed, files created, etc.). If uncertain, mark failed."
-                )},
+                {"role": "system", "content": HEARTBEAT_SYSTEM_PROMPT},
                 {"role": "user", "content": user_content},
             ],
-            tools=_HEARTBEAT_TOOL,
+            tools=HEARTBEAT_TOOL,
             model=self.model,
         )
-
         if not response.has_tool_calls:
             return "skip", "", []
-
         args = response.tool_calls[0].arguments
-        action = args.get("action", "skip")
-        tasks = args.get("tasks", "")
-        review_decisions = args.get("review_decision", [])
-        if not isinstance(review_decisions, list):
-            review_decisions = []
-        return action, tasks, review_decisions
+        review = args.get("review_decision", [])
+        return args.get("action", "skip"), args.get("tasks", ""), review if isinstance(review, list) else []
+
+    # ------------------------------------------------------------------
+    # Notification drain
+    # ------------------------------------------------------------------
+
+    async def _deliver_pending(self) -> None:
+        """Deliver pending proactive notifications and mark them sent."""
+        if not self.on_notify:
+            return
+        try:
+            pending = collect_pending()
+            ids = [n["id"] for n in pending]
+            for n in pending:
+                try:
+                    await self.on_notify(n.get("content", ""))
+                except Exception:
+                    logger.warning("drain: delivery failed for {}", n.get("id"))
+            if ids:
+                mark_delivered(ids)
+        except Exception:
+            logger.exception("drain: unexpected error")
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        """Start the heartbeat service."""
         if not self.enabled:
             logger.info("Heartbeat disabled")
             return
         if self._running:
-            logger.warning("Heartbeat already running")
             return
-
         self._running = True
         self._task = asyncio.create_task(self._run_loop())
         logger.info("Heartbeat started (every {}s)", self.interval_s)
 
     def stop(self) -> None:
-        """Stop the heartbeat service."""
         self._running = False
         if self._task:
             self._task.cancel()
             self._task = None
 
     async def _run_loop(self) -> None:
-        """Main heartbeat loop."""
         while self._running:
             try:
                 await asyncio.sleep(self.interval_s)
@@ -191,139 +184,90 @@ class HeartbeatService:
             except Exception as e:
                 logger.error("Heartbeat error: {}", e)
 
+    # ------------------------------------------------------------------
+    # Tick (periodic)
+    # ------------------------------------------------------------------
+
     async def _tick(self) -> None:
-        """Execute a single heartbeat tick."""
         from nanobot.utils.evaluator import evaluate_response
 
         content = self._read_heartbeat_file()
         if not content:
-            logger.debug("Heartbeat: HEARTBEAT.md missing or empty")
             return
 
         logger.info("Heartbeat: checking for tasks...")
-
-        # Send start ping
         if self.on_tick_report:
             await self.on_tick_report("start", "", None)
 
         try:
-            # Check for completed delegations that need review
-            pending_review: list[dict[str, str]] = []
-            try:
-                from nanobot.agent.task_lifecycle import query_pending_review
-                pending_review = await query_pending_review()
-            except Exception as exc:
-                logger.warning("Heartbeat: delegation review check failed: {}", exc)
-
+            pending_review = await self._fetch_pending_review()
             if pending_review:
                 logger.info("Heartbeat: {} tasks pending review", len(pending_review))
 
             action, tasks, review_decisions = await self._decide(content, pending_review or None)
-
-            # Handle review decisions first
-            if review_decisions:
-                from nanobot.agent.task_lifecycle import close_task
-                for dec in review_decisions:
-                    tid = dec.get("task_id", "")
-                    verdict = dec.get("verdict", "")
-                    note = dec.get("note", "")
-                    if not tid:
-                        continue
-                    if verdict == "done" and note:
-                        ok = await close_task(tid, note)
-                        logger.info(
-                            "Heartbeat: closed task {} as done: {}",
-                            tid[:20], "ok" if ok else "failed",
-                        )
-                    elif verdict == "failed":
-                        from nanobot.agent.task_lifecycle import mark_task_delegation_failure
-                        await mark_task_delegation_failure(tid, note or "heartbeat review: marked failed")
-                        logger.info("Heartbeat: marked task {} as failed", tid[:20])
+            await self._process_reviews(review_decisions)
 
             if action == "review" and not review_decisions:
-                logger.info("Heartbeat: review action but no decisions — skipping")
+                logger.info("Heartbeat: review action but no decisions")
                 return
 
-            if action != "run":
-                logger.info("Heartbeat: OK (nothing to report)")
-            else:
+            if action == "run" and self.on_execute:
                 logger.info("Heartbeat: tasks found, executing...")
-                if self.on_execute:
-                    response = await self.on_execute(tasks)
+                try:
+                    response = await asyncio.wait_for(self.on_execute(tasks), timeout=600)
+                except asyncio.TimeoutError:
+                    logger.error("Heartbeat: on_execute timed out")
+                    response = None
+                if response:
+                    should_notify = await evaluate_response(response, tasks, self.provider, self.model)
+                    if should_notify and self.on_notify:
+                        await self.on_notify(response)
+            else:
+                logger.info("Heartbeat: nothing to report")
 
-                    if response:
-                        should_notify = await evaluate_response(
-                            response, tasks, self.provider, self.model,
-                        )
-                        if should_notify and self.on_notify:
-                            logger.info("Heartbeat: completed, delivering response")
-                            await self.on_notify(response)
-                        else:
-                            logger.info("Heartbeat: silenced by post-run evaluation")
-
-            # Send brief tick report to user
             if self.on_tick_report:
                 await self.on_tick_report(action, tasks, review_decisions)
         except Exception:
             logger.exception("Heartbeat execution failed")
 
-    async def trigger_now(self) -> dict:
-        """Manually trigger a heartbeat and return a structured result.
+        await self._deliver_pending()
 
-        Returns a dict with:
-            - ``action``: ``"skip"``, ``"run"``, or ``"review"``
-            - ``tasks``: natural-language summary (empty for skip)
-            - ``result``: execution response (only for run)
-            - ``review_decisions``: list of review decisions
-        """
-        # Send start ping
+    # ------------------------------------------------------------------
+    # Trigger (manual)
+    # ------------------------------------------------------------------
+
+    async def trigger_now(self) -> dict:
+        """Manually trigger heartbeat, return structured result."""
         if self.on_tick_report:
             await self.on_tick_report("start", "", None)
 
         content = self._read_heartbeat_file()
         if not content:
-            result = {"action": "skip", "tasks": "", "result": "HEARTBEAT.md missing or empty", "review_decisions": []}
+            r = {"action": "skip", "tasks": "", "result": "HEARTBEAT.md missing", "review_decisions": []}
             if self.on_tick_report:
                 await self.on_tick_report("skip", "", None)
-            return result
+            return r
 
-        pending_review: list[dict[str, str]] = []
-        try:
-            from nanobot.agent.task_lifecycle import query_pending_review
-            pending_review = await query_pending_review()
-        except Exception:
-            pass
-
-        action, tasks, review_decisions = await self._decide(content, pending_review or None)
-
-        # Handle review decisions
-        if review_decisions:
-            from nanobot.agent.task_lifecycle import close_task
-            closed = []
-            for dec in review_decisions:
-                tid = dec.get("task_id", "")
-                verdict = dec.get("verdict", "")
-                note = dec.get("note", "")
-                if not tid:
-                    continue
-                if verdict == "done" and note:
-                    ok = await close_task(tid, note)
-                    closed.append({"task_id": tid, "verdict": verdict, "ok": ok})
-                elif verdict == "failed":
-                    from nanobot.agent.task_lifecycle import mark_task_delegation_failure
-                    await mark_task_delegation_failure(tid, note or "heartbeat review: marked failed")
-                    closed.append({"task_id": tid, "verdict": verdict, "ok": True})
-            if closed:
-                if self.on_tick_report:
-                    await self.on_tick_report("review", tasks, review_decisions)
-                return {"action": "review", "tasks": tasks, "result": "", "review_decisions": closed}
+        action, tasks, review_decisions = await self._decide(
+            content, await self._fetch_pending_review() or None,
+        )
+        closed = await self._process_reviews(review_decisions)
+        if closed:
+            if self.on_tick_report:
+                await self.on_tick_report("review", tasks, review_decisions)
+            return {"action": "review", "tasks": tasks, "result": "", "review_decisions": closed}
 
         if action != "run" or not self.on_execute:
             if self.on_tick_report:
                 await self.on_tick_report(action, tasks, None)
             return {"action": action, "tasks": tasks, "result": "", "review_decisions": []}
 
-        result = await self.on_execute(tasks)
+        try:
+            result = await asyncio.wait_for(self.on_execute(tasks), timeout=600)
+        except asyncio.TimeoutError:
+            logger.error("Heartbeat trigger_now: timed out")
+            result = None
         if self.on_tick_report:
             await self.on_tick_report("run", tasks, None)
+        await self._deliver_pending()
         return {"action": "run", "tasks": tasks, "result": result or "", "review_decisions": []}

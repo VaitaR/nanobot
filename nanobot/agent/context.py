@@ -9,6 +9,7 @@ from typing import Any
 
 from loguru import logger
 
+from nanobot.agent.dynamic_slots import resolve_dynamic_slots
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
 from nanobot.utils.helpers import build_assistant_message, current_time_str, detect_image_mime
@@ -34,35 +35,8 @@ class ContextBuilder:
         self.system_prompt_max_tokens = system_prompt_max_tokens
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
-        self._skill_enhancer = self._init_skill_enhancer()
-
-    @staticmethod
-    def _init_skill_enhancer():
-        """Try to create a skill description enhancer from workspace modules.
-
-        Returns a callable ``(skill_name: str) -> str | None`` that enriches
-        skill descriptions with applied evolution notes.  Returns ``None`` to
-        fall back to the default frontmatter description.
-        """
-        try:
-            from nanobot_workspace.proactive.skill_router import SkillRouter
-
-            workspace_skills = Path.home() / ".nanobot" / "workspace" / "skills"
-            router = SkillRouter(
-                skills_base_path=workspace_skills,
-                description_loader=lambda name: "",
-            )
-
-            def _enhance(skill_name: str) -> str | None:
-                results = router.get_enhanced_descriptions([skill_name])
-                enhanced = results.get(skill_name, "")
-                return enhanced if enhanced else None
-            return _enhance
-        except ImportError:
-            return None
-        except Exception as exc:
-            logger.warning("SkillRouter init failed, disabling: {}", exc)
-            return None
+        # --- Workspace SkillRouter: lazy init for enhanced descriptions ---
+        self._skill_router = None  # None=not tried, False=failed, object=ready
 
     def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
@@ -83,7 +57,7 @@ class ContextBuilder:
             if always_content:
                 parts.append(("always_skills", always_content))
 
-        skills_summary = self.skills.build_skills_summary(enhancer=self._skill_enhancer)
+        skills_summary = self.skills.build_skills_summary(enhancer=self._get_skill_enhancer())
         if skills_summary:
             header = (
                 "The following skills extend your capabilities. "
@@ -198,6 +172,38 @@ Your workspace is at: {workspace_path}
 Reply directly with text for conversations. Only use the 'message' tool to send to a specific chat channel.
 IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST call the 'message' tool with the 'media' parameter. Do NOT use read_file to "send" a file — reading a file only shows its content to you, it does NOT deliver the file to the user. Example: message(content="Here is the file", media=["/path/to/file.png"])"""
 
+    def _get_skill_enhancer(self):
+        """Return a skill description enhancer callback, or None.
+
+        Uses the workspace SkillRouter to append applied evolution notes
+        to skill descriptions.  Returns None if the router is unavailable.
+        """
+        if self._skill_router is False:
+            return None
+        if self._skill_router is None:
+            try:
+                from nanobot_workspace.proactive.skill_router import SkillRouter  # noqa: WPS433
+                self._skill_router = SkillRouter(
+                    skills_base_path=self.workspace / "skills",
+                    description_loader=self.skills._get_skill_description,
+                )
+                logger.debug("SkillRouter initialised for enhanced descriptions")
+            except Exception as exc:
+                logger.debug("SkillRouter unavailable: {}", exc)
+                self._skill_router = False
+        if self._skill_router is False or self._skill_router is None:
+            return None
+
+        def _enhance(skill_name: str) -> str:
+            base = self.skills._get_skill_description(skill_name)
+            try:
+                enhanced = self._skill_router.get_enhanced_descriptions([skill_name])
+                return enhanced.get(skill_name, base)
+            except Exception:
+                return base
+
+        return _enhance
+
     @staticmethod
     def _build_runtime_context(
         channel: str | None, chat_id: str | None, timezone: str | None = None,
@@ -227,6 +233,7 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
             file_path = self.workspace / filename
             if file_path.exists():
                 content = file_path.read_text(encoding="utf-8")
+                content = resolve_dynamic_slots(content)
                 parts.append(f"## {filename}\n\n{content}")
 
         return "\n\n".join(parts) if parts else ""

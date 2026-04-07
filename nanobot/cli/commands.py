@@ -438,6 +438,32 @@ def _make_provider(config: Config):
         max_tokens=defaults.max_tokens,
         reasoning_effort=defaults.reasoning_effort,
     )
+
+    # --- OpenRouter fallback: wrap primary if openrouter key is configured ---
+    or_cfg = config.providers.openrouter
+    if or_cfg and or_cfg.api_key:
+        from nanobot.providers.fallback import FallbackProvider
+        from nanobot.providers.openai_compat_provider import OpenAICompatProvider
+        from nanobot.providers.registry import find_by_name as _find
+
+        or_spec = _find("openrouter")
+        or_fallback_model = or_cfg.fallback_model or "qwen/qwen3.6-plus:free"
+        backup = OpenAICompatProvider(
+            api_key=or_cfg.api_key,
+            default_model=or_fallback_model,
+            spec=or_spec,
+        )
+        backup.generation = GenerationSettings(
+            temperature=defaults.temperature,
+            max_tokens=defaults.max_tokens,
+            reasoning_effort=defaults.reasoning_effort,
+        )
+        provider = FallbackProvider(primary=provider, backup=backup, fallback_model=or_fallback_model)
+        import logging as _logging
+        _logging.getLogger(__name__).debug(
+            "OpenRouter fallback enabled → %s", or_fallback_model
+        )
+
     return provider
 
 
@@ -572,6 +598,7 @@ def gateway(
         channels_config=config.channels,
         timezone=config.agents.defaults.timezone,
         confirmation_rules=config.tools.confirmation_rules or None,
+        permission_policy=dict(config.tools.permission_policy) or None,
     )
 
     # Set cron callback (needs agent)
@@ -895,6 +922,7 @@ def agent(
         channels_config=config.channels,
         timezone=config.agents.defaults.timezone,
         confirmation_rules=config.tools.confirmation_rules or None,
+        permission_policy=dict(config.tools.permission_policy) or None,
     )
 
     # Shared reference for progress callbacks

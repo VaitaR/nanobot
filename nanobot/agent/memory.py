@@ -13,6 +13,9 @@ from loguru import logger
 
 from nanobot.utils.helpers import ensure_dir, estimate_message_tokens, estimate_prompt_tokens_chain
 
+_TOOL_RESULT_STRIP_PLACEHOLDER = "[tool result stripped to save context]"
+_DEFAULT_STRIP_KEEP_RECENT = 50
+
 if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
     from nanobot.session.manager import Session, SessionManager
@@ -72,6 +75,48 @@ def _is_tool_choice_unsupported(content: str | None) -> bool:
     return any(m in text for m in _TOOL_CHOICE_ERROR_MARKERS)
 
 
+def strip_old_tool_results(
+    messages: list[dict],
+    keep_recent: int = _DEFAULT_STRIP_KEEP_RECENT,
+    placeholder: str = _TOOL_RESULT_STRIP_PLACEHOLDER,
+) -> int:
+    """Replace tool-result content in old messages to save context tokens.
+
+    Only messages with ``role="tool"`` are affected.  User, assistant, and
+    system messages are left untouched.  All other keys on the message dict
+    (``tool_call_id``, ``name``, etc.) are preserved.
+
+    Operates **in-place** on *messages* and returns the number of messages
+    whose content was replaced.
+
+    Parameters
+    ----------
+    messages:
+        The full session message list.
+    keep_recent:
+        The most recent N messages whose tool results will *not* be touched.
+        If ``len(messages) <= keep_recent`` the function returns immediately.
+    placeholder:
+        The short string that replaces the original tool-result content.
+    """
+    if len(messages) <= keep_recent:
+        return 0
+
+    count = 0
+    for msg in messages[:-keep_recent]:
+        if msg.get("role") != "tool":
+            continue
+        content = msg.get("content")
+        if content is None:
+            continue
+        # Already stripped — skip (idempotent).
+        if isinstance(content, str) and content == placeholder:
+            continue
+        msg["content"] = placeholder
+        count += 1
+    return count
+
+
 class MemoryStore:
     """Two-layer memory: MEMORY.md (long-term facts) + HISTORY.md (grep-searchable log)."""
 
@@ -83,6 +128,9 @@ class MemoryStore:
         self.history_file = self.memory_dir / "HISTORY.md"
         self._consecutive_failures = 0
         self._last_chunk_summary: str = ""
+        # --- Workspace FTS: lazy init ---
+        self._fts: Any | None = None
+        self._fts_init_attempted: bool = False
 
     def read_long_term(self) -> str:
         if self.memory_file.exists():
@@ -114,6 +162,56 @@ class MemoryStore:
     def get_memory_context(self) -> str:
         long_term = self.read_long_term()
         return f"## Long-term Memory\n{long_term}" if long_term else ""
+
+    def _init_fts(self) -> Any | None:
+        """Lazily initialise MemoryFTS (one attempt only)."""
+        if self._fts_init_attempted:
+            return self._fts
+        self._fts_init_attempted = True
+        try:
+            from nanobot_workspace.memory.fts import MemoryFTS  # noqa: WPS433
+            db_path = self.memory_dir / "memory_fts.db"
+            fts = MemoryFTS(db_path)
+            fts.reindex_all(self.memory_dir)
+            self._fts = fts
+            logger.info("MemoryFTS initialised and indexed")
+        except Exception as exc:
+            logger.warning("MemoryFTS init failed, search unavailable: {}", exc)
+        return self._fts
+
+    def _reindex_fts(self) -> None:
+        """Reindex FTS after memory files change (non-critical)."""
+        if self._fts is not None:
+            try:
+                self._fts.reindex_all(self.memory_dir)
+            except Exception:
+                pass
+
+    def search_memory(self, query: str, limit: int = 20) -> list[Any]:
+        """Full-text search across memory files (MEMORY.md, HISTORY.md, etc.).
+
+        Returns a list of SearchResult objects or an empty list.
+        Requires ``nanobot-workspace`` with sqlite3 FTS5 support.
+        """
+        fts = self._init_fts()
+        if fts is None:
+            return []
+        try:
+            return fts.search(query, limit=limit)
+        except Exception:
+            return []
+
+    def run_maintenance(self) -> None:
+        """Run workspace memory maintenance: history archival, key redaction, compaction.
+
+        Non-critical: errors are logged but never raised.
+        """
+        try:
+            from nanobot_workspace.memory.consolidate import run_consolidation  # noqa: WPS433
+            run_consolidation(self.memory_dir)
+            logger.info("Workspace memory maintenance complete")
+        except Exception as exc:
+            logger.debug("Workspace memory maintenance unavailable: {}", exc)
 
     @staticmethod
     def _format_messages(messages: list[dict]) -> str:
@@ -225,6 +323,7 @@ class MemoryStore:
             self._last_chunk_summary = entry
 
             self._consecutive_failures = 0
+            self._reindex_fts()
             logger.info("Memory consolidation done for {} messages", len(messages))
             return True
         except Exception:
@@ -238,6 +337,7 @@ class MemoryStore:
             return False
         self._raw_archive(messages)
         self._consecutive_failures = 0
+        self._reindex_fts()
         return True
 
     def _raw_archive(self, messages: list[dict]) -> None:
@@ -270,6 +370,7 @@ class MemoryConsolidator:
         build_messages: Callable[..., list[dict[str, Any]]],
         get_tool_definitions: Callable[[], list[dict[str, Any]]],
         max_completion_tokens: int = 4096,
+        strip_tool_keep_recent: int = _DEFAULT_STRIP_KEEP_RECENT,
     ):
         self.store = MemoryStore(workspace)
         self.provider = provider
@@ -280,10 +381,22 @@ class MemoryConsolidator:
         self._build_messages = build_messages
         self._get_tool_definitions = get_tool_definitions
         self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+        self._maintenance_scheduled = False
+        self._strip_tool_keep_recent = strip_tool_keep_recent
 
     def get_lock(self, session_key: str) -> asyncio.Lock:
         """Return the shared consolidation lock for one session."""
         return self._locks.setdefault(session_key, asyncio.Lock())
+
+    def schedule_maintenance(self) -> None:
+        """Run workspace memory maintenance once (history archival, key redaction)."""
+        if self._maintenance_scheduled:
+            return
+        self._maintenance_scheduled = True
+        try:
+            self.store.run_maintenance()
+        except Exception:
+            pass
 
     async def consolidate_messages(self, messages: list[dict[str, object]]) -> bool:
         """Archive a selected message chunk into persistent memory."""
@@ -348,6 +461,18 @@ class MemoryConsolidator:
 
         lock = self.get_lock(session.key)
         async with lock:
+            # Cheap context savings: strip old tool results before expensive estimation.
+            stripped = strip_old_tool_results(
+                session.messages, keep_recent=self._strip_tool_keep_recent,
+            )
+            if stripped:
+                logger.info(
+                    "Stripped tool results from {} old messages in session {}",
+                    stripped,
+                    session.key,
+                )
+                self.sessions.save(session)
+
             budget = self.context_window_tokens - self.max_completion_tokens - self._SAFETY_BUFFER
             target = budget // 2
             estimated, source = self.estimate_session_prompt_tokens(session)

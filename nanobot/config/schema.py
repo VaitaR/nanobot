@@ -70,6 +70,7 @@ class ProviderConfig(Base):
     api_key: str = ""
     api_base: str | None = None
     extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
+    fallback_model: str = ""  # For gateway-type providers: model to use when acting as a fallback
 
 
 class ProvidersConfig(Base):
@@ -186,6 +187,7 @@ class ToolsConfig(Base):
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
     confirmation_rules: list[ConfirmationRuleConfig] = Field(default_factory=list)  # Empty = no confirmations; use built-in defaults
+    permission_policy: dict[str, str] = Field(default_factory=dict)  # Override PermissionEngine defaults: {"exec": "allow", "write_file": "ask", ...}
 
 
 class Config(BaseSettings):
