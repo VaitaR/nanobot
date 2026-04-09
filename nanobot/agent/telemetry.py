@@ -34,9 +34,14 @@ def classify_error(error_str: str | None) -> ErrorCategory:
         return ErrorCategory.SESSION
     if any(kw in lower for kw in ("config", "setting", "env", "missing")):
         return ErrorCategory.CONFIGURATION
-    if any(kw in lower for kw in ("rate limit", "429", "timeout", "connection", "api_error", "api key")):
+    if any(
+        kw in lower for kw in ("rate limit", "429", "timeout", "connection", "api_error", "api key")
+    ):
         return ErrorCategory.LLM_API
-    if any(kw in lower for kw in ("command", "execution", "exit code", "permission denied", "file not found")):
+    if any(
+        kw in lower
+        for kw in ("command", "execution", "exit code", "permission denied", "file not found")
+    ):
         return ErrorCategory.TOOL_EXECUTION
     if any(kw in lower for kw in ("validation", "invalid", "malformed", "schema")):
         return ErrorCategory.VALIDATION
@@ -113,3 +118,79 @@ class TelemetryCollector:
                 if path:
                     files_touched.append(path)
         return skills, files_touched
+
+
+def record_retry_attempt(
+    *,
+    provider: str,
+    model: str,
+    attempt: int,
+    max_attempts: int,
+    delay: float,
+    error_content: str | None,
+) -> None:
+    """Emit a retry telemetry record for observability. Safe to call from retry loops."""
+    from datetime import datetime, timezone
+
+    category = classify_error(error_content)
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "event": "llm_retry_attempt",
+        "provider": provider,
+        "model": model,
+        "error_type": category.value,
+        "attempt": attempt,
+        "max_attempts": max_attempts,
+        "backoff_seconds": delay,
+        "error_snippet": (error_content or "")[:200],
+    }
+    try:
+        retry_log = Path(__file__).resolve().parents[2] / "memory" / "retry-log.jsonl"
+        retry_log.parent.mkdir(parents=True, exist_ok=True)
+        with open(retry_log, "a") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass  # telemetry must never break the retry loop
+
+
+def get_retry_stats(log_path: Path, hours: int = 24) -> list[dict]:
+    """Return aggregated retry statistics from retry-log.jsonl (last *hours* hours).
+
+    Returns list of dicts sorted by count descending:
+        provider, model, error_type, count, last_seen
+    """
+    import datetime as dt
+
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours)
+    stats: dict[tuple, dict] = {}
+    try:
+        with open(log_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ts = dt.datetime.fromisoformat(entry.get("ts", ""))
+                if ts < cutoff:
+                    continue
+                key = (
+                    entry.get("provider", "?"),
+                    entry.get("model", "?"),
+                    entry.get("error_type", "?"),
+                )
+                if key not in stats:
+                    stats[key] = {
+                        "provider": key[0],
+                        "model": key[1],
+                        "error_type": key[2],
+                        "count": 0,
+                        "last_seen": "",
+                    }
+                stats[key]["count"] += 1
+                stats[key]["last_seen"] = entry.get("ts", "")
+    except FileNotFoundError:
+        pass
+    return sorted(stats.values(), key=lambda x: -x["count"])

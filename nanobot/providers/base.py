@@ -1,5 +1,7 @@
 """Base LLM provider interface."""
 
+from __future__ import annotations
+
 import asyncio
 import json
 from abc import ABC, abstractmethod
@@ -9,10 +11,19 @@ from typing import Any
 
 from loguru import logger
 
+from nanobot.providers.error_classifier import (
+    _QUOTA_MARKERS as _QUOTA_ERROR_MARKERS,  # noqa: F401
+)
+from nanobot.providers.error_classifier import (
+    _TRANSIENT_MARKERS as _TRANSIENT_ERROR_MARKERS,  # noqa: F401
+)
+from nanobot.providers.error_classifier import is_retryable
+
 
 @dataclass
 class ToolCallRequest:
     """A tool call request from the LLM."""
+
     id: str
     name: str
     arguments: dict[str, Any]
@@ -35,20 +46,23 @@ class ToolCallRequest:
         if self.provider_specific_fields:
             tool_call["provider_specific_fields"] = self.provider_specific_fields
         if self.function_provider_specific_fields:
-            tool_call["function"]["provider_specific_fields"] = self.function_provider_specific_fields
+            tool_call["function"]["provider_specific_fields"] = (
+                self.function_provider_specific_fields
+            )
         return tool_call
 
 
 @dataclass
 class LLMResponse:
     """Response from an LLM provider."""
+
     content: str | None
     tool_calls: list[ToolCallRequest] = field(default_factory=list)
     finish_reason: str = "stop"
     usage: dict[str, int] = field(default_factory=dict)
     reasoning_content: str | None = None  # Kimi, DeepSeek-R1 etc.
     thinking_blocks: list[dict] | None = None  # Anthropic extended thinking
-    
+
     @property
     def has_tool_calls(self) -> bool:
         """Check if response contains tool calls."""
@@ -73,26 +87,13 @@ class GenerationSettings:
 class LLMProvider(ABC):
     """
     Abstract base class for LLM providers.
-    
+
     Implementations should handle the specifics of each provider's API
     while maintaining a consistent interface.
     """
 
     _CHAT_RETRY_DELAYS = (1, 2, 4)
-    _TRANSIENT_ERROR_MARKERS = (
-        "429",
-        "rate limit",
-        "500",
-        "502",
-        "503",
-        "504",
-        "overloaded",
-        "timeout",
-        "timed out",
-        "connection",
-        "server error",
-        "temporarily unavailable",
-    )
+    _TRANSIENT_ERROR_MARKERS = _TRANSIENT_ERROR_MARKERS  # module-level re-export
 
     _SENTINEL = object()
 
@@ -110,7 +111,10 @@ class LLMProvider(ABC):
 
             if isinstance(content, str) and not content:
                 clean = dict(msg)
-                clean["content"] = None if (msg.get("role") == "assistant" and msg.get("tool_calls")) else "(empty)"
+                if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                    clean.pop("content", None)  # Zhipu rejects empty string and None
+                else:
+                    clean["content"] = "(empty)"
                 result.append(clean)
                 continue
 
@@ -177,7 +181,7 @@ class LLMProvider(ABC):
     ) -> LLMResponse:
         """
         Send a chat completion request.
-        
+
         Args:
             messages: List of message dicts with 'role' and 'content'.
             tools: Optional list of tool definitions.
@@ -185,7 +189,7 @@ class LLMProvider(ABC):
             max_tokens: Maximum tokens in response.
             temperature: Sampling temperature.
             tool_choice: Tool selection strategy ("auto", "required", or specific tool dict).
-        
+
         Returns:
             LLMResponse with content and/or tool calls.
         """
@@ -193,8 +197,8 @@ class LLMProvider(ABC):
 
     @classmethod
     def _is_transient_error(cls, content: str | None) -> bool:
-        err = (content or "").lower()
-        return any(marker in err for marker in cls._TRANSIENT_ERROR_MARKERS)
+        """Check if error content indicates a retryable transient failure."""
+        return is_retryable(error=None, content=content)
 
     @staticmethod
     def _strip_image_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
@@ -246,9 +250,13 @@ class LLMProvider(ABC):
         streaming should override this method.
         """
         response = await self.chat(
-            messages=messages, tools=tools, model=model,
-            max_tokens=max_tokens, temperature=temperature,
-            reasoning_effort=reasoning_effort, tool_choice=tool_choice,
+            messages=messages,
+            tools=tools,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            reasoning_effort=reasoning_effort,
+            tool_choice=tool_choice,
         )
         if on_content_delta and response.content:
             await on_content_delta(response.content)
@@ -283,9 +291,13 @@ class LLMProvider(ABC):
             reasoning_effort = self.generation.reasoning_effort
 
         kw: dict[str, Any] = dict(
-            messages=messages, tools=tools, model=model,
-            max_tokens=max_tokens, temperature=temperature,
-            reasoning_effort=reasoning_effort, tool_choice=tool_choice,
+            messages=messages,
+            tools=tools,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            reasoning_effort=reasoning_effort,
+            tool_choice=tool_choice,
             on_content_delta=on_content_delta,
         )
 
@@ -298,15 +310,32 @@ class LLMProvider(ABC):
             if not self._is_transient_error(response.content):
                 stripped = self._strip_image_content(messages)
                 if stripped is not None:
-                    logger.warning("Non-transient LLM error with image content, retrying without images")
+                    logger.warning(
+                        "Non-transient LLM error with image content, retrying without images"
+                    )
                     return await self._safe_chat_stream(**{**kw, "messages": stripped})
                 return response
 
             logger.warning(
                 "LLM transient error (attempt {}/{}), retrying in {}s: {}",
-                attempt, len(self._CHAT_RETRY_DELAYS), delay,
+                attempt,
+                len(self._CHAT_RETRY_DELAYS),
+                delay,
                 (response.content or "")[:120].lower(),
             )
+            try:
+                from nanobot.agent.telemetry import record_retry_attempt
+
+                record_retry_attempt(
+                    provider=type(self).__name__,
+                    model=model or self.generation.model,
+                    attempt=attempt,
+                    max_attempts=len(self._CHAT_RETRY_DELAYS),
+                    delay=delay,
+                    error_content=response.content,
+                )
+            except Exception:
+                pass
             await asyncio.sleep(delay)
 
         return await self._safe_chat_stream(**kw)
@@ -335,9 +364,13 @@ class LLMProvider(ABC):
             reasoning_effort = self.generation.reasoning_effort
 
         kw: dict[str, Any] = dict(
-            messages=messages, tools=tools, model=model,
-            max_tokens=max_tokens, temperature=temperature,
-            reasoning_effort=reasoning_effort, tool_choice=tool_choice,
+            messages=messages,
+            tools=tools,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            reasoning_effort=reasoning_effort,
+            tool_choice=tool_choice,
         )
 
         for attempt, delay in enumerate(self._CHAT_RETRY_DELAYS, start=1):
@@ -349,15 +382,32 @@ class LLMProvider(ABC):
             if not self._is_transient_error(response.content):
                 stripped = self._strip_image_content(messages)
                 if stripped is not None:
-                    logger.warning("Non-transient LLM error with image content, retrying without images")
+                    logger.warning(
+                        "Non-transient LLM error with image content, retrying without images"
+                    )
                     return await self._safe_chat(**{**kw, "messages": stripped})
                 return response
 
             logger.warning(
                 "LLM transient error (attempt {}/{}), retrying in {}s: {}",
-                attempt, len(self._CHAT_RETRY_DELAYS), delay,
+                attempt,
+                len(self._CHAT_RETRY_DELAYS),
+                delay,
                 (response.content or "")[:120].lower(),
             )
+            try:
+                from nanobot.agent.telemetry import record_retry_attempt
+
+                record_retry_attempt(
+                    provider=type(self).__name__,
+                    model=model or self.generation.model,
+                    attempt=attempt,
+                    max_attempts=len(self._CHAT_RETRY_DELAYS),
+                    delay=delay,
+                    error_content=response.content,
+                )
+            except Exception:
+                pass
             await asyncio.sleep(delay)
 
         return await self._safe_chat(**kw)

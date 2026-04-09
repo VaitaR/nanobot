@@ -46,7 +46,7 @@ class TestResolveExecutorAPI:
         info = resolve_executor("openrouter", mock_config)
 
         assert info.alias == "openrouter"
-        assert info.model == "qwen/qwen3.6-plus:free"
+        assert info.model == "stepfun/step-3.5-flash"
         assert info.is_api
         assert info.provider is not None
 
@@ -96,7 +96,11 @@ class TestResolveExecutorCLI:
     def test_codex_is_cli(self):
         from nanobot.agent.executor import resolve_executor
 
-        for alias, model in [("codex-5.3", "gpt-5.3-codex"), ("codex-5.4", "gpt-5.4"), ("codex-5.4-mini", "gpt-5.4-mini")]:
+        for alias, model in [
+            ("codex-5.3", "gpt-5.3-codex"),
+            ("codex-5.4", "gpt-5.4"),
+            ("codex-5.4-mini", "gpt-5.4-mini"),
+        ]:
             info = resolve_executor(alias)
             assert info.is_cli
             assert info.acpx_agent == "codex"

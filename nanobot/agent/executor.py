@@ -57,7 +57,7 @@ _EXECUTOR_REGISTRY: dict[str, tuple[str, str, str, str | None]] = {
     # alias: (config provider key, default model, mode, acpx_agent)
     "glm-turbo": ("custom", "glm-5-turbo", "api", None),
     "glm-5.1": ("custom", "glm-5.1", "api", None),
-    "openrouter": ("openrouter", "qwen/qwen3.6-plus:free", "api", None),
+    "openrouter": ("openrouter", "stepfun/step-3.5-flash", "api", None),
     # CLI-based — routed through ACPX subprocess
     "claude-native": ("", "claude-sonnet-4-20250514", "cli", "claude"),
     "claude-zai": ("", "claude-sonnet-4-20250514", "cli", "claude"),
@@ -92,7 +92,10 @@ def resolve_executor(alias: str, config: "Config | None" = None) -> ExecutorInfo
     if mode == "cli":
         logger.info("Executor '{}' is CLI-based (acpx_agent={})", alias, acpx_agent)
         return ExecutorInfo(
-            model=default_model, mode="cli", alias=alias, acpx_agent=acpx_agent,
+            model=default_model,
+            mode="cli",
+            alias=alias,
+            acpx_agent=acpx_agent,
         )
 
     # --- API-based: build LLMProvider from config ---
@@ -124,7 +127,8 @@ def _build_provider_for_alias(
         logger.warning(
             "Executor '{}': no API key configured for provider '{}'. "
             "The subagent will likely fail at runtime.",
-            alias, provider_key,
+            alias,
+            provider_key,
         )
 
     return OpenAICompatProvider(

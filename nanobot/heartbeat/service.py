@@ -19,6 +19,16 @@ if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
 
 
+def _emit_heartbeat_event(event_type: str, data: dict[str, Any] | None = None) -> None:
+    """Best-effort write to heartbeat.jsonl session log.  Never raises."""
+    try:
+        from nanobot_workspace.observability.session_writer import write_event
+
+        write_event(event_type, data)
+    except Exception:
+        pass
+
+
 class HeartbeatService:
     """Periodic heartbeat: LLM decides skip/run/review, then executes if needed."""
 
@@ -166,6 +176,7 @@ class HeartbeatService:
         self._running = True
         self._task = asyncio.create_task(self._run_loop())
         logger.info("Heartbeat started (every {}s)", self.interval_s)
+        _emit_heartbeat_event("heartbeat.started", {"interval_s": self.interval_s})
 
     def stop(self) -> None:
         self._running = False
@@ -196,6 +207,7 @@ class HeartbeatService:
             return
 
         logger.info("Heartbeat: checking for tasks...")
+        _emit_heartbeat_event("heartbeat.checking")
         if self.on_tick_report:
             await self.on_tick_report("start", "", None)
 
@@ -213,6 +225,7 @@ class HeartbeatService:
 
             if action == "run" and self.on_execute:
                 logger.info("Heartbeat: tasks found, executing...")
+                _emit_heartbeat_event("heartbeat.executing", {"tasks_preview": tasks[:200]})
                 try:
                     response = await asyncio.wait_for(self.on_execute(tasks), timeout=600)
                 except asyncio.TimeoutError:
@@ -224,6 +237,7 @@ class HeartbeatService:
                         await self.on_notify(response)
             else:
                 logger.info("Heartbeat: nothing to report")
+                _emit_heartbeat_event("heartbeat.nothing_to_report")
 
             if self.on_tick_report:
                 await self.on_tick_report(action, tasks, review_decisions)

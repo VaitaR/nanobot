@@ -6,6 +6,7 @@ import asyncio
 import json
 import time
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -40,8 +41,55 @@ from nanobot.providers.base import LLMProvider
 
 # Subagent timeout defaults (seconds)
 _SUBAGENT_HARD_CAP = 1800  # 30 min absolute maximum
-_SUBAGENT_IDLE_TIMEOUT = 300  # 5 min no progress = dead
+_SUBAGENT_IDLE_TIMEOUT = 600  # 10 min no progress = dead
 _WATCHDOG_POLL_INTERVAL = 30  # seconds between idle-activity checks
+
+
+def _write_subagent_telemetry(
+    workspace: Path,
+    model: str,
+    duration_ms: int,
+    stop_reason: str,
+    tools: list[str],
+    error: str | None,
+    label: str,
+    origin: dict[str, Any],
+) -> None:
+    """Append LLM-based subagent telemetry to improvement-log.jsonl."""
+    memory_dir = workspace / "memory"
+    try:
+        memory_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        logger.warning("subagent.telemetry_mkdir_failed", path=str(memory_dir))
+        return
+
+    session = origin.get("channel", "unknown")
+    entry = {
+        "ts": datetime.now(UTC).isoformat(),
+        "session": session,
+        "channel": origin.get("channel"),
+        "chat_id": origin.get("chat_id"),
+        "model": model,
+        "label": label,
+        "request_id": None,
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0},
+        "total_tokens": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "duration_ms": duration_ms,
+        "stop_reason": stop_reason,
+        "error": error,
+        "error_category": None,
+        "tools": tools,
+        "skills": [],
+        "files_touched": [],
+    }
+
+    try:
+        with open(memory_dir / "improvement-log.jsonl", "a") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError:
+        logger.warning("subagent.telemetry_write_failed")
 
 
 class SubagentManager:
@@ -490,6 +538,18 @@ class SubagentManager:
                     checkpoint_policy,
                 )
 
+            # Write delegation telemetry for LLM-based path
+            _write_subagent_telemetry(
+                self.workspace,
+                effective_model,
+                int((time.monotonic() - start_time) * 1000),
+                result.stop_reason or "unknown",
+                result.tools_used,
+                result.error,
+                label,
+                origin,
+            )
+
             if result.stop_reason == "tool_error":
                 if nb_task_id:
                     await mark_task_delegation_failure(nb_task_id, "tool_error during execution")
@@ -623,6 +683,16 @@ class SubagentManager:
         except asyncio.TimeoutError as e:
             msg = str(e) or f"Task timed out (hard cap: {hard_cap}s)."
             logger.warning("Subagent [{}] {}", task_id, msg)
+            _write_subagent_telemetry(
+                self.workspace,
+                effective_model,
+                int((time.monotonic() - start_time) * 1000),
+                "timeout",
+                [],
+                msg,
+                label,
+                origin,
+            )
             if nb_task_id:
                 await mark_task_delegation_failure(nb_task_id, msg)
             await self._announce_result(
@@ -640,6 +710,16 @@ class SubagentManager:
         except Exception as e:
             error_msg = f"Error: {str(e)}"
             logger.error("Subagent [{}] failed: {}", task_id, e)
+            _write_subagent_telemetry(
+                self.workspace,
+                effective_model,
+                int((time.monotonic() - start_time) * 1000),
+                "exception",
+                [],
+                str(e),
+                label,
+                origin,
+            )
             if nb_task_id:
                 await mark_task_delegation_failure(nb_task_id, error_msg)
             await self._announce_result(
@@ -851,7 +931,7 @@ class SubagentManager:
         agent for interpretation.
         """
         # Verify claimed artifacts exist on disk (detect illusion of execution)
-        envelope = verify_envelope(envelope)
+        envelope = verify_envelope(envelope, correlation_id=task_id)
 
         # Build metadata — propagate message_thread_id for topic routing
         metadata: dict[str, Any] = {}

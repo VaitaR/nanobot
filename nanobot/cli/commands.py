@@ -66,6 +66,7 @@ def _flush_pending_tty_input() -> None:
 
     try:
         import termios
+
         termios.tcflush(fd, termios.TCIFLUSH)
         return
     except Exception:
@@ -88,6 +89,7 @@ def _restore_terminal() -> None:
         return
     try:
         import termios
+
         termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, _SAVED_TERM_ATTRS)
     except Exception:
         pass
@@ -100,6 +102,7 @@ def _init_prompt_session() -> None:
     # Save terminal state so we can restore it on exit
     try:
         import termios
+
         _SAVED_TERM_ATTRS = termios.tcgetattr(sys.stdin.fileno())
     except Exception:
         pass
@@ -112,7 +115,7 @@ def _init_prompt_session() -> None:
     _PROMPT_SESSION = PromptSession(
         history=FileHistory(str(history_file)),
         enable_open_in_editor=False,
-        multiline=False,   # Enter submits (single line mode)
+        multiline=False,  # Enter submits (single line mode)
     )
 
 
@@ -158,10 +161,9 @@ def _response_renderable(content: str, render_markdown: bool, metadata: dict | N
 
 async def _print_interactive_line(text: str) -> None:
     """Print async interactive updates with prompt_toolkit-safe Rich styling."""
+
     def _write() -> None:
-        ansi = _render_interactive_ansi(
-            lambda c: c.print(f"  [dim]↳ {text}[/dim]")
-        )
+        ansi = _render_interactive_ansi(lambda c: c.print(f"  [dim]↳ {text}[/dim]"))
         print_formatted_text(ANSI(ansi), end="")
 
     await run_in_terminal(_write)
@@ -173,6 +175,7 @@ async def _print_interactive_response(
     metadata: dict | None = None,
 ) -> None:
     """Print async interactive replies with prompt_toolkit-safe Rich styling."""
+
     def _write() -> None:
         content = response or ""
         ansi = _render_interactive_ansi(
@@ -224,7 +227,6 @@ async def _read_interactive_input_async() -> str:
         raise KeyboardInterrupt from exc
 
 
-
 def version_callback(value: bool):
     if value:
         console.print(f"{__logo__} nanobot v{__version__}")
@@ -233,9 +235,7 @@ def version_callback(value: bool):
 
 @app.callback()
 def main(
-    version: bool = typer.Option(
-        None, "--version", "-v", callback=version_callback, is_eager=True
-    ),
+    version: bool = typer.Option(None, "--version", "-v", callback=version_callback, is_eager=True),
 ):
     """nanobot - Personal AI Assistant."""
     pass
@@ -274,8 +274,12 @@ def onboard(
             config = _apply_workspace_override(load_config(config_path))
         else:
             console.print(f"[yellow]Config already exists at {config_path}[/yellow]")
-            console.print("  [bold]y[/bold] = overwrite with defaults (existing values will be lost)")
-            console.print("  [bold]N[/bold] = refresh config, keeping existing values and adding new fields")
+            console.print(
+                "  [bold]y[/bold] = overwrite with defaults (existing values will be lost)"
+            )
+            console.print(
+                "  [bold]N[/bold] = refresh config, keeping existing values and adding new fields"
+            )
             if typer.confirm("Overwrite?"):
                 config = _apply_workspace_override(Config())
                 save_config(config, config_path)
@@ -283,7 +287,9 @@ def onboard(
             else:
                 config = _apply_workspace_override(load_config(config_path))
                 save_config(config, config_path)
-                console.print(f"[green]✓[/green] Config refreshed at {config_path} (existing values preserved)")
+                console.print(
+                    f"[green]✓[/green] Config refreshed at {config_path} (existing values preserved)"
+                )
     else:
         config = _apply_workspace_override(Config())
         # In wizard mode, don't save yet - the wizard will handle saving if should_save=True
@@ -333,7 +339,9 @@ def onboard(
         console.print(f"  1. Add your API key to [cyan]{config_path}[/cyan]")
         console.print("     Get one at: https://openrouter.ai/keys")
         console.print(f"  2. Chat: [cyan]{agent_cmd}[/cyan]")
-    console.print("\n[dim]Want Telegram/WhatsApp? See: https://github.com/HKUDS/nanobot#-chat-apps[/dim]")
+    console.print(
+        "\n[dim]Want Telegram/WhatsApp? See: https://github.com/HKUDS/nanobot#-chat-apps[/dim]"
+    )
 
 
 def _merge_missing_defaults(existing: Any, defaults: Any) -> Any:
@@ -406,9 +414,11 @@ def _make_provider(config: Config):
     # --- instantiation by backend ---
     if backend == "openai_codex":
         from nanobot.providers.openai_codex_provider import OpenAICodexProvider
+
         provider = OpenAICodexProvider(default_model=model)
     elif backend == "azure_openai":
         from nanobot.providers.azure_openai_provider import AzureOpenAIProvider
+
         provider = AzureOpenAIProvider(
             **{"api_key": p.api_key},
             api_base=p.api_base,
@@ -416,6 +426,7 @@ def _make_provider(config: Config):
         )
     elif backend == "anthropic":
         from nanobot.providers.anthropic_provider import AnthropicProvider
+
         provider = AnthropicProvider(
             **{"api_key": p.api_key if p else None},
             api_base=config.get_api_base(model),
@@ -424,6 +435,7 @@ def _make_provider(config: Config):
         )
     else:
         from nanobot.providers.openai_compat_provider import OpenAICompatProvider
+
         provider = OpenAICompatProvider(
             **{"api_key": p.api_key if p else None},
             api_base=config.get_api_base(model),
@@ -439,29 +451,103 @@ def _make_provider(config: Config):
         reasoning_effort=defaults.reasoning_effort,
     )
 
-    # --- OpenRouter fallback: wrap primary if openrouter key is configured ---
-    or_cfg = config.providers.openrouter
-    if or_cfg and or_cfg.api_key:
-        from nanobot.providers.fallback import FallbackProvider
-        from nanobot.providers.openai_compat_provider import OpenAICompatProvider
-        from nanobot.providers.registry import find_by_name as _find
+    import logging as _logging
 
-        or_spec = _find("openrouter")
-        or_fallback_model = or_cfg.fallback_model or "qwen/qwen3.6-plus:free"
-        backup = OpenAICompatProvider(
-            api_key=or_cfg.api_key,
-            default_model=or_fallback_model,
-            spec=or_spec,
-        )
-        backup.generation = GenerationSettings(
+    from nanobot.providers.fallback import FallbackProvider
+
+    codex_backup_model = "openai-codex/gpt-5.4"
+    or_cfg = config.providers.openrouter
+    # Fallback chain: try models in order until one works
+    or_fallback_chain = [
+        (or_cfg.fallback_model if or_cfg else None) or "stepfun/step-3.5-flash:free",
+        "nvidia/nemotron-3-super-120b-a12b:free",
+        "minimax/minimax-m2.5:free",
+    ]
+
+    # --- Layer 1: Codex OAuth backup (gpt-5.4) ---
+    try:
+        from nanobot.providers.openai_codex_provider import OpenAICodexProvider
+
+        codex_backup = OpenAICodexProvider(default_model=codex_backup_model)
+        codex_backup.generation = GenerationSettings(
             temperature=defaults.temperature,
             max_tokens=defaults.max_tokens,
             reasoning_effort=defaults.reasoning_effort,
         )
-        provider = FallbackProvider(primary=provider, backup=backup, fallback_model=or_fallback_model)
-        import logging as _logging
-        _logging.getLogger(__name__).debug(
-            "OpenRouter fallback enabled → %s", or_fallback_model
+        provider = FallbackProvider(
+            primary=provider,
+            backup=codex_backup,
+            fallback_model=codex_backup_model,
+        )
+        _logging.getLogger(__name__).info("Codex fallback enabled → %s", codex_backup_model)
+    except Exception:
+        _logging.getLogger(__name__).warning("Codex fallback unavailable, skipping")
+
+    # --- Layer 2: OpenRouter free fallback (last resort) - with chain ---
+    if or_cfg and or_cfg.api_key:
+        from nanobot.providers.openai_compat_provider import OpenAICompatProvider
+        from nanobot.providers.registry import find_by_name as _find
+
+        or_spec = _find("openrouter")
+
+        # Create providers for each model in the chain
+        # Chain: step-3.5-flash → nemotron-3-super → minimax-m2.5
+        or_backup1 = OpenAICompatProvider(
+            api_key=or_cfg.api_key,
+            default_model=or_fallback_chain[0],
+            spec=or_spec,
+        )
+        or_backup1.generation = GenerationSettings(
+            temperature=defaults.temperature,
+            max_tokens=defaults.max_tokens,
+            reasoning_effort=defaults.reasoning_effort,
+        )
+
+        or_backup2 = OpenAICompatProvider(
+            api_key=or_cfg.api_key,
+            default_model=or_fallback_chain[1],
+            spec=or_spec,
+        )
+        or_backup2.generation = GenerationSettings(
+            temperature=defaults.temperature,
+            max_tokens=defaults.max_tokens,
+            reasoning_effort=defaults.reasoning_effort,
+        )
+
+        or_backup3 = OpenAICompatProvider(
+            api_key=or_cfg.api_key,
+            default_model=or_fallback_chain[2],
+            spec=or_spec,
+        )
+        or_backup3.generation = GenerationSettings(
+            temperature=defaults.temperature,
+            max_tokens=defaults.max_tokens,
+            reasoning_effort=defaults.reasoning_effort,
+        )
+
+        # Nest fallback providers to create the chain:
+        # provider → or_backup1 → or_backup2 → or_backup3
+        provider = FallbackProvider(
+            primary=provider,
+            backup=or_backup1,
+            fallback_model=or_fallback_chain[0],
+        )
+        provider = FallbackProvider(
+            primary=provider,
+            backup=or_backup2,
+            fallback_model=or_fallback_chain[1],
+        )
+        provider = FallbackProvider(
+            primary=provider,
+            backup=or_backup3,
+            fallback_model=or_fallback_chain[2],
+        )
+
+        _logging.getLogger(__name__).info(
+            "OpenRouter fallback chain enabled → %s → %s → %s",
+            or_fallback_chain[0],
+            or_fallback_chain[1],
+            or_fallback_chain[2],
         )
 
     return provider
@@ -514,6 +600,7 @@ def _migrate_cron_store(config: "Config") -> None:
     if legacy_path.is_file() and not new_path.exists():
         new_path.parent.mkdir(parents=True, exist_ok=True)
         import shutil
+
         shutil.move(str(legacy_path), str(new_path))
 
 
@@ -540,6 +627,7 @@ def gateway(
 
     if verbose:
         import logging
+
         logging.basicConfig(level=logging.DEBUG)
 
     config = _load_runtime_config(config, workspace)
@@ -565,7 +653,9 @@ def gateway(
     )
 
     console.print(f"{__logo__} Starting nanobot gateway version {__version__} on port {port}...")
-    console.print(f"[dim]Log: {log_path} (rotate: {log_cfg.rotation}, retain: {log_cfg.retention})[/dim]")
+    console.print(
+        f"[dim]Log: {log_path} (rotate: {log_cfg.rotation}, retain: {log_cfg.retention})[/dim]"
+    )
     sync_workspace_templates(config.workspace_path)
     bus = MessageBus()
     provider = _make_provider(config)
@@ -638,16 +728,23 @@ def gateway(
 
         if job.payload.deliver and job.payload.to and response:
             should_notify = await evaluate_response(
-                response, job.payload.message, provider, agent.model,
+                response,
+                job.payload.message,
+                provider,
+                agent.model,
             )
             if should_notify:
                 from nanobot.bus.events import OutboundMessage
-                await bus.publish_outbound(OutboundMessage(
-                    channel=job.payload.channel or "cli",
-                    chat_id=job.payload.to,
-                    content=response,
-                ))
+
+                await bus.publish_outbound(
+                    OutboundMessage(
+                        channel=job.payload.channel or "cli",
+                        chat_id=job.payload.to,
+                        content=response,
+                    )
+                )
         return response
+
     cron.on_job = on_cron_job
 
     # Create channel manager
@@ -722,17 +819,23 @@ def gateway(
     async def on_heartbeat_notify(response: str) -> None:
         """Deliver a heartbeat response to the user's channel."""
         from nanobot.bus.events import OutboundMessage
+
         channel, chat_id = _pick_heartbeat_target()
         if channel == "cli":
             return  # No external channel available to deliver to
-        await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=response))
+        await bus.publish_outbound(
+            OutboundMessage(channel=channel, chat_id=chat_id, content=response)
+        )
 
     async def on_heartbeat_tick_report(
-        action: str, tasks: str, review_decisions: list[dict[str, str]],
+        action: str,
+        tasks: str,
+        review_decisions: list[dict[str, str]],
     ) -> None:
         """Send a brief one-line heartbeat tick report to the user's channel."""
         from nanobot.bus.events import OutboundMessage
         from nanobot.utils.helpers import current_time_str
+
         channel, chat_id = _pick_heartbeat_target()
         if channel == "cli":
             return
@@ -799,11 +902,13 @@ def gateway(
                             try:
                                 data = json.loads(marker.read_text())
                                 marker.unlink()
-                                await bus.publish_outbound(OutboundMessage(
-                                    channel=data.get("channel", "cli"),
-                                    chat_id=data.get("chat_id", "direct"),
-                                    content=f"✅ nanobot restarted (v{__version__})",
-                                ))
+                                await bus.publish_outbound(
+                                    OutboundMessage(
+                                        channel=data.get("channel", "cli"),
+                                        chat_id=data.get("chat_id", "direct"),
+                                        content=f"✅ nanobot restarted (v{__version__})",
+                                    )
+                                )
                                 return
                             except Exception:
                                 pass
@@ -822,10 +927,14 @@ def gateway(
                                 pass
                         else:
                             # Always record last restart time, even for manual/launchd restarts.
-                            last_restart_marker.write_text(json.dumps({
-                                "reason": "manual",
-                                "timestamp": datetime.now(UTC).isoformat(),
-                            }))
+                            last_restart_marker.write_text(
+                                json.dumps(
+                                    {
+                                        "reason": "manual",
+                                        "timestamp": datetime.now(UTC).isoformat(),
+                                    }
+                                )
+                            )
 
                         channel, chat_id = _pick_heartbeat_target()
                         if channel == "cli":
@@ -852,6 +961,7 @@ def gateway(
             console.print("\nShutting down...")
         except Exception:
             import traceback
+
             console.print("\n[red]Error: Gateway crashed unexpectedly[/red]")
             console.print(traceback.format_exc())
         finally:
@@ -862,8 +972,6 @@ def gateway(
             await channels.stop_all()
 
     asyncio.run(run())
-
-
 
 
 # ============================================================================
@@ -877,8 +985,12 @@ def agent(
     session_id: str = typer.Option("cli:direct", "--session", "-s", help="Session ID"),
     workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
     config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
-    markdown: bool = typer.Option(True, "--markdown/--no-markdown", help="Render assistant output as Markdown"),
-    logs: bool = typer.Option(False, "--logs/--no-logs", help="Show nanobot runtime logs during chat"),
+    markdown: bool = typer.Option(
+        True, "--markdown/--no-markdown", help="Render assistant output as Markdown"
+    ),
+    logs: bool = typer.Option(
+        False, "--logs/--no-logs", help="Show nanobot runtime logs during chat"
+    ),
 ):
     """Interact with the agent directly."""
     from loguru import logger
@@ -943,7 +1055,8 @@ def agent(
         async def run_once():
             renderer = StreamRenderer(render_markdown=markdown)
             response = await agent_loop.process_direct(
-                message, session_id,
+                message,
+                session_id,
                 on_progress=_cli_progress,
                 on_stream=renderer.on_delta,
                 on_stream_end=renderer.on_end,
@@ -961,8 +1074,11 @@ def agent(
     else:
         # Interactive mode — route through bus like other channels
         from nanobot.bus.events import InboundMessage
+
         _init_prompt_session()
-        console.print(f"{__logo__} Interactive mode (type [bold]exit[/bold] or [bold]Ctrl+C[/bold] to quit)\n")
+        console.print(
+            f"{__logo__} Interactive mode (type [bold]exit[/bold] or [bold]Ctrl+C[/bold] to quit)\n"
+        )
 
         if ":" in session_id:
             cli_channel, cli_chat_id = session_id.split(":", 1)
@@ -978,11 +1094,11 @@ def agent(
         signal.signal(signal.SIGINT, _handle_signal)
         signal.signal(signal.SIGTERM, _handle_signal)
         # SIGHUP is not available on Windows
-        if hasattr(signal, 'SIGHUP'):
+        if hasattr(signal, "SIGHUP"):
             signal.signal(signal.SIGHUP, _handle_signal)
         # Ignore SIGPIPE to prevent silent process termination when writing to closed pipes
         # SIGPIPE is not available on Windows
-        if hasattr(signal, 'SIGPIPE'):
+        if hasattr(signal, "SIGPIPE"):
             signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 
         async def run_interactive():
@@ -1058,13 +1174,15 @@ def agent(
                         turn_response.clear()
                         renderer = StreamRenderer(render_markdown=markdown)
 
-                        await bus.publish_inbound(InboundMessage(
-                            channel=cli_channel,
-                            sender_id="user",
-                            chat_id=cli_chat_id,
-                            content=user_input,
-                            metadata={"_wants_stream": True},
-                        ))
+                        await bus.publish_inbound(
+                            InboundMessage(
+                                channel=cli_channel,
+                                sender_id="user",
+                                chat_id=cli_chat_id,
+                                content=user_input,
+                                metadata={"_wants_stream": True},
+                            )
+                        )
 
                         await turn_done.wait()
 
@@ -1074,7 +1192,9 @@ def agent(
                                 if renderer:
                                     await renderer.close()
                                 _print_agent_response(
-                                    content, render_markdown=markdown, metadata=meta,
+                                    content,
+                                    render_markdown=markdown,
+                                    metadata=meta,
                                 )
                         elif renderer and not renderer.streamed:
                             await renderer.close()
@@ -1196,7 +1316,9 @@ def _get_bridge_dir() -> Path:
 @channels_app.command("login")
 def channels_login(
     channel_name: str = typer.Argument(..., help="Channel name (e.g. weixin, whatsapp)"),
-    force: bool = typer.Option(False, "--force", "-f", help="Force re-authentication even if already logged in"),
+    force: bool = typer.Option(
+        False, "--force", "-f", help="Force re-authentication even if already logged in"
+    ),
 ):
     """Authenticate with a channel via QR code or other interactive login."""
     from nanobot.channels.registry import discover_all
@@ -1281,8 +1403,12 @@ def status():
 
     console.print(f"{__logo__} nanobot Status\n")
 
-    console.print(f"Config: {config_path} {'[green]✓[/green]' if config_path.exists() else '[red]✗[/red]'}")
-    console.print(f"Workspace: {workspace} {'[green]✓[/green]' if workspace.exists() else '[red]✗[/red]'}")
+    console.print(
+        f"Config: {config_path} {'[green]✓[/green]' if config_path.exists() else '[red]✗[/red]'}"
+    )
+    console.print(
+        f"Workspace: {workspace} {'[green]✓[/green]' if workspace.exists() else '[red]✗[/red]'}"
+    )
 
     if config_path.exists():
         from nanobot.providers.registry import PROVIDERS
@@ -1304,7 +1430,9 @@ def status():
                     console.print(f"{spec.label}: [dim]not set[/dim]")
             else:
                 has_key = bool(p.api_key)
-                console.print(f"{spec.label}: {'[green]✓[/green]' if has_key else '[dim]not set[/dim]'}")
+                console.print(
+                    f"{spec.label}: {'[green]✓[/green]' if has_key else '[dim]not set[/dim]'}"
+                )
 
 
 # ============================================================================
@@ -1322,12 +1450,15 @@ def _register_login(name: str):
     def decorator(fn):
         _LOGIN_HANDLERS[name] = fn
         return fn
+
     return decorator
 
 
 @provider_app.command("login")
 def provider_login(
-    provider: str = typer.Argument(..., help="OAuth provider (e.g. 'openai-codex', 'github-copilot')"),
+    provider: str = typer.Argument(
+        ..., help="OAuth provider (e.g. 'openai-codex', 'github-copilot')"
+    ),
 ):
     """Authenticate with an OAuth provider."""
     from nanobot.providers.registry import PROVIDERS
@@ -1352,6 +1483,7 @@ def provider_login(
 def _login_openai_codex() -> None:
     try:
         from oauth_cli_kit import get_token, login_oauth_interactive
+
         token = None
         try:
             token = get_token()
@@ -1366,7 +1498,9 @@ def _login_openai_codex() -> None:
         if not (token and token.access):
             console.print("[red]✗ Authentication failed[/red]")
             raise typer.Exit(1)
-        console.print(f"[green]✓ Authenticated with OpenAI Codex[/green]  [dim]{token.account_id}[/dim]")
+        console.print(
+            f"[green]✓ Authenticated with OpenAI Codex[/green]  [dim]{token.account_id}[/dim]"
+        )
     except ImportError:
         console.print("[red]oauth_cli_kit not installed. Run: pip install oauth-cli-kit[/red]")
         raise typer.Exit(1)

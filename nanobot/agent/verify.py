@@ -9,12 +9,18 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from loguru import logger
+import structlog
 
 from nanobot.agent.result_envelope import Artifact, ResultEnvelope
 
+log = structlog.get_logger(__name__)
 
-def verify_artifact_exists(artifact: Artifact) -> Artifact:
+
+def verify_artifact_exists(
+    artifact: Artifact,
+    *,
+    correlation_id: str | None = None,
+) -> Artifact:
     """Check if a file artifact exists on disk.
 
     Non-file artifacts (url, metric) are returned with ``verified=False``
@@ -31,7 +37,11 @@ def verify_artifact_exists(artifact: Artifact) -> Artifact:
     )
 
 
-def verify_envelope(envelope: ResultEnvelope) -> ResultEnvelope:
+def verify_envelope(
+    envelope: ResultEnvelope,
+    *,
+    correlation_id: str | None = None,
+) -> ResultEnvelope:
     """Verify all file/diff artifacts in the envelope.
 
     Downgrades status from ``"ok"`` to ``"partial"`` if any claimed file
@@ -41,21 +51,20 @@ def verify_envelope(envelope: ResultEnvelope) -> ResultEnvelope:
     if not envelope.artifacts or envelope.status == "error":
         return envelope
 
-    verified_artifacts = [verify_artifact_exists(a) for a in envelope.artifacts]
-    missing = [
-        a for a in verified_artifacts
-        if not a.verified and a.kind in ("file", "diff")
+    verified_artifacts = [
+        verify_artifact_exists(a, correlation_id=correlation_id) for a in envelope.artifacts
     ]
+    missing = [a for a in verified_artifacts if not a.verified and a.kind in ("file", "diff")]
 
     if missing and envelope.status == "ok":
         paths = ", ".join(a.path for a in missing)
-        logger.warning(f"Subagent claimed files that don't exist: {paths}")
+        log.bind(correlation_id=correlation_id).warning(
+            "Subagent claimed files that don't exist",
+            missing_paths=paths,
+        )
         return ResultEnvelope(
             status="partial",
-            summary=(
-                f"{envelope.summary} "
-                f"(warning: {len(missing)} file(s) not found on disk)"
-            ),
+            summary=(f"{envelope.summary} (warning: {len(missing)} file(s) not found on disk)"),
             artifacts=verified_artifacts,
             details=envelope.details,
             stop_reason=envelope.stop_reason,

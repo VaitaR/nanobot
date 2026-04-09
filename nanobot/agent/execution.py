@@ -14,6 +14,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -210,17 +211,40 @@ async def execute_acpx(
     DelegatedResult:
         Structured result with tool_calls, final_message, duration, and error info.
         Falls back to raw text if JSON parsing fails.
+
+    Telemetry is written to ``memory/improvement-log.jsonl`` for every
+    invocation, ensuring all ACPX delegations (heartbeat, chat-spawn, etc.)
+    are visible in the dashboard.
     """
+    result = await _execute_acpx_impl(agent, prompt, workspace, timeout_s=timeout_s)
+    _write_acpx_telemetry(workspace, agent, result)
+    return result
+
+
+async def _execute_acpx_impl(
+    agent: str,
+    prompt: str,
+    workspace: Path,
+    *,
+    timeout_s: int = _DEFAULT_TIMEOUT_S,
+) -> DelegatedResult:
+    """Internal implementation — see :func:`execute_acpx` for public API."""
     acpx_claude_sh = workspace / "acpx_claude.sh"
 
     # Build command with --format json for structured output
     if agent == "codex":
         cmd = [
-            "npx", "-y", "acpx@latest",
-            "--cwd", str(workspace),
-            "--format", "json",
+            "npx",
+            "-y",
+            "acpx@latest",
+            "--cwd",
+            str(workspace),
+            "--format",
+            "json",
             "--approve-reads",
-            "codex", "exec", prompt,
+            "codex",
+            "exec",
+            prompt,
         ]
     elif agent == "claude":
         if not acpx_claude_sh.exists():
@@ -256,7 +280,8 @@ async def execute_acpx(
 
         try:
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                process.communicate(), timeout=timeout_s,
+                process.communicate(),
+                timeout=timeout_s,
             )
         except TimeoutError:
             process.kill()
@@ -340,3 +365,56 @@ async def execute_acpx(
             total_duration=duration,
             error_type="exception",
         )
+
+
+def _write_acpx_telemetry(
+    workspace: Path,
+    agent: str,
+    result: DelegatedResult,
+) -> None:
+    """Append delegation telemetry to ``memory/improvement-log.jsonl``.
+
+    Called automatically by :func:`execute_acpx` for every invocation,
+    ensuring all ACPX delegations (heartbeat, chat-spawn, etc.) are tracked
+    alongside main-agent LLM turns already logged by TelemetryCollector.
+    """
+    memory_dir = workspace / "memory"
+    try:
+        memory_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        logger.warning("acpx.telemetry_mkdir_failed", path=str(memory_dir))
+        return
+
+    target = memory_dir / "improvement-log.jsonl"
+    duration_ms = int(result.total_duration * 1000) if result.total_duration else 0
+    stop_reason = "completed" if result.success else "error"
+    tools = [tc.name for tc in result.tool_calls] if result.tool_calls else []
+
+    entry = {
+        "ts": datetime.now(UTC).isoformat(),
+        "session": "acpx",
+        "channel": "acpx",
+        "chat_id": None,
+        "model": agent,
+        "request_id": None,
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0},
+        "total_tokens": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "duration_ms": duration_ms,
+        "stop_reason": stop_reason,
+        "error": result.error,
+        "error_category": result.error_type or None,
+        "tools": tools,
+        "skills": [],
+        "files_touched": [],
+    }
+
+    try:
+        with open(target, "a") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        logger.debug(
+            "acpx.telemetry_written", agent=agent, duration_ms=duration_ms, stop=stop_reason
+        )
+    except OSError:
+        logger.warning("acpx.telemetry_write_failed", agent=agent)

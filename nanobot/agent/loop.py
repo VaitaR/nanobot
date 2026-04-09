@@ -577,11 +577,11 @@ class AgentLoop:
                             on_stream=on_stream,
                             on_stream_end=on_stream_end,
                         ),
-                        timeout=300,  # 5-minute hard cap per message
+                        timeout=600,  # 10-minute hard cap per message
                     )
                 except asyncio.TimeoutError:
                     logger.error(
-                        "Message processing timed out after 300s for session {}",
+                        "Message processing timed out after 600s for session {}",
                         msg.session_key,
                     )
                     self.telemetry.record_turn(
@@ -591,9 +591,9 @@ class AgentLoop:
                         chat_id=msg.chat_id,
                         model=self.model,
                         usage={},
-                        duration_ms=300_000,
+                        duration_ms=600_000,
                         stop_reason="timeout",
-                        error="Message processing timed out after 300s",
+                        error="Message processing timed out after 600s",
                         tools_used=[],
                         skills=[],
                         files_touched=[],
@@ -687,7 +687,10 @@ class AgentLoop:
                     message_tool.set_turn_metadata(msg.metadata or {})
             history = session.get_history(max_messages=0)
             history = self._maybe_compact_history(history)
-            current_role = "assistant" if msg.sender_id == "subagent" else "user"
+            # Subagent results are inputs TO the main agent (incoming messages),
+            # not the agent's own replies — always use "user" role so the history
+            # stays properly alternating and providers like GLM don't reject it.
+            current_role = "user"
             messages = self.context.build_messages(
                 history=history,
                 current_message=msg.content,
@@ -810,20 +813,6 @@ class AgentLoop:
             message_thread_id=msg.metadata.get("message_thread_id"),
         )
 
-        # --- SignalDetector: detect failure/correction patterns ---
-        if self.signal_detector is not None:
-            try:
-                meta_for_signal = {
-                    "channel": msg.channel,
-                    "chat_id": msg.chat_id,
-                    "session": key,
-                    "tools_used": tools_used,
-                    "stop_reason": stop_reason,
-                }
-                await self.signal_detector.detect_and_feed(msg.content, metadata=meta_for_signal)
-            except Exception:
-                pass  # silently skip — signal detection is non-critical
-
         skills, files_touched = self.telemetry.extract_from_events(tool_events)
         self.telemetry.record_turn(
             ts=datetime.now(timezone.utc).isoformat(),
@@ -854,6 +843,13 @@ class AgentLoop:
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             return None
+
+        # Prepend fallback marker if the provider switched to backup this turn
+        if (
+            hasattr(self.provider, "active_provider_info")
+            and self.provider.active_provider_info
+        ):
+            final_content = f"⚡ fallback: {self.provider.active_provider_info}\n{final_content}"
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)

@@ -1,8 +1,8 @@
 """FallbackProvider: wraps a primary + backup LLM provider.
 
-When the primary returns a quota / hard-limit error the request is
-transparently retried against the backup provider with a pre-configured
-fallback model.
+When the primary returns any error the request is transparently retried
+against the backup provider with a pre-configured fallback model.
+Quota-specific errors are logged with extra diagnostics.
 """
 
 from __future__ import annotations
@@ -12,22 +12,13 @@ from typing import Any
 
 from loguru import logger
 
-from nanobot.providers.base import LLMProvider, LLMResponse
+from nanobot.providers.base import _QUOTA_ERROR_MARKERS, LLMProvider, LLMResponse
 
-
-# Phrases that indicate a hard quota/limit (not a transient network error).
-# These are NOT retried by the base retry loop, so we intercept them here.
-_QUOTA_MARKERS: tuple[str, ...] = (
-    "quota",
-    "usage limit",
-    "1308",         # GLM-specific quota error code
-    "limit reached",
-    "insufficient_quota",
-    "exceeded your",
-)
+_QUOTA_MARKERS: tuple[str, ...] = _QUOTA_ERROR_MARKERS
 
 
 def _is_quota_error(content: str | None) -> bool:
+    """Check if error content indicates a quota / rate-limit issue."""
     if not content:
         return False
     lc = content.lower()
@@ -35,7 +26,7 @@ def _is_quota_error(content: str | None) -> bool:
 
 
 class FallbackProvider(LLMProvider):
-    """Try *primary*; on quota error fall back to *backup* with *fallback_model*."""
+    """Try *primary*; on ANY provider error fall back to *backup*."""
 
     def __init__(
         self,
@@ -47,15 +38,36 @@ class FallbackProvider(LLMProvider):
         self.primary = primary
         self.backup = backup
         self.fallback_model = fallback_model
-        # Inherit generation settings from primary
         self.generation = primary.generation
+        self.used_fallback: bool = False
 
-    # ------------------------------------------------------------------
-    # LLMProvider interface
-    # ------------------------------------------------------------------
+    @property
+    def active_provider_info(self) -> str | None:
+        """Return the fallback model name if backup was used this call, else None."""
+        return self.fallback_model if self.used_fallback else None
 
     def get_default_model(self) -> str:
         return self.primary.get_default_model()
+
+    def _should_fallback(self, response: LLMResponse) -> bool:
+        """Primary errored — always fall back for availability."""
+        return response.finish_reason == "error"
+
+    def _log_fallback(self, content: str | None, stream: bool = False) -> None:
+        suffix = " (stream)" if stream else ""
+        if _is_quota_error(content):
+            logger.warning(
+                "Primary provider quota limit hit, falling back to {}{}",
+                self.fallback_model,
+                suffix,
+            )
+        else:
+            logger.warning(
+                "Primary provider error, falling back to {}{}: {}",
+                self.fallback_model,
+                suffix,
+                (content or "unknown error")[:200],
+            )
 
     async def chat(
         self,
@@ -64,12 +76,11 @@ class FallbackProvider(LLMProvider):
         model: str | None = None,
         **kwargs: Any,
     ) -> LLMResponse:
+        self.used_fallback = False
         response = await self.primary.chat(messages, tools=tools, model=model, **kwargs)
-        if response.finish_reason == "error" and _is_quota_error(response.content):
-            logger.warning(
-                "Primary provider quota limit hit, falling back to {}",
-                self.fallback_model,
-            )
+        if self._should_fallback(response):
+            self._log_fallback(response.content)
+            self.used_fallback = True
             return await self.backup.chat(
                 messages, tools=tools, model=self.fallback_model, **kwargs
             )
@@ -83,17 +94,22 @@ class FallbackProvider(LLMProvider):
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
         **kwargs: Any,
     ) -> LLMResponse:
+        self.used_fallback = False
         response = await self.primary.chat_stream(
-            messages, tools=tools, model=model,
-            on_content_delta=on_content_delta, **kwargs,
+            messages,
+            tools=tools,
+            model=model,
+            on_content_delta=on_content_delta,
+            **kwargs,
         )
-        if response.finish_reason == "error" and _is_quota_error(response.content):
-            logger.warning(
-                "Primary provider quota limit hit, falling back to {} (stream)",
-                self.fallback_model,
-            )
+        if self._should_fallback(response):
+            self._log_fallback(response.content, stream=True)
+            self.used_fallback = True
             return await self.backup.chat_stream(
-                messages, tools=tools, model=self.fallback_model,
-                on_content_delta=on_content_delta, **kwargs,
+                messages,
+                tools=tools,
+                model=self.fallback_model,
+                on_content_delta=on_content_delta,
+                **kwargs,
             )
         return response

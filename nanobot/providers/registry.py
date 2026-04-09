@@ -92,8 +92,19 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         backend="azure_openai",
         is_direct=True,
     ),
+    # === OpenAI Codex: OAuth-based, high-priority fallback (gpt-5.4) =========
+    ProviderSpec(
+        name="openai_codex",
+        keywords=("openai-codex",),
+        env_key="",
+        display_name="OpenAI Codex",
+        backend="openai_codex",
+        detect_by_base_keyword="codex",
+        default_api_base="https://chatgpt.com/backend-api",
+        is_oauth=True,
+    ),
+
     # === Gateways (detected by api_key / api_base, not model name) =========
-    # Gateways can route any model, so they win in fallback.
     # OpenRouter: global gateway, keys start with "sk-or-"
     ProviderSpec(
         name="openrouter",
