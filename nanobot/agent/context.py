@@ -16,6 +16,7 @@ from nanobot.utils.helpers import build_assistant_message, current_time_str, det
 
 _CHARS_PER_TOKEN = 4  # rough estimate, consistent with memory.py
 _SEPARATOR = "\n\n---\n\n"
+_MEMORY_SEARCH_TAG = "[Relevant Memory — retrieved from embedding search]"
 
 
 class ContextBuilder:
@@ -37,6 +38,8 @@ class ContextBuilder:
         self.skills = SkillsLoader(workspace)
         # --- Workspace SkillRouter: lazy init for enhanced descriptions ---
         self._skill_router = None  # None=not tried, False=failed, object=ready
+        # --- Workspace memory search: lazy init for embedding retrieval ---
+        self._memory_search_fn: Any | None = None  # None=not tried, False=failed
 
     def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
@@ -259,11 +262,71 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         else:
             merged = [{"type": "text", "text": runtime_ctx}] + user_content
 
+        system_prompt = self.build_system_prompt(skill_names)
+
+        # --- Memory search: embed query, retrieve relevant chunks ---
+        memory_context = self._get_memory_search_context(current_message)
+        if memory_context:
+            system_prompt = f"{system_prompt}\n\n{_SEPARATOR}\n\n{memory_context}"
+
         return [
-            {"role": "system", "content": self.build_system_prompt(skill_names)},
+            {"role": "system", "content": system_prompt},
             *history,
             {"role": current_role, "content": merged},
         ]
+
+    def _get_memory_search_context(self, query: str) -> str:
+        """Retrieve relevant memory chunks via embedding search.
+
+        Lazy init on first call.  Returns empty string if search is
+        unavailable or returns no results.  Never raises.
+        """
+        if self._memory_search_fn is False:
+            return ""
+        if self._memory_search_fn is None:
+            self._memory_search_fn = self._init_memory_search()
+        if self._memory_search_fn is None:
+            self._memory_search_fn = False
+            return ""
+        try:
+            results = self._memory_search_fn(query)
+            if not results:
+                return ""
+            from nanobot_workspace.memory.search import format_relevant_context
+
+            formatted = format_relevant_context(results)
+            if not formatted:
+                return ""
+            return f"# {_MEMORY_SEARCH_TAG}\n\n{formatted}"
+        except Exception as exc:
+            logger.debug("Memory search context failed: {}", exc)
+            return ""
+
+    @staticmethod
+    def _init_memory_search() -> Any:
+        """Try to initialise the workspace memory search function.
+
+        Returns a callable(query) -> list[HybridResult] on success,
+        or None if the search module is unavailable.
+        """
+        try:
+            from nanobot_workspace.memory.search import get_hybrid_search, search_relevant_chunks
+
+            # Trigger lazy init — if this fails, get_hybrid_search returns None
+            searcher = get_hybrid_search(Path.home() / ".nanobot" / "workspace")
+            if searcher is None:
+                return None
+            # Return a closure that captures the workspace path
+            _ws = Path.home() / ".nanobot" / "workspace"
+
+            def _search(query: str):
+                return search_relevant_chunks(query, _ws)
+
+            logger.info("Memory search initialised (HybridSearch ready)")
+            return _search
+        except Exception as exc:
+            logger.debug("Memory search unavailable: {}", exc)
+            return None
 
     def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:
         """Build user message content with optional base64-encoded images."""

@@ -32,6 +32,9 @@ def _emit_heartbeat_event(event_type: str, data: dict[str, Any] | None = None) -
 class HeartbeatService:
     """Periodic heartbeat: LLM decides skip/run/review, then executes if needed."""
 
+    # Memory reindex interval: every N ticks (~hours at 30-min intervals).
+    _MEMORY_REINDEX_INTERVAL = 2
+
     def __init__(
         self,
         workspace: Path,
@@ -55,6 +58,7 @@ class HeartbeatService:
         self.timezone = timezone
         self._running = False
         self._task: asyncio.Task | None = None
+        self._tick_count: int = 0
 
     @property
     def heartbeat_file(self) -> Path:
@@ -199,8 +203,33 @@ class HeartbeatService:
     # Tick (periodic)
     # ------------------------------------------------------------------
 
+    def _maybe_reindex_memory(self) -> None:
+        """Run incremental memory embedding reindex (non-critical).
+
+        Called every ``_MEMORY_REINDEX_INTERVAL`` ticks.  From cache this
+        takes <1 s.  On failure, the agent still works without embeddings.
+        """
+        try:
+            from nanobot_workspace.memory.search import reindex_incremental
+
+            stats = reindex_incremental(self.workspace)
+            if stats:
+                logger.info(
+                    "Memory reindex: embedded={}, skipped={}, errors={}",
+                    stats.get("embedded", 0),
+                    stats.get("skipped", 0),
+                    stats.get("errors", 0),
+                )
+        except Exception:
+            logger.debug("Memory reindex skipped (module unavailable)")
+
     async def _tick(self) -> None:
         from nanobot.utils.evaluator import evaluate_response
+
+        # --- Maintenance: incremental memory reindex ---
+        self._tick_count += 1
+        if self._tick_count % self._MEMORY_REINDEX_INTERVAL == 0:
+            self._maybe_reindex_memory()
 
         content = self._read_heartbeat_file()
         if not content:
