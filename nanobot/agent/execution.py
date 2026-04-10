@@ -231,6 +231,9 @@ async def _execute_acpx_impl(
     """Internal implementation — see :func:`execute_acpx` for public API."""
     acpx_claude_sh = workspace / "acpx_claude.sh"
 
+    # Use /root as cwd so subagents can access both runtime and workspace repos.
+    runtime_cwd = Path("/root")
+
     # Build command with --format json for structured output
     if agent == "codex":
         cmd = [
@@ -238,7 +241,7 @@ async def _execute_acpx_impl(
             "-y",
             "acpx@latest",
             "--cwd",
-            str(workspace),
+            str(runtime_cwd),
             "--format",
             "json",
             "--approve-reads",
@@ -269,12 +272,12 @@ async def _execute_acpx_impl(
     start_time = time.time()
 
     try:
-        env = {**os.environ, "ACPX_CWD": str(workspace)} if agent == "claude" else None
+        env = {**os.environ, "ACPX_CWD": str(runtime_cwd)} if agent == "claude" else None
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=str(workspace),
+            cwd=str(runtime_cwd),
             env=env,
         )
 
