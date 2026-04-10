@@ -792,9 +792,20 @@ def gateway(
                 return channel, chat_id
         return "cli", "direct"
 
+    # Reload coordinator: safe restart when .pending-reload exists
+    from nanobot.agent.reload import ReloadChecker
+
+    reload_checker = ReloadChecker(
+        workspace=config.workspace_path,
+        agent_loop=agent,
+        subagent_manager=agent.subagents,
+    )
+
     # Create heartbeat service
     async def on_heartbeat_execute(tasks: str) -> str:
         """Phase 2: execute heartbeat tasks through the full agent loop."""
+        if reload_checker.check():
+            return ""  # Process is exiting
         channel, chat_id = _pick_heartbeat_target()
 
         async def _silent(*_args, **_kwargs):
@@ -880,6 +891,15 @@ def gateway(
     console.print(f"[green]✓[/green] Heartbeat: every {hb_cfg.interval_s}s")
 
     async def run():
+        loop = asyncio.get_running_loop()
+        stop_event = asyncio.Event()
+
+        def _handle_stop():
+            stop_event.set()
+
+        loop.add_signal_handler(signal.SIGTERM, _handle_stop)
+        loop.add_signal_handler(signal.SIGINT, _handle_stop)
+
         try:
             await cron.start()
             await heartbeat.start()
@@ -912,6 +932,22 @@ def gateway(
                                 return
                             except Exception:
                                 pass
+
+                        # Clean up reload markers from previous cycle.
+                        reloading_marker = config.workspace_path / ".reloading"
+                        if reloading_marker.exists():
+                            try:
+                                rdata = json.loads(reloading_marker.read_text())
+                                logger.info(
+                                    "Gateway recovered from reload: %s",
+                                    rdata.get("reason", "unknown"),
+                                )
+                            except Exception:
+                                pass
+                            reloading_marker.unlink(missing_ok=True)
+                        pending_reload = config.workspace_path / ".pending-reload"
+                        if pending_reload.exists():
+                            pending_reload.unlink(missing_ok=True)
 
                         # If restart_gateway tool was used, show reason in startup ping.
                         tool_marker = config.workspace_path / ".restart-pending"
@@ -953,10 +989,21 @@ def gateway(
 
                 asyncio.create_task(_send_startup_ping())
 
-            await asyncio.gather(
-                agent.run(),
-                channels.start_all(),
+            done, pending = await asyncio.wait(
+                [
+                    asyncio.ensure_future(agent.run()),
+                    asyncio.ensure_future(channels.start_all()),
+                    asyncio.ensure_future(stop_event.wait()),
+                ],
+                return_when=asyncio.FIRST_COMPLETED,
             )
+            # If stop_event fired, cancel the long-running tasks so gather-like
+            # cleanup runs and the finally block proceeds.
+            for t in pending:
+                t.cancel()
+            # Await cancellations so CancelledError is raised cleanly.
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
         except KeyboardInterrupt:
             console.print("\nShutting down...")
         except Exception:
