@@ -15,6 +15,24 @@ from nanobot.agent.tools.base import Tool
 class ExecTool(Tool):
     """Tool to execute shell commands."""
 
+    _DEFAULT_DENY_PATTERNS: list[str] = [
+        r"\brm\s+-[rf]{1,2}\b",          # rm -r, rm -rf, rm -fr
+        r"\bdel\s+/[fq]\b",              # del /f, del /q
+        r"\brmdir\s+/s\b",               # rmdir /s
+        r"(?:^|[;&|]\s*)format\b",       # format (as standalone command only)
+        r"\b(mkfs|diskpart)\b",          # disk operations
+        r"\bdd\s+if=",                   # dd
+        r">\s*/dev/sd",                  # write to disk
+        r"\b(shutdown|reboot|poweroff)\b",  # system power
+        r":\(\)\s*\{.*\};\s*:",          # fork bomb
+        # Never unload/remove the gateway — kills the process with no recovery path.
+        r"launchctl\s+(bootout|unload|remove).*nanobot.{0,30}gateway",
+        # Never kill the gateway process directly via signal.
+        r"pkill.{0,30}nanobot.{0,20}gateway|killall.{0,10}nanobot",
+        # Linux: never stop/kill/disable the gateway via systemctl.
+        r"systemctl.{0,20}(stop|kill|disable|mask).{0,30}nanobot",
+    ]
+
     def __init__(
         self,
         timeout: int = 60,
@@ -26,22 +44,8 @@ class ExecTool(Tool):
     ):
         self.timeout = timeout
         self.working_dir = working_dir
-        self.deny_patterns = deny_patterns or [
-            r"\brm\s+-[rf]{1,2}\b",          # rm -r, rm -rf, rm -fr
-            r"\bdel\s+/[fq]\b",              # del /f, del /q
-            r"\brmdir\s+/s\b",               # rmdir /s
-            r"(?:^|[;&|]\s*)format\b",       # format (as standalone command only)
-            r"\b(mkfs|diskpart)\b",          # disk operations
-            r"\bdd\s+if=",                   # dd
-            r">\s*/dev/sd",                  # write to disk
-            r"\b(shutdown|reboot|poweroff)\b",  # system power
-            r":\(\)\s*\{.*\};\s*:",          # fork bomb
-            # Never unload/remove the gateway — kills the process with no recovery path.
-            # launchd will NOT restart after bootout/unload (it unregisters the service).
-            r"launchctl\s+(bootout|unload|remove).*nanobot.{0,30}gateway",
-            # Never kill the gateway process directly via signal — launchd may not restart cleanly.
-            r"pkill.{0,30}nanobot.{0,20}gateway|killall.{0,10}nanobot",
-        ]
+        # Config deny_patterns are APPENDED to the built-in defaults, not a replacement.
+        self.deny_patterns = self._DEFAULT_DENY_PATTERNS + (deny_patterns or [])
         self.allow_patterns = allow_patterns or []
         self.restrict_to_workspace = restrict_to_workspace
         self.path_append = path_append

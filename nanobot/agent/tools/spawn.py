@@ -36,7 +36,14 @@ class SpawnTool(Tool):
             "Use this for complex or time-consuming tasks that can run independently. "
             "The subagent will complete the task and report back when done. "
             "For deliverables or existing projects, inspect the workspace first "
-            "and use a dedicated subdirectory when helpful."
+            "and use a dedicated subdirectory when helpful.\n"
+            "Use the 'executor' parameter to choose the execution backend:\n"
+            "- 'codex-5.4' or 'codex-5.3': OpenAI Codex via ACPX (code tasks)\n"
+            "- 'claude-native' or 'claude-zai': Claude via ACPX (code tasks)\n"
+            "- 'glm-turbo': Zhipu GLM-5-turbo API (research, analysis)\n"
+            "- 'glm-5.1': Zhipu GLM-5.1 API (more capable, slower)\n"
+            "- 'openrouter': fallback via OpenRouter\n"
+            "Default: the main agent's own provider/model."
         )
 
     @property
@@ -51,6 +58,19 @@ class SpawnTool(Tool):
                 "label": {
                     "type": "string",
                     "description": "Optional short label for the task (for display)",
+                },
+                "executor": {
+                    "type": "string",
+                    "description": (
+                        "Executor backend alias. Options: codex-5.4, codex-5.3, codex-5.4-mini, "
+                        "claude-native, claude-zai, glm-turbo, glm-5.1, openrouter. "
+                        "Omit to use the main agent's default provider/model."
+                    ),
+                    "enum": [
+                        "codex-5.4", "codex-5.3", "codex-5.4-mini",
+                        "claude-native", "claude-zai",
+                        "glm-turbo", "glm-5.1", "openrouter",
+                    ],
                 },
                 "max_iterations": {
                     "type": "integer",
@@ -73,6 +93,7 @@ class SpawnTool(Tool):
         }
 
     async def execute(self, task: str, label: str | None = None,
+                      executor: str | None = None,
                       max_iterations: int | None = None,
                       hard_cap: int | None = None,
                       **kwargs: Any) -> str:
@@ -87,6 +108,8 @@ class SpawnTool(Tool):
         )
         if self._message_thread_id is not None:
             spawn_kwargs["message_thread_id"] = self._message_thread_id
+        if executor is not None:
+            spawn_kwargs["executor"] = executor
         if max_iterations is not None:
             spawn_kwargs["max_iterations"] = max_iterations
         # Cap hard_cap at 1 hour for safety; omit to use manager default (1800s)

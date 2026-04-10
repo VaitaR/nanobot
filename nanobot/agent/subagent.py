@@ -228,25 +228,71 @@ class SubagentManager:
 
         if acpx_agent is None:
             logger.error("Subagent [{}]: executor '{}' has no acpx_agent mapping", task_id, alias)
-            await self._announce_result(
-                origin,
-                task,
-                label,
-                False,
-                f"Executor '{alias}' has no acpx_agent mapping",
-                time.monotonic(),
-                task_id,
+            envelope = self._build_envelope(
+                f"Executor '{alias}' has no acpx_agent mapping", "error", stop_reason="config_error"
             )
+            await self._announce_result(task_id, label, task, envelope, origin)
             return
 
         start_time = time.monotonic()
+        started_at = datetime.now(UTC).isoformat()
 
         result = await execute_acpx(acpx_agent, task, self.workspace, timeout_s=hard_cap)
 
+        finished_at = datetime.now(UTC).isoformat()
         logger.info("Subagent [{}]: CLI executor finished, success={}", task_id, result.success)
-        await self._announce_result(
-            origin, task, label, result.success, result.summary, start_time, task_id
+
+        # ── Delivery record ────────────────────────────────────────────────
+        try:
+            from nanobot_workspace.agent.delivery import DeliveryRecord, is_transient_failure, write_delivery_record
+
+            summary = result.final_message or ""
+            if len(summary) > 400:
+                summary = summary[:400]
+
+            write_delivery_record(
+                self.workspace,
+                DeliveryRecord(
+                    task_id=task_id,
+                    agent=alias,
+                    attempt=1,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    success=result.success,
+                    transient=is_transient_failure(result),
+                    exit_code=result.exit_code,
+                    error_type=result.error_type or "",
+                    summary=summary,
+                ),
+            )
+        except Exception:
+            logger.exception("Subagent [{}]: failed to write delivery record", task_id)
+
+        # ── Post-delegation verification (ruff + pytest) ────────────────────
+        verified = True
+        if result.success and getattr(result, "tool_calls", None):
+            try:
+                from nanobot_workspace.agent.verification import verify_delegation
+
+                outcome = verify_delegation(result, self.workspace, correlation_id=task_id)
+                if not outcome.passed and not outcome.timed_out and not outcome.skipped:
+                    verified = False
+                    error_summary = (
+                        f"Verification failed. "
+                        f"Lint: {len(outcome.lint_errors)} errors, "
+                        f"Tests: {len(outcome.test_failures)} failures"
+                    )
+                    logger.warning("Subagent [{}]: {}", task_id, error_summary)
+            except Exception:
+                logger.exception("Subagent [{}]: verification check failed", task_id)
+
+        status = "ok" if verified and result.success else "error"
+        summary = result.final_message or result.summary if hasattr(result, "summary") else result.final_message or ""
+        error = "" if verified and result.success else (result.error or summary)
+        envelope = self._build_envelope(
+            summary, status, stop_reason="completed" if result.success else "error", error=error if not (verified and result.success) else None
         )
+        await self._announce_result(task_id, label, task, envelope, origin)
 
     async def _run_subagent(
         self,
