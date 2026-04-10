@@ -957,7 +957,14 @@ def gateway(
                             try:
                                 td = json.loads(tool_marker.read_text())
                                 tool_reason = td.get("reason", "")
-                                last_restart_marker.write_text(tool_marker.read_text())
+                                last_restart_marker.write_text(
+                                    json.dumps(
+                                        {
+                                            "reason": tool_reason or "tool",
+                                            "timestamp": datetime.now(UTC).isoformat(),
+                                        }
+                                    )
+                                )
                                 tool_marker.unlink()
                             except Exception:
                                 pass

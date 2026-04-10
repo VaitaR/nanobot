@@ -328,6 +328,9 @@ async def _execute_acpx_impl(
         stderr = stderr_bytes.decode("utf-8", errors="replace")
         duration = time.time() - start_time
 
+        # Persist raw output for post-mortem debugging
+        _write_acpx_raw_log(workspace, agent, stdout, stderr, duration)
+
         # Try to parse JSON output
         try:
             parsed = _parse_acpx_json_output(stdout, stderr, duration)
@@ -401,6 +404,50 @@ async def _execute_acpx_impl(
             total_duration=duration,
             error_type="exception",
         )
+
+
+def _write_acpx_raw_log(
+    workspace: Path,
+    agent: str,
+    stdout: str,
+    stderr: str,
+    duration: float,
+) -> None:
+    """Append raw ACPX stdout+stderr to a per-day log for post-mortem inspection.
+
+    Written to ``sessions/acpx_<date>.log`` with a separator between invocations.
+    """
+    sessions_dir = workspace / "sessions"
+    try:
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        logger.warning("acpx.raw_log_mkdir_failed", path=str(sessions_dir))
+        return
+
+    date_stamp = datetime.now(UTC).strftime("%Y%m%d")
+    log_path = sessions_dir / f"acpx_{date_stamp}.log"
+
+    duration_ms = int(duration * 1000)
+    separator = (
+        f"\n{'='*60}\n"
+        f"[{datetime.now(UTC).isoformat()}] agent={agent} duration={duration_ms}ms\n"
+        f"{'='*60}\n"
+    )
+
+    try:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(separator)
+            f.write("--- STDOUT ---\n")
+            f.write(stdout)
+            if not stdout.endswith("\n"):
+                f.write("\n")
+            if stderr.strip():
+                f.write("--- STDERR ---\n")
+                f.write(stderr)
+                if not stderr.endswith("\n"):
+                    f.write("\n")
+    except OSError:
+        logger.warning("acpx.raw_log_write_failed", path=str(log_path))
 
 
 def _write_acpx_telemetry(
