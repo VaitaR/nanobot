@@ -234,7 +234,6 @@ class SubagentManager:
             await self._announce_result(task_id, label, task, envelope, origin)
             return
 
-        start_time = time.monotonic()
         started_at = datetime.now(UTC).isoformat()
 
         result = await execute_acpx(acpx_agent, task, self.workspace, timeout_s=hard_cap)
@@ -244,11 +243,17 @@ class SubagentManager:
 
         # ── Delivery record ────────────────────────────────────────────────
         try:
-            from nanobot_workspace.agent.delivery import DeliveryRecord, is_transient_failure, write_delivery_record
+            from nanobot_workspace.agent.delivery import (
+                DeliveryRecord,
+                is_transient_failure,
+                write_delivery_record,
+            )
 
             summary = result.final_message or ""
             if len(summary) > 400:
                 summary = summary[:400]
+
+            stderr_tail = result.stderr[-500:] if (not result.success and result.stderr) else ""
 
             write_delivery_record(
                 self.workspace,
@@ -263,6 +268,7 @@ class SubagentManager:
                     exit_code=result.exit_code,
                     error_type=result.error_type or "",
                     summary=summary,
+                    stderr_tail=stderr_tail,
                 ),
             )
         except Exception:

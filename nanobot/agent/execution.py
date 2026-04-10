@@ -21,6 +21,31 @@ from typing import Any
 from loguru import logger
 
 # ---------------------------------------------------------------------------
+# Signal helpers
+# ---------------------------------------------------------------------------
+
+_SIGNAL_NAMES: dict[int, str] = {
+    1: "SIGHUP",
+    2: "SIGINT",
+    3: "SIGQUIT",
+    6: "SIGABRT",
+    9: "SIGKILL",
+    11: "SIGSEGV",
+    13: "SIGPIPE",
+    15: "SIGTERM",
+}
+
+
+def _signal_label(rc: int) -> str | None:
+    """Return 'SIGNAME (signal N)' for exit codes > 128, else None."""
+    if rc > 128:
+        signum = rc - 128
+        name = _SIGNAL_NAMES.get(signum, f"signal {signum}")
+        return f"{name} (signal {signum})"
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Result types
 # ---------------------------------------------------------------------------
 
@@ -93,7 +118,7 @@ class DelegatedResult:
 # ACPX executor
 # ---------------------------------------------------------------------------
 
-_DEFAULT_TIMEOUT_S = 300
+_DEFAULT_TIMEOUT_S = 600
 
 
 def get_default_timeout() -> int:
@@ -327,7 +352,15 @@ async def _execute_acpx_impl(
             if result.success:
                 logger.info("acpx.ok", agent=agent, duration=duration)
             else:
-                logger.warning("acpx.fail", agent=agent, rc=process.returncode, error=result.error)
+                _rc = process.returncode
+                logger.warning(
+                    "acpx.fail",
+                    agent=agent,
+                    rc=_rc,
+                    signal=_signal_label(_rc),
+                    error=result.error,
+                    stderr_tail=stderr[-500:] if stderr else "",
+                )
 
             return result
 
