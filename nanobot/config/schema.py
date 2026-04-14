@@ -51,7 +51,7 @@ class CompactionConfig(Base):
     token_budget: int = 0  # 0 = auto (derived from context_window_tokens)
     safety_margin: int = 8_000
     keep_recent: int = 10
-    compaction_threshold: float = 0.75  # Fire when tokens > threshold * effective_budget
+    compaction_threshold: float = 0.5  # Fire when tokens > threshold * effective_budget (50K tokens with 100K budget)
 
 
 class AgentDefaults(Base):

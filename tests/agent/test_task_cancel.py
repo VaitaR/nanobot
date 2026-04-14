@@ -103,6 +103,15 @@ class TestDispatch:
 
         assert loop.tools.get("exec") is None
 
+    def test_direct_exec_tool_has_unrestricted_tier(self):
+        loop, _bus = _make_loop()
+
+        exec_tool = loop.tools.get("exec")
+
+        assert exec_tool is not None
+        assert exec_tool.max_tier == 3
+        assert exec_tool.exec_context == "direct"
+
     @pytest.mark.asyncio
     async def test_dispatch_processes_and_publishes(self):
         from nanobot.bus.events import InboundMessage, OutboundMessage

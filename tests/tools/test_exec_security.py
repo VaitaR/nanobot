@@ -67,3 +67,15 @@ async def test_exec_blocks_chained_internal_url():
             command="echo start && curl http://169.254.169.254/latest/meta-data/ && echo done"
         )
     assert "Error" in result
+
+
+@pytest.mark.asyncio
+async def test_exec_blocks_command_above_tier_cap_and_logs_warning():
+    tool = ExecTool(max_tier=1, exec_context="subagent")
+
+    with patch("nanobot.agent.tools.shell.logger.warning") as mock_warning:
+        result = await tool.execute(command="rm -rf /tmp/test")
+
+    assert "Error: Command blocked by exec tier gate" in result
+    assert "max tier 1" in result
+    mock_warning.assert_called_once()

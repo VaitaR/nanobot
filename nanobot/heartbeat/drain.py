@@ -100,10 +100,22 @@ def collect_pending(*, path: Path | None = None) -> list[dict[str, Any]]:
     queue_path = path or QUEUE_PATH
     data = _read_queue(queue_path)
     notifications = data.get("notifications", [])
-    pending = [
-        n for n in notifications
-        if n.get("status") == "pending" and n.get("channel") == "telegram"
-    ]
+    pending = []
+    for notification in notifications:
+        if notification.get("status") != "pending" or notification.get("channel") != "telegram":
+            continue
+        item = dict(notification)
+        metadata = item.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+            item["metadata"] = metadata
+        if item.get("source") is None:
+            item["source"] = metadata.get("source")
+        if item.get("task_id") is None:
+            item["task_id"] = metadata.get("task_id")
+        if item.get("correlation_id") is None:
+            item["correlation_id"] = metadata.get("correlation_id") or item.get("task_id")
+        pending.append(item)
     if pending:
         logger.info("drain: {} pending notifications", len(pending))
     return pending

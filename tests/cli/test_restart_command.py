@@ -78,7 +78,8 @@ class TestRestartCommand:
         loop, bus = _make_loop()
         msg = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="/status")
 
-        with patch.object(loop, "_dispatch", new_callable=AsyncMock) as mock_dispatch:
+        with patch.object(loop, "_dispatch", new_callable=AsyncMock) as mock_dispatch, \
+             patch("nanobot_workspace.observability.usage_tracker.run_checks", return_value=[]):
             await bus.publish_inbound(msg)
 
             loop._running = True
@@ -133,7 +134,8 @@ class TestRestartCommand:
 
         msg = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="/status")
 
-        response = await loop._process_message(msg)
+        with patch("nanobot_workspace.observability.usage_tracker.run_checks", return_value=[]):
+            response = await loop._process_message(msg)
 
         assert response is not None
         assert "Model: test-model" in response.content

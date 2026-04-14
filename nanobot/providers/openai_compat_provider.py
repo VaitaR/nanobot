@@ -158,6 +158,7 @@ class OpenAICompatProvider(LLMProvider):
         self.default_model = default_model
         self.extra_headers = extra_headers or {}
         self._spec = spec
+        self._configure_llm_concurrency(self.default_model)
 
         if api_key and spec and spec.env_key:
             self._setup_env(api_key, api_base)
@@ -600,20 +601,22 @@ class OpenAICompatProvider(LLMProvider):
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
     ) -> LLMResponse:
-        kwargs = self._build_kwargs(
-            messages,
-            tools,
-            model,
-            max_tokens,
-            temperature,
-            reasoning_effort,
-            tool_choice,
-        )
-        try:
-            return self._parse(await self._client.chat.completions.create(**kwargs))
-        except Exception as e:
-            _log_messages_on_error(kwargs.get("messages"), e)
-            return self._handle_error(e)
+        effective_model = model or self.default_model
+        async with self._acquire_llm_slot(effective_model):
+            kwargs = self._build_kwargs(
+                messages,
+                tools,
+                model,
+                max_tokens,
+                temperature,
+                reasoning_effort,
+                tool_choice,
+            )
+            try:
+                return self._parse(await self._client.chat.completions.create(**kwargs))
+            except Exception as e:
+                _log_messages_on_error(kwargs.get("messages"), e)
+                return self._handle_error(e)
 
     async def chat_stream(
         self,
@@ -626,30 +629,32 @@ class OpenAICompatProvider(LLMProvider):
         tool_choice: str | dict[str, Any] | None = None,
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
-        kwargs = self._build_kwargs(
-            messages,
-            tools,
-            model,
-            max_tokens,
-            temperature,
-            reasoning_effort,
-            tool_choice,
-        )
-        kwargs["stream"] = True
-        kwargs["stream_options"] = {"include_usage": True}
-        try:
-            stream = await self._client.chat.completions.create(**kwargs)
-            chunks: list[Any] = []
-            async for chunk in stream:
-                chunks.append(chunk)
-                if on_content_delta and chunk.choices:
-                    text = getattr(chunk.choices[0].delta, "content", None)
-                    if text:
-                        await on_content_delta(text)
-            return self._parse_chunks(chunks)
-        except Exception as e:
-            _log_messages_on_error(kwargs.get("messages"), e)
-            return self._handle_error(e)
+        effective_model = model or self.default_model
+        async with self._acquire_llm_slot(effective_model):
+            kwargs = self._build_kwargs(
+                messages,
+                tools,
+                model,
+                max_tokens,
+                temperature,
+                reasoning_effort,
+                tool_choice,
+            )
+            kwargs["stream"] = True
+            kwargs["stream_options"] = {"include_usage": True}
+            try:
+                stream = await self._client.chat.completions.create(**kwargs)
+                chunks: list[Any] = []
+                async for chunk in stream:
+                    chunks.append(chunk)
+                    if on_content_delta and chunk.choices:
+                        text = getattr(chunk.choices[0].delta, "content", None)
+                        if text:
+                            await on_content_delta(text)
+                return self._parse_chunks(chunks)
+            except Exception as e:
+                _log_messages_on_error(kwargs.get("messages"), e)
+                return self._handle_error(e)
 
     def get_default_model(self) -> str:
         return self.default_model

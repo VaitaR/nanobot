@@ -24,6 +24,7 @@ class OpenAICodexProvider(LLMProvider):
     def __init__(self, default_model: str = "openai-codex/gpt-5.1-codex"):
         super().__init__(api_key=None, api_base=None)
         self.default_model = default_model
+        self._configure_llm_concurrency(self.default_model)
 
     async def _call_codex(
         self,
@@ -92,7 +93,11 @@ class OpenAICodexProvider(LLMProvider):
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
     ) -> LLMResponse:
-        return await self._call_codex(messages, tools, model, reasoning_effort, tool_choice)
+        effective_model = model or self.default_model
+        async with self._acquire_llm_slot(effective_model):
+            return await self._call_codex(
+                messages, tools, model, reasoning_effort, tool_choice
+            )
 
     async def chat_stream(
         self,
@@ -105,9 +110,11 @@ class OpenAICodexProvider(LLMProvider):
         tool_choice: str | dict[str, Any] | None = None,
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
-        return await self._call_codex(
-            messages, tools, model, reasoning_effort, tool_choice, on_content_delta
-        )
+        effective_model = model or self.default_model
+        async with self._acquire_llm_slot(effective_model):
+            return await self._call_codex(
+                messages, tools, model, reasoning_effort, tool_choice, on_content_delta
+            )
 
     def get_default_model(self) -> str:
         return self.default_model
@@ -259,7 +266,9 @@ async def _iter_sse(response: httpx.Response) -> AsyncGenerator[dict[str, Any], 
     async for line in response.aiter_lines():
         if line == "":
             if buffer:
-                data_lines = [l[5:].strip() for l in buffer if l.startswith("data:")]
+                data_lines = [
+                    line_item[5:].strip() for line_item in buffer if line_item.startswith("data:")
+                ]
                 buffer = []
                 if not data_lines:
                     continue

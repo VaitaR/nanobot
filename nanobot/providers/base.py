@@ -6,6 +6,7 @@ import asyncio
 import json
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -84,6 +85,12 @@ class GenerationSettings:
     reasoning_effort: str | None = None
 
 
+_DEFAULT_CONCURRENCY_LIMITS: dict[str, int] = {
+    "glm-5-turbo": 2,
+    "glm-5.1": 1,
+}
+
+
 class LLMProvider(ABC):
     """
     Abstract base class for LLM providers.
@@ -101,6 +108,35 @@ class LLMProvider(ABC):
         self.api_key = api_key
         self.api_base = api_base
         self.generation: GenerationSettings = GenerationSettings()
+        self._llm_semaphores: dict[str, asyncio.Semaphore] = {}
+        self._llm_semaphore: asyncio.Semaphore | None = None
+
+    def _configure_llm_concurrency(self, default_model: str | None) -> None:
+        """Prime the shared semaphore for the provider's default model."""
+        self._llm_semaphore = self._get_llm_semaphore(default_model)
+
+    def _get_llm_semaphore(self, model: str | None) -> asyncio.Semaphore | None:
+        """Return the shared semaphore for *model*, creating it lazily if needed."""
+        if not model:
+            return None
+        limit = _DEFAULT_CONCURRENCY_LIMITS.get(model)
+        if not limit or limit <= 0:
+            return None
+        semaphore = self._llm_semaphores.get(model)
+        if semaphore is None:
+            semaphore = asyncio.Semaphore(limit)
+            self._llm_semaphores[model] = semaphore
+        return semaphore
+
+    @asynccontextmanager
+    async def _acquire_llm_slot(self, model: str | None) -> Any:
+        """Serialize provider calls when a model-specific concurrency limit applies."""
+        semaphore = self._get_llm_semaphore(model)
+        if semaphore is None:
+            yield
+            return
+        async with semaphore:
+            yield
 
     @staticmethod
     def _sanitize_empty_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:

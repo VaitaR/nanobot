@@ -302,7 +302,7 @@ class TelegramChannel(BaseChannel):
         self._app.add_handler(CommandHandler("status", self._forward_command))
         self._app.add_handler(CommandHandler("tasks", self._forward_command))
         self._app.add_handler(CommandHandler("heartbeat", self._forward_command))
-        self._app.add_handler(CommandHandler("help", self._forward_command))
+        self._app.add_handler(CommandHandler("help", self._on_help))
 
         # Add message handler for text, photos, voice, documents
         self._app.add_handler(
@@ -637,6 +637,22 @@ class TelegramChannel(BaseChannel):
             "Send me a message and I'll respond!\n"
             "Type /help to see available commands."
         )
+
+    async def _on_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /help command."""
+        del context
+        if not update.message:
+            return
+
+        commands = "\n".join([
+            "/new - Start a new conversation",
+            "/stop - Stop the current task",
+            "/restart - Restart the bot",
+            "/status - Show bot status",
+            "/tasks - List workspace tasks",
+            "/heartbeat - Trigger heartbeat check",
+        ])
+        await update.message.reply_text(f"Available commands:\n{commands}")
 
     @staticmethod
     def _sender_id(user) -> str:

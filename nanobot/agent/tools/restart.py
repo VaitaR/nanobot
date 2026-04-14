@@ -6,7 +6,6 @@ import json
 import logging
 import os
 import shutil
-import signal
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +15,7 @@ from nanobot.agent.tools.base import Tool
 
 if TYPE_CHECKING:
     from nanobot.agent.subagent import SubagentManager
+    from nanobot.bus.queue import MessageBus
 
 logger = logging.getLogger(__name__)
 
@@ -64,18 +64,20 @@ class RestartGatewayTool(Tool):
     """Tool to restart the nanobot gateway process.
 
     Writes a ``.restart-pending`` marker with the reason, then re-execs
-    the current Python interpreter so launchd (or the parent process)
-    respawns a fresh gateway instance.
-
-    **Safety**: If no supervisor (systemd/launchd) is detected, the restart
-    is **blocked** because os.execv would kill the process permanently.
+    the current Python interpreter.
     """
 
     _PENDING_FILE = ".restart-pending"
 
-    def __init__(self, workspace: Path, subagent_manager: SubagentManager | None = None) -> None:
+    def __init__(
+        self,
+        workspace: Path,
+        subagent_manager: SubagentManager | None = None,
+        bus: MessageBus | None = None,
+    ) -> None:
         self._workspace = workspace
         self._subagent_manager = subagent_manager
+        self._bus = bus
 
     @property
     def name(self) -> str:
@@ -85,9 +87,7 @@ class RestartGatewayTool(Tool):
     def description(self) -> str:
         return (
             "Restart the nanobot gateway process. "
-            "Writes a marker file with the reason, then sends SIGTERM to self. "
-            "Systemd (or the parent supervisor) will respawn a fresh instance. "
-            "If no supervisor is detected, restart is blocked to prevent self-kill."
+            "Writes a marker file with the reason, then re-execs the current Python process."
         )
 
     @property
@@ -100,6 +100,19 @@ class RestartGatewayTool(Tool):
                     "description": "Why the restart is happening (e.g. 'applied code patch')",
                     "maxLength": 200,
                 },
+                "channel": {
+                    "type": "string",
+                    "description": "Originating channel for the chat to resume after restart.",
+                },
+                "chat_id": {
+                    "type": "string",
+                    "description": "Originating chat ID for the chat to resume after restart.",
+                },
+                "resume_prompt": {
+                    "type": "string",
+                    "description": "System resume prompt injected after the gateway comes back online.",
+                    "maxLength": 1_000,
+                },
             },
             "required": ["reason"],
         }
@@ -110,21 +123,15 @@ class RestartGatewayTool(Tool):
             return "Error: 'reason' is required and must be non-empty"
 
         reason = reason.strip()[:200]
-
-        # --- Supervisor check (hard block) ---
-        supervisor = _detect_supervisor()
-        if supervisor is None:
-            logger.warning("restart_gateway blocked: no supervisor detected")
-            return (
-                "❌ Restart blocked: no supervisor (systemd/launchd) detected.\n"
-                "os.execv would kill the process with no way to restart.\n"
-                "To fix: set up a systemd user service or launchd agent for nanobot,\n"
-                "or restart manually: kill <pid> && nanobot gateway &"
-            )
+        channel = str(kwargs.get("channel") or "").strip()
+        chat_id = str(kwargs.get("chat_id") or "").strip()
+        resume_prompt = str(kwargs.get("resume_prompt") or "").strip()[:1000]
 
         # --- Safety checks (warnings only, never block) ---
         warnings: list[str] = []
-        warnings.append(f"Supervisor: {supervisor}")
+        supervisor = _detect_supervisor()
+        if supervisor is not None:
+            warnings.append(f"Supervisor: {supervisor}")
 
         if self._subagent_manager is not None:
             try:
@@ -147,6 +154,9 @@ class RestartGatewayTool(Tool):
             pending = self._workspace / self._PENDING_FILE
             payload = {
                 "reason": reason,
+                "channel": channel,
+                "chat_id": chat_id,
+                "resume_prompt": resume_prompt,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
             pending.write_text(json.dumps(payload, indent=2))
@@ -160,13 +170,10 @@ class RestartGatewayTool(Tool):
             parts.append("\n".join(warnings))
         parts.append("Restarting gateway…")
 
-        # --- Signal-based restart (works with systemd) ---
-        # os.execv does NOT trigger systemd restart because PID stays alive.
-        # SIGTERM lets systemd see process death → Restart=always respawns.
         try:
-            os.kill(os.getpid(), signal.SIGTERM)
+            os.execv(sys.executable, [sys.executable, "-m", "nanobot", "gateway"])
         except Exception as exc:
-            return "\n".join(parts) + f"\nError: os.kill(SIGTERM) failed: {exc}"
+            return "\n".join(parts) + f"\nError: execv failed: {exc}"
 
-        # Unreachable — process is terminating.
+        # Unreachable — process image has been replaced.
         return "\n".join(parts)  # pragma: no cover

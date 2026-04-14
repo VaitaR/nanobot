@@ -269,7 +269,7 @@ async def _execute_acpx_impl(
             str(runtime_cwd),
             "--format",
             "json",
-            "--approve-reads",
+            "--approve-all",
             "codex",
             "exec",
             prompt,

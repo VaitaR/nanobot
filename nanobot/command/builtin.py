@@ -33,6 +33,10 @@ async def cmd_restart(ctx: CommandContext):
     import json
 
     msg = ctx.msg
+    resume_prompt = (
+        "[System] Gateway restart complete. Continue from the previous conversation "
+        "and finish any interrupted work."
+    )
 
     async def _do_restart():
         await asyncio.sleep(1)
@@ -40,7 +44,15 @@ async def cmd_restart(ctx: CommandContext):
         try:
             if ctx.loop and hasattr(ctx.loop, "workspace"):
                 marker = ctx.loop.workspace / "restart_pending.json"
-                marker.write_text(json.dumps({"channel": msg.channel, "chat_id": msg.chat_id}))
+                marker.write_text(
+                    json.dumps(
+                        {
+                            "channel": msg.channel,
+                            "chat_id": msg.chat_id,
+                            "resume_prompt": resume_prompt,
+                        }
+                    )
+                )
         except Exception:
             pass
         os.execv(sys.executable, [sys.executable, "-m", "nanobot"] + sys.argv[1:])
@@ -60,6 +72,20 @@ async def cmd_status(ctx: CommandContext):
         pass
     if ctx_est <= 0:
         ctx_est = loop._last_usage.get("prompt_tokens", 0)
+
+    usage_snapshot: str | None = None
+    try:
+        from nanobot_workspace.observability.usage_tracker import (
+            format_snapshot,
+            load_latest_snapshot,
+        )
+
+        results = await asyncio.to_thread(load_latest_snapshot)
+        if results:
+            usage_snapshot = format_snapshot(results)
+    except Exception:
+        pass
+
     return ctx.outbound(
         build_status_content(
             version=__version__, model=loop.model,
@@ -67,6 +93,7 @@ async def cmd_status(ctx: CommandContext):
             context_window_tokens=loop.context_window_tokens,
             session_msg_count=len(session.get_history(max_messages=0)),
             context_tokens_estimate=ctx_est,
+            usage_snapshot=usage_snapshot,
         ),
         render_as="text",
     )

@@ -19,7 +19,7 @@ _AZURE_MSG_KEYS = frozenset({"role", "content", "tool_calls", "tool_call_id", "n
 class AzureOpenAIProvider(LLMProvider):
     """
     Azure OpenAI provider with API version 2024-10-21 compliance.
-    
+
     Features:
     - Hardcoded API version 2024-10-21
     - Uses model field as Azure deployment name in URL path
@@ -37,16 +37,17 @@ class AzureOpenAIProvider(LLMProvider):
         super().__init__(api_key, api_base)
         self.default_model = default_model
         self.api_version = "2024-10-21"
-        
+        self._configure_llm_concurrency(self.default_model)
+
         # Validate required parameters
         if not api_key:
             raise ValueError("Azure OpenAI api_key is required")
         if not api_base:
             raise ValueError("Azure OpenAI api_base is required")
-        
+
         # Ensure api_base ends with /
-        if not api_base.endswith('/'):
-            api_base += '/'
+        if not api_base.endswith("/"):
+            api_base += "/"
         self.api_base = api_base
 
     def _build_chat_url(self, deployment_name: str) -> str:
@@ -54,12 +55,12 @@ class AzureOpenAIProvider(LLMProvider):
         # Azure OpenAI URL format:
         # https://{resource}.openai.azure.com/openai/deployments/{deployment}/chat/completions?api-version={version}
         base_url = self.api_base
-        if not base_url.endswith('/'):
-            base_url += '/'
-        
+        if not base_url.endswith("/"):
+            base_url += "/"
+
         url = urljoin(
-            base_url, 
-            f"openai/deployments/{deployment_name}/chat/completions"
+            base_url,
+            f"openai/deployments/{deployment_name}/chat/completions",
         )
         return f"{url}?api-version={self.api_version}"
 
@@ -138,30 +139,31 @@ class AzureOpenAIProvider(LLMProvider):
             LLMResponse with content and/or tool calls.
         """
         deployment_name = model or self.default_model
-        url = self._build_chat_url(deployment_name)
-        headers = self._build_headers()
-        payload = self._prepare_request_payload(
-            deployment_name, messages, tools, max_tokens, temperature, reasoning_effort,
-            tool_choice=tool_choice,
-        )
-
-        try:
-            async with httpx.AsyncClient(timeout=60.0, verify=True) as client:
-                response = await client.post(url, headers=headers, json=payload)
-                if response.status_code != 200:
-                    return LLMResponse(
-                        content=f"Azure OpenAI API Error {response.status_code}: {response.text}",
-                        finish_reason="error",
-                    )
-                
-                response_data = response.json()
-                return self._parse_response(response_data)
-
-        except Exception as e:
-            return LLMResponse(
-                content=f"Error calling Azure OpenAI: {repr(e)}",
-                finish_reason="error",
+        async with self._acquire_llm_slot(deployment_name):
+            url = self._build_chat_url(deployment_name)
+            headers = self._build_headers()
+            payload = self._prepare_request_payload(
+                deployment_name, messages, tools, max_tokens, temperature, reasoning_effort,
+                tool_choice=tool_choice,
             )
+
+            try:
+                async with httpx.AsyncClient(timeout=60.0, verify=True) as client:
+                    response = await client.post(url, headers=headers, json=payload)
+                    if response.status_code != 200:
+                        return LLMResponse(
+                            content=f"Azure OpenAI API Error {response.status_code}: {response.text}",
+                            finish_reason="error",
+                        )
+
+                    response_data = response.json()
+                    return self._parse_response(response_data)
+
+            except Exception as e:
+                return LLMResponse(
+                    content=f"Error calling Azure OpenAI: {repr(e)}",
+                    finish_reason="error",
+                )
 
     def _parse_response(self, response: dict[str, Any]) -> LLMResponse:
         """Parse Azure OpenAI response into our standard format."""
@@ -223,26 +225,27 @@ class AzureOpenAIProvider(LLMProvider):
     ) -> LLMResponse:
         """Stream a chat completion via Azure OpenAI SSE."""
         deployment_name = model or self.default_model
-        url = self._build_chat_url(deployment_name)
-        headers = self._build_headers()
-        payload = self._prepare_request_payload(
-            deployment_name, messages, tools, max_tokens, temperature,
-            reasoning_effort, tool_choice=tool_choice,
-        )
-        payload["stream"] = True
+        async with self._acquire_llm_slot(deployment_name):
+            url = self._build_chat_url(deployment_name)
+            headers = self._build_headers()
+            payload = self._prepare_request_payload(
+                deployment_name, messages, tools, max_tokens, temperature,
+                reasoning_effort, tool_choice=tool_choice,
+            )
+            payload["stream"] = True
 
-        try:
-            async with httpx.AsyncClient(timeout=60.0, verify=True) as client:
-                async with client.stream("POST", url, headers=headers, json=payload) as response:
-                    if response.status_code != 200:
-                        text = await response.aread()
-                        return LLMResponse(
-                            content=f"Azure OpenAI API Error {response.status_code}: {text.decode('utf-8', 'ignore')}",
-                            finish_reason="error",
-                        )
-                    return await self._consume_stream(response, on_content_delta)
-        except Exception as e:
-            return LLMResponse(content=f"Error calling Azure OpenAI: {repr(e)}", finish_reason="error")
+            try:
+                async with httpx.AsyncClient(timeout=60.0, verify=True) as client:
+                    async with client.stream("POST", url, headers=headers, json=payload) as response:
+                        if response.status_code != 200:
+                            text = await response.aread()
+                            return LLMResponse(
+                                content=f"Azure OpenAI API Error {response.status_code}: {text.decode('utf-8', 'ignore')}",
+                                finish_reason="error",
+                            )
+                        return await self._consume_stream(response, on_content_delta)
+            except Exception as e:
+                return LLMResponse(content=f"Error calling Azure OpenAI: {repr(e)}", finish_reason="error")
 
     async def _consume_stream(
         self,

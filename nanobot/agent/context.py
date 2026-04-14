@@ -4,6 +4,7 @@ import base64
 import json
 import mimetypes
 import platform
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +13,12 @@ from loguru import logger
 from nanobot.agent.dynamic_slots import resolve_dynamic_slots
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
-from nanobot.utils.helpers import build_assistant_message, current_time_str, detect_image_mime
+from nanobot.utils.helpers import (
+    build_assistant_message,
+    current_time_str,
+    detect_image_mime,
+    estimate_prompt_tokens_chain,
+)
 
 _CHARS_PER_TOKEN = 4  # rough estimate, consistent with memory.py
 _SEPARATOR = "\n\n---\n\n"
@@ -102,7 +108,7 @@ class ContextBuilder:
         for label in removable:
             if total_chars // _CHARS_PER_TOKEN <= budget:
                 break
-            idx = next((i for i, (l, _) in enumerate(result) if l == label), None)
+            idx = next((i for i, (part_label, _) in enumerate(result) if part_label == label), None)
             if idx is None:
                 continue
             section_chars = len(result[idx][1])
@@ -117,10 +123,12 @@ class ContextBuilder:
 
         # Truncate memory if still over budget (identity is never touched)
         if total_chars // _CHARS_PER_TOKEN > budget:
-            mem_idx = next((i for i, (l, _) in enumerate(result) if l == "memory"), None)
+            mem_idx = next((i for i, (part_label, _) in enumerate(result) if part_label == "memory"), None)
             if mem_idx is not None:
                 remaining = budget * _CHARS_PER_TOKEN
-                remaining -= sum(len(c) for l, c in result if l != "memory")
+                remaining -= sum(
+                    len(content) for part_label, content in result if part_label != "memory"
+                )
                 remaining -= _SEPARATOR.__len__() * max(0, len(result) - 1)
                 # TODO: smart memory truncation (LLM summarization) instead of raw character cutoff
                 result[mem_idx] = ("memory", result[mem_idx][1][:max(0, remaining)])
@@ -209,8 +217,11 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
 
     @staticmethod
     def _build_runtime_context(
-        channel: str | None, chat_id: str | None, timezone: str | None = None,
+        channel: str | None,
+        chat_id: str | None,
+        timezone: str | None = None,
         workspace: Path | None = None,
+        session_stats: dict[str, int] | None = None,
     ) -> str:
         """Build untrusted runtime metadata block for injection before the user message."""
         lines = [f"Current Time: {current_time_str(timezone)}"]
@@ -226,7 +237,57 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
                     lines.append(f"Last restart: {ts} — {reason}")
                 except Exception:
                     pass
+        if session_stats:
+            lines.extend([
+                "Session Stats:",
+                f"session_message_count: {session_stats['session_message_count']}",
+                f"session_age_minutes: {session_stats['session_age_minutes']}",
+            ])
+            estimated_token_count = session_stats.get("estimated_token_count")
+            if estimated_token_count is not None:
+                lines.append(f"estimated_token_count: {estimated_token_count}")
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
+
+    @staticmethod
+    def _parse_session_timestamp(raw_timestamp: Any) -> datetime | None:
+        """Parse a session timestamp value into a timezone-aware datetime when possible."""
+        if not isinstance(raw_timestamp, str) or not raw_timestamp:
+            return None
+        normalized = raw_timestamp.replace("Z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed
+
+    @classmethod
+    def _build_session_stats(cls, session: Any) -> dict[str, int]:
+        """Build best-effort session stats for runtime context."""
+        message_count = len(getattr(session, "messages", []) or [])
+
+        created_at = getattr(session, "created_at", None)
+        if created_at is None:
+            timestamps = [
+                cls._parse_session_timestamp(message.get("timestamp"))
+                for message in getattr(session, "messages", [])
+                if isinstance(message, dict)
+            ]
+            created_at = min((ts for ts in timestamps if ts is not None), default=None)
+
+        age_minutes = 0
+        if isinstance(created_at, datetime):
+            if created_at.tzinfo is None:
+                age_delta = datetime.now() - created_at
+            else:
+                age_delta = datetime.now(timezone.utc) - created_at.astimezone(timezone.utc)
+            age_minutes = max(0, int(age_delta.total_seconds() // 60))
+
+        return {
+            "session_message_count": message_count,
+            "session_age_minutes": age_minutes,
+        }
 
     def _load_bootstrap_files(self) -> str:
         """Load all bootstrap files from workspace."""
@@ -250,17 +311,10 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         channel: str | None = None,
         chat_id: str | None = None,
         current_role: str = "user",
+        session: Any | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
-        runtime_ctx = self._build_runtime_context(channel, chat_id, self.timezone, workspace=self.workspace)
         user_content = self._build_user_content(current_message, media)
-
-        # Merge runtime context and user content into a single user message
-        # to avoid consecutive same-role messages that some providers reject.
-        if isinstance(user_content, str):
-            merged = f"{runtime_ctx}\n\n{user_content}"
-        else:
-            merged = [{"type": "text", "text": runtime_ctx}] + user_content
 
         system_prompt = self.build_system_prompt(skill_names)
 
@@ -269,11 +323,46 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         if memory_context:
             system_prompt = f"{system_prompt}\n\n{_SEPARATOR}\n\n{memory_context}"
 
-        return [
+        session_stats = self._build_session_stats(session) if session is not None else None
+        runtime_ctx = self._build_runtime_context(
+            channel,
+            chat_id,
+            self.timezone,
+            workspace=self.workspace,
+            session_stats=session_stats,
+        )
+
+        # Merge runtime context and user content into a single user message
+        # to avoid consecutive same-role messages that some providers reject.
+        if isinstance(user_content, str):
+            merged = f"{runtime_ctx}\n\n{user_content}"
+        else:
+            merged = [{"type": "text", "text": runtime_ctx}] + user_content
+
+        messages = [
             {"role": "system", "content": system_prompt},
             *history,
             {"role": current_role, "content": merged},
         ]
+        if session_stats is not None:
+            estimated_token_count, _ = estimate_prompt_tokens_chain(
+                provider=None,
+                model=None,
+                messages=messages,
+            )
+            session_stats["estimated_token_count"] = estimated_token_count
+            runtime_ctx = self._build_runtime_context(
+                channel,
+                chat_id,
+                self.timezone,
+                workspace=self.workspace,
+                session_stats=session_stats,
+            )
+            if isinstance(user_content, str):
+                messages[-1]["content"] = f"{runtime_ctx}\n\n{user_content}"
+            else:
+                messages[-1]["content"] = [{"type": "text", "text": runtime_ctx}] + user_content
+        return messages
 
     def _get_memory_search_context(self, query: str) -> str:
         """Retrieve relevant memory chunks via embedding search.

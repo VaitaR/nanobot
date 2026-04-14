@@ -9,7 +9,6 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 import json_repair
-from loguru import logger
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
@@ -37,7 +36,9 @@ class AnthropicProvider(LLMProvider):
         super().__init__(api_key, api_base)
         self.default_model = default_model
         self.extra_headers = extra_headers or {}
+        self._configure_llm_concurrency(self.default_model)
 
+        import httpx
         from anthropic import AsyncAnthropic
 
         client_kw: dict[str, Any] = {}
@@ -47,6 +48,9 @@ class AnthropicProvider(LLMProvider):
             client_kw["base_url"] = api_base
         if extra_headers:
             client_kw["default_headers"] = extra_headers
+        # Explicit timeout: connect 15 s, read 180 s (covers long streaming responses).
+        # Default SDK timeout is 600 s which can cause agent-wide hangs on network stalls.
+        client_kw["timeout"] = httpx.Timeout(connect=15.0, read=180.0, write=15.0, pool=15.0)
         self._client = AsyncAnthropic(**client_kw)
 
     @staticmethod
@@ -402,15 +406,17 @@ class AnthropicProvider(LLMProvider):
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
     ) -> LLMResponse:
-        kwargs = self._build_kwargs(
-            messages, tools, model, max_tokens, temperature,
-            reasoning_effort, tool_choice,
-        )
-        try:
-            response = await self._client.messages.create(**kwargs)
-            return self._parse_response(response)
-        except Exception as e:
-            return LLMResponse(content=f"Error calling LLM: {e}", finish_reason="error")
+        effective_model = model or self.default_model
+        async with self._acquire_llm_slot(effective_model):
+            kwargs = self._build_kwargs(
+                messages, tools, model, max_tokens, temperature,
+                reasoning_effort, tool_choice,
+            )
+            try:
+                response = await self._client.messages.create(**kwargs)
+                return self._parse_response(response)
+            except Exception as e:
+                return LLMResponse(content=f"Error calling LLM: {e}", finish_reason="error")
 
     async def chat_stream(
         self,
@@ -423,19 +429,21 @@ class AnthropicProvider(LLMProvider):
         tool_choice: str | dict[str, Any] | None = None,
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
-        kwargs = self._build_kwargs(
-            messages, tools, model, max_tokens, temperature,
-            reasoning_effort, tool_choice,
-        )
-        try:
-            async with self._client.messages.stream(**kwargs) as stream:
-                if on_content_delta:
-                    async for text in stream.text_stream:
-                        await on_content_delta(text)
-                response = await stream.get_final_message()
-            return self._parse_response(response)
-        except Exception as e:
-            return LLMResponse(content=f"Error calling LLM: {e}", finish_reason="error")
+        effective_model = model or self.default_model
+        async with self._acquire_llm_slot(effective_model):
+            kwargs = self._build_kwargs(
+                messages, tools, model, max_tokens, temperature,
+                reasoning_effort, tool_choice,
+            )
+            try:
+                async with self._client.messages.stream(**kwargs) as stream:
+                    if on_content_delta:
+                        async for text in stream.text_stream:
+                            await on_content_delta(text)
+                    response = await stream.get_final_message()
+                return self._parse_response(response)
+            except Exception as e:
+                return LLMResponse(content=f"Error calling LLM: {e}", finish_reason="error")
 
     def get_default_model(self) -> str:
         return self.default_model

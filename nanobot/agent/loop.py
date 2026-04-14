@@ -36,6 +36,7 @@ from nanobot.command import CommandContext, CommandRouter, register_builtin_comm
 from nanobot.providers.base import LLMProvider
 from nanobot.react.signal_detector import SignalDetector
 from nanobot.session.manager import Session, SessionManager
+from nanobot.utils.helpers import estimate_prompt_tokens_chain
 
 if TYPE_CHECKING:
     from nanobot.config.schema import (
@@ -290,6 +291,8 @@ class AgentLoop:
                     restrict_to_workspace=self.restrict_to_workspace,
                     path_append=self.exec_config.path_append,
                     deny_patterns=self.exec_config.deny_patterns or None,
+                    max_tier=3,
+                    exec_context="direct",
                 )
             )
         self.tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
@@ -298,7 +301,11 @@ class AgentLoop:
         self.tools.register(NotifyTool())
         self.tools.register(SpawnTool(manager=self.subagents))
         self.tools.register(
-            RestartGatewayTool(workspace=self.workspace, subagent_manager=self.subagents)
+            RestartGatewayTool(
+                workspace=self.workspace,
+                subagent_manager=self.subagents,
+                bus=self.bus,
+            )
         )
         if self.cron_service:
             self.tools.register(
@@ -516,11 +523,18 @@ class AgentLoop:
                 continue
             task = asyncio.create_task(self._dispatch(msg))
             self._active_tasks.setdefault(msg.session_key, []).append(task)
+            logger.debug("_active_tasks DIAG: added task to session={}, now {} tasks total, session has {}", 
+                         msg.session_key, sum(len(v) for v in self._active_tasks.values()), len(self._active_tasks[msg.session_key]))
             task.add_done_callback(
                 lambda t, k=msg.session_key: (
-                    self._active_tasks.get(k, []) and self._active_tasks[k].remove(t)
-                    if t in self._active_tasks.get(k, [])
-                    else None
+                    (lambda: (
+                        logger.debug("_active_tasks DIAG: done_callback fired for session={}, task done={}, cancelled={}",
+                                     k, t.done(), t.cancelled()),
+                        (self._active_tasks.get(k, []) and self._active_tasks[k].remove(t)
+                         if t in self._active_tasks.get(k, [])
+                         else logger.debug("_active_tasks DIAG: task NOT in list for session={}, list_len={}",
+                                           k, len(self._active_tasks.get(k, []))))
+                    ))()  # IIFE to ensure all expressions execute
                 )
             )
 
@@ -577,11 +591,11 @@ class AgentLoop:
                             on_stream=on_stream,
                             on_stream_end=on_stream_end,
                         ),
-                        timeout=600,  # 10-minute hard cap per message
+                        timeout=300,  # 5-minute hard cap per message
                     )
                 except asyncio.TimeoutError:
                     logger.error(
-                        "Message processing timed out after 600s for session {}",
+                        "Message processing timed out after 300s for session {}",
                         msg.session_key,
                     )
                     self.telemetry.record_turn(
@@ -591,9 +605,9 @@ class AgentLoop:
                         chat_id=msg.chat_id,
                         model=self.model,
                         usage={},
-                        duration_ms=600_000,
+                        duration_ms=300_000,
                         stop_reason="timeout",
-                        error="Message processing timed out after 600s",
+                        error="Message processing timed out after 300s",
                         tools_used=[],
                         skills=[],
                         files_touched=[],
@@ -686,17 +700,25 @@ class AgentLoop:
                     message_tool.start_turn()
                     message_tool.set_turn_metadata(msg.metadata or {})
             history = session.get_history(max_messages=0)
-            history = self._maybe_compact_history(history)
             # Subagent results are inputs TO the main agent (incoming messages),
             # not the agent's own replies — always use "user" role so the history
             # stays properly alternating and providers like GLM don't reject it.
             current_role = "user"
+            history = self._maybe_compact_history(
+                history,
+                session=session,
+                current_message=msg.content,
+                channel=channel,
+                chat_id=chat_id,
+                current_role=current_role,
+            )
             messages = self.context.build_messages(
                 history=history,
                 current_message=msg.content,
                 channel=channel,
                 chat_id=chat_id,
                 current_role=current_role,
+                session=session,
             )
             t0 = time.monotonic()
             (
@@ -771,13 +793,21 @@ class AgentLoop:
                 message_tool.set_turn_metadata(msg.metadata or {})
 
         history = session.get_history(max_messages=0)
-        history = self._maybe_compact_history(history)
+        history = self._maybe_compact_history(
+            history,
+            session=session,
+            current_message=msg.content,
+            media=msg.media if msg.media else None,
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+        )
         initial_messages = self.context.build_messages(
             history=history,
             current_message=msg.content,
             media=msg.media if msg.media else None,
             channel=msg.channel,
             chat_id=msg.chat_id,
+            session=session,
         )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
@@ -873,6 +903,20 @@ class AgentLoop:
         path = (block.get("_meta") or {}).get("path", "")
         return {"type": "text", "text": f"[image: {path}]" if path else "[image]"}
 
+    def _truncate_tool_result(self, content: str) -> str:
+        """Keep the head and tail of oversized tool output."""
+        if len(content) <= self._TOOL_RESULT_MAX_CHARS:
+            return content
+
+        head_size = self._TOOL_RESULT_MAX_CHARS // 2
+        tail_size = self._TOOL_RESULT_MAX_CHARS - head_size
+        omitted = len(content) - head_size - tail_size
+        return (
+            content[:head_size]
+            + f"\n\n... [{omitted:,} chars omitted] ...\n\n"
+            + content[-tail_size:]
+        )
+
     def _sanitize_persisted_blocks(
         self,
         content: list[dict[str, Any]],
@@ -904,7 +948,7 @@ class AgentLoop:
             if block.get("type") == "text" and isinstance(block.get("text"), str):
                 text = block["text"]
                 if truncate_text and len(text) > self._TOOL_RESULT_MAX_CHARS:
-                    text = text[: self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
+                    text = self._truncate_tool_result(text)
                 filtered.append({**block, "text": text})
                 continue
 
@@ -912,7 +956,17 @@ class AgentLoop:
 
         return filtered
 
-    def _maybe_compact_history(self, history: list[dict]) -> list[dict]:
+    def _maybe_compact_history(
+        self,
+        history: list[dict],
+        session: Session | None = None,
+        *,
+        current_message: str = "",
+        media: list[str] | None = None,
+        channel: str | None = None,
+        chat_id: str | None = None,
+        current_role: str = "user",
+    ) -> list[dict]:
         """Apply compaction to history if token count exceeds threshold.
 
         Pure heuristic — no LLM calls.  Returns history unchanged if compaction
@@ -928,31 +982,54 @@ class AgentLoop:
             return history
 
         try:
-            # Estimate tokens from history content
-            total_tokens = 0
-            for msg in history:
-                content = msg.get("content", "")
-                if isinstance(content, str):
-                    from nanobot_workspace.memory.compaction import estimate_tokens
+            token_source = "history_fallback"
+            try:
+                probe_messages = self.context.build_messages(
+                    history=history,
+                    current_message=current_message,
+                    media=media,
+                    channel=channel,
+                    chat_id=chat_id,
+                    current_role=current_role,
+                    session=session,
+                )
+                total_tokens, token_source = estimate_prompt_tokens_chain(
+                    self.provider,
+                    self.model,
+                    probe_messages,
+                    self.tools.get_definitions(),
+                )
+                if total_tokens <= 0:
+                    raise ValueError("full prompt token estimate unavailable")
+            except Exception:
+                # Keep direct unit tests and degraded loop states working even
+                # if full prompt assembly is unavailable.
+                total_tokens = 0
+                for msg in history:
+                    content = msg.get("content", "")
+                    if isinstance(content, str):
+                        from nanobot_workspace.memory.compaction import estimate_tokens
 
-                    total_tokens += estimate_tokens(content) + estimate_tokens(msg.get("role", ""))
-                elif isinstance(content, list):
-                    # Multimodal: estimate text parts only, add fixed overhead per image
-                    from nanobot_workspace.memory.compaction import estimate_tokens
+                        total_tokens += estimate_tokens(content) + estimate_tokens(
+                            msg.get("role", "")
+                        )
+                    elif isinstance(content, list):
+                        from nanobot_workspace.memory.compaction import estimate_tokens
 
-                    for block in content:
-                        if isinstance(block, dict) and block.get("type") == "text":
-                            total_tokens += estimate_tokens(block.get("text", ""))
-                        else:
-                            total_tokens += 200  # rough image/token overhead
-                    total_tokens += estimate_tokens(msg.get("role", ""))
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") == "text":
+                                total_tokens += estimate_tokens(block.get("text", ""))
+                            else:
+                                total_tokens += 200
+                        total_tokens += estimate_tokens(msg.get("role", ""))
 
             if not self._compaction_policy.should_compact(total_tokens):
                 return history
 
             logger.info(
-                "Compaction triggered: {} tokens > threshold, {} history messages",
+                "Compaction triggered: {} tokens via {} > threshold, {} history messages",
                 total_tokens,
+                token_source,
                 len(history),
             )
             compacted = self._compact_fn(
@@ -965,6 +1042,26 @@ class AgentLoop:
                 len(history),
                 len(compacted),
             )
+            if session is not None and compacted != history:
+                try:
+                    preserved_prefix = session.messages[: session.last_consolidated]
+                    session.messages = preserved_prefix + compacted
+                    session.updated_at = datetime.now()
+                    self.sessions.save(session)
+                    logger.info(
+                        "Compaction persisted: {} -> {} unconsolidated messages",
+                        len(history),
+                        len(compacted),
+                    )
+                    if self._ws_notify:
+                        self._ws_notify.notify(
+                            f"Compacted session: {len(history)} -> {len(compacted)} messages"
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to persist compaction, using in-memory only: {}",
+                        exc,
+                    )
             return compacted
         except Exception as exc:
             logger.warning("Compaction failed, continuing with full history: {}", exc)
@@ -981,7 +1078,7 @@ class AgentLoop:
                 continue  # skip empty assistant messages — they poison session context
             if role == "tool":
                 if isinstance(content, str) and len(content) > self._TOOL_RESULT_MAX_CHARS:
-                    entry["content"] = content[: self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
+                    entry["content"] = self._truncate_tool_result(content)
                 elif isinstance(content, list):
                     filtered = self._sanitize_persisted_blocks(content, truncate_text=True)
                     if not filtered:

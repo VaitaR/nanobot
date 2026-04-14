@@ -876,7 +876,35 @@ def gateway(
         enabled=hb_cfg.enabled,
         timezone=config.agents.defaults.timezone,
     )
+
+    async def spawn_boredom_delegation(task: str, label: str, executor: str) -> str:
+        """Spawn a boredom delegation with the requested executor."""
+        return await agent.subagents.spawn(
+            task=task,
+            label=label,
+            origin_channel="system",
+            origin_chat_id="heartbeat",
+            session_key="heartbeat:boredom",
+            executor=executor,
+        )
+
+    heartbeat.set_spawn_callback(spawn_boredom_delegation)
     heartbeat.on_tick_report = on_heartbeat_tick_report
+
+    _SYSTEM_SESSION_PREFIXES = ("cron:", "heartbeat")
+
+    def is_user_active() -> bool:
+        """True if any non-system session has active tasks (real user interaction)."""
+        for key, tasks in agent._active_tasks.items():
+            if tasks and not key.startswith(_SYSTEM_SESSION_PREFIXES):
+                import loguru
+                loguru.logger.debug("is_user_active DIAG: returning True for session={}, tasks={}", key, len(tasks))
+                return True
+        import loguru
+        loguru.logger.debug("is_user_active DIAG: returning False, all sessions idle")
+        return False
+
+    heartbeat.is_user_active = is_user_active
     agent.heartbeat_service = heartbeat
 
     if channels.enabled_channels:
@@ -914,7 +942,27 @@ def gateway(
                         from datetime import UTC, datetime
 
                         from nanobot import __version__
-                        from nanobot.bus.events import OutboundMessage
+                        from nanobot.bus.events import InboundMessage, OutboundMessage
+
+                        async def _publish_resume_message(
+                            channel: str,
+                            chat_id: str,
+                            resume_prompt: str | None,
+                        ) -> None:
+                            prompt = (resume_prompt or "").strip()
+                            if not prompt:
+                                return
+                            await asyncio.sleep(2)
+                            await bus.publish_inbound(
+                                InboundMessage(
+                                    channel=channel,
+                                    sender_id="system-restart",
+                                    chat_id=chat_id,
+                                    content=prompt,
+                                    metadata={"_resume_after_restart": True},
+                                    session_key_override=f"{channel}:{chat_id}",
+                                )
+                            )
 
                         # If /restart was used, confirm it to the originating chat.
                         marker = config.workspace_path / "restart_pending.json"
@@ -922,12 +970,19 @@ def gateway(
                             try:
                                 data = json.loads(marker.read_text())
                                 marker.unlink()
+                                channel = str(data.get("channel") or "cli")
+                                chat_id = str(data.get("chat_id") or "direct")
                                 await bus.publish_outbound(
                                     OutboundMessage(
-                                        channel=data.get("channel", "cli"),
-                                        chat_id=data.get("chat_id", "direct"),
+                                        channel=channel,
+                                        chat_id=chat_id,
                                         content=f"✅ nanobot restarted (v{__version__})",
                                     )
+                                )
+                                await _publish_resume_message(
+                                    channel=channel,
+                                    chat_id=chat_id,
+                                    resume_prompt=data.get("resume_prompt"),
                                 )
                                 return
                             except Exception:
@@ -953,10 +1008,16 @@ def gateway(
                         tool_marker = config.workspace_path / ".restart-pending"
                         last_restart_marker = config.workspace_path / ".last-restart"
                         tool_reason: str | None = None
+                        tool_channel: str | None = None
+                        tool_chat_id: str | None = None
+                        tool_resume_prompt: str | None = None
                         if tool_marker.exists():
                             try:
                                 td = json.loads(tool_marker.read_text())
                                 tool_reason = td.get("reason", "")
+                                tool_channel = str(td.get("channel") or "").strip() or None
+                                tool_chat_id = str(td.get("chat_id") or "").strip() or None
+                                tool_resume_prompt = str(td.get("resume_prompt") or "").strip() or None
                                 last_restart_marker.write_text(
                                     json.dumps(
                                         {
@@ -980,7 +1041,9 @@ def gateway(
                             )
 
                         channel, chat_id = _pick_heartbeat_target()
-                        if channel == "cli":
+                        ping_channel = tool_channel or channel
+                        ping_chat_id = tool_chat_id or chat_id
+                        if ping_channel == "cli":
                             return  # No external channel available
                         model_name = agent.model or ""
                         msg = "nanobot 🐈 online"
@@ -989,8 +1052,14 @@ def gateway(
                         if model_name:
                             msg += f" ({model_name})"
                         await bus.publish_outbound(
-                            OutboundMessage(channel=channel, chat_id=chat_id, content=msg),
+                            OutboundMessage(channel=ping_channel, chat_id=ping_chat_id, content=msg),
                         )
+                        if tool_channel and tool_chat_id:
+                            await _publish_resume_message(
+                                channel=tool_channel,
+                                chat_id=tool_chat_id,
+                                resume_prompt=tool_resume_prompt,
+                            )
                     except Exception:
                         pass  # Fire-and-forget: never block startup
 

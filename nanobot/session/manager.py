@@ -87,6 +87,17 @@ class Session:
 
         out: list[dict[str, Any]] = []
         for message in sliced:
+            if "role" not in message:
+                # Non-message records (metadata, events) should not appear in the
+                # history slice — log a warning so we notice if this recurs.
+                _type = message.get("_type", "unknown")
+                if _type != "metadata":  # metadata is expected as the first record
+                    logger.warning(
+                        "session.get_history: skipping record without 'role' (type={}, keys={})",
+                        _type,
+                        list(message.keys()),
+                    )
+                continue
             entry: dict[str, Any] = {"role": message["role"], "content": message.get("content", "")}
             for key in ("tool_calls", "tool_call_id", "name"):
                 if key in message:
@@ -203,7 +214,7 @@ class SessionManager:
                         metadata = data.get("metadata", {})
                         created_at = datetime.fromisoformat(data["created_at"]) if data.get("created_at") else None
                         last_consolidated = data.get("last_consolidated", 0)
-                    else:
+                    elif "role" in data:
                         messages.append(data)
 
             return Session(

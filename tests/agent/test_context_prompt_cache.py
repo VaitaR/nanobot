@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import datetime as real_datetime
+from datetime import datetime as real_datetime, timedelta
 from importlib.resources import files as pkg_files
 from pathlib import Path
 import datetime as datetime_module
 
 from nanobot.agent.context import ContextBuilder
+from nanobot.session.manager import Session
 
 
 class _FakeDatetime(real_datetime):
@@ -71,3 +72,26 @@ def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:
     assert "Channel: cli" in user_content
     assert "Chat ID: direct" in user_content
     assert "Return exactly: OK" in user_content
+
+
+def test_runtime_context_includes_session_stats(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+    session = Session(key="cli:direct", created_at=real_datetime.now() - timedelta(minutes=15))
+    session.add_message("user", "Hello")
+    session.add_message("assistant", "Hi")
+
+    messages = builder.build_messages(
+        history=session.get_history(max_messages=0),
+        current_message="Return exactly: OK",
+        channel="cli",
+        chat_id="direct",
+        session=session,
+    )
+
+    user_content = messages[-1]["content"]
+    assert isinstance(user_content, str)
+    assert "Session Stats:" in user_content
+    assert "session_message_count: 2" in user_content
+    assert "session_age_minutes: 15" in user_content
+    assert "estimated_token_count:" in user_content
