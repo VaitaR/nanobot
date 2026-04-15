@@ -67,3 +67,18 @@ async def test_exec_blocks_chained_internal_url():
             command="echo start && curl http://169.254.169.254/latest/meta-data/ && echo done"
         )
     assert "Error" in result
+
+
+def test_exec_tier_gate_blocks_subagent_package_ops():
+    tool = ExecTool(exec_max_tier=1, exec_tier_context="subagent")
+    guard_result = tool._guard_command("uv pip install requests", "/tmp")
+
+    assert guard_result is not None
+    assert "exec tier gate" in guard_result.lower()
+
+
+def test_exec_tier_gate_allows_interactive_package_ops():
+    tool = ExecTool(exec_max_tier=3, exec_tier_context="interactive")
+    guard_result = tool._guard_command("uv pip install requests", "/tmp")
+
+    assert guard_result is None

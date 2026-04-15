@@ -289,6 +289,8 @@ class SubagentManager:
                 timeout=self.exec_config.timeout,
                 restrict_to_workspace=self.restrict_to_workspace,
                 path_append=self.exec_config.path_append,
+                exec_max_tier=1,
+                exec_tier_context="subagent",
             ))
             tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
             tools.register(WebFetchTool(proxy=self.web_proxy))
@@ -941,13 +943,35 @@ Tools like 'read_file' and 'web_fetch' can return native image content. Read vis
 ## Workspace
 {self.workspace}"""]
 
+        # Bootstrap docs: inject key governance docs for subagent context (F-029 fix)
+        bootstrap_files = ["AGENTS.md", "SOUL.md", "TOOLS.md"]
+        for bname in bootstrap_files:
+            bpath = self.workspace / bname
+            if bpath.exists():
+                try:
+                    btext = bpath.read_text(encoding="utf-8").strip()
+                    if len(btext) > 1500:
+                        cut = btext.rfind("\n", 0, 1500)
+                        if cut <= 0:
+                            cut = 1500
+                        btext = btext[:cut] + "\n...(truncated)"
+                    parts.append(f"## {bname}\n\n{btext}")
+                except Exception:
+                    pass
+
         # Inject long-term memory (truncated to 2000 chars to avoid prompt bloat)
         memory_store = MemoryStore(self.workspace)
         long_term = memory_store.read_long_term()
         content = long_term.strip() if long_term else ""
         if content:
             if len(content) > 2000:
-                content = content[:2000] + "\n...(truncated)"
+                # Truncate at line boundary for clean Markdown (F-019 fix)
+                cut = content.rfind("\n", 0, 2000)
+                if cut <= 0:
+                    cut = content.rfind(" ", 0, 2000)
+                if cut <= 0:
+                    cut = 2000
+                content = content[:cut] + "\n...(truncated)"
             parts.append(f"## Memory Context\n\n{content}")
 
         skills_summary = SkillsLoader(self.workspace).build_skills_summary()

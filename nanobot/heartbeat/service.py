@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Coroutine
 
@@ -45,6 +49,42 @@ class HeartbeatService:
         self.timezone = timezone
         self._running = False
         self._task: asyncio.Task | None = None
+        self._last_tick_ts: str | None = None  # F-033: persisted across restarts
+
+    @property
+    def state_file(self) -> Path:
+        """Path to heartbeat state file for last-tick persistence."""
+        return self.workspace / ".heartbeat_state.json"
+
+    def _load_persisted_state(self) -> None:
+        """Load last-tick timestamp from disk (F-033 fix)."""
+        try:
+            if self.state_file.exists():
+                data = json.loads(self.state_file.read_text(encoding="utf-8"))
+                self._last_tick_ts = data.get("last_tick")
+                logger.debug("Heartbeat: loaded persisted last_tick={}", self._last_tick_ts)
+        except Exception as exc:
+            logger.warning("Heartbeat: failed to load persisted state: {}", exc)
+
+    def _persist_tick(self) -> None:
+        """Persist last-tick timestamp to disk atomically (F-033 fix)."""
+        try:
+            state = {"last_tick": self._last_tick_ts}
+            fd, tmp = tempfile.mkstemp(dir=str(self.workspace), suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(state, f)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, self.state_file)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+        except Exception as exc:
+            logger.warning("Heartbeat: failed to persist tick state: {}", exc)
 
     @property
     def heartbeat_file(self) -> Path:
@@ -178,9 +218,10 @@ class HeartbeatService:
             return
         if self._running:
             return
+        self._load_persisted_state()
         self._running = True
         self._task = asyncio.create_task(self._run_loop())
-        logger.info("Heartbeat started (every {}s)", self.interval_s)
+        logger.info("Heartbeat started (every {}s, last_tick={})", self.interval_s, self._last_tick_ts)
 
     def stop(self) -> None:
         self._running = False
@@ -253,6 +294,8 @@ class HeartbeatService:
             logger.exception("Heartbeat execution failed")
 
         await self._deliver_pending()
+        self._last_tick_ts = datetime.now(timezone.utc).isoformat()
+        self._persist_tick()
 
     # ------------------------------------------------------------------
     # Trigger (manual)

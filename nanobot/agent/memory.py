@@ -242,13 +242,21 @@ class MemoryStore:
         if self._last_chunk_summary:
             prior_section = f"\n## Previous Consolidation Summary\n{self._last_chunk_summary}\n"
 
+        ts = datetime.now().strftime("%Y-%m-%dT%H:%M")
         prompt = f"""Process this conversation and call the save_memory tool with your consolidation.
 {prior_section}
 ## Current Long-term Memory
 {current_memory or "(empty)"}
 
 ## Conversation to Process
-{self._format_messages(messages)}"""
+{self._format_messages(messages)}
+
+## Provenance Requirements
+When updating memory_update, add provenance markers to any NEW facts:
+- Format: `[source: YYYY-MM-DDThh:mm]` at the end of new or changed lines
+- Current timestamp: {ts}
+- Do NOT add markers to existing unchanged lines
+- This enables tracking when facts were recorded and detecting stale entries"""
 
         chat_messages = [
             {"role": "system", "content": (

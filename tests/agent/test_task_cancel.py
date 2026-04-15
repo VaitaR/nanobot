@@ -173,6 +173,22 @@ class TestDispatch:
             "telegram", "chat-1", "m-1", "thread-9", "req-42"
         )
 
+    def test_set_tool_context_propagates_spawn_request_id_without_thread_id(self):
+        loop, _bus = _make_loop()
+
+        loop._set_tool_context(
+            channel="telegram",
+            chat_id="chat-1",
+            message_id="m-1",
+            message_thread_id=None,
+            request_id="req-no-thread",
+        )
+
+        spawn_tool = loop.tools.get("spawn")
+        assert spawn_tool is not None
+        assert getattr(spawn_tool, "_request_id") == "req-no-thread"
+        assert getattr(spawn_tool, "_message_thread_id") is None
+
     @pytest.mark.asyncio
     async def test_dispatch_exception_records_telemetry_with_request_id(self):
         from nanobot.bus.events import InboundMessage

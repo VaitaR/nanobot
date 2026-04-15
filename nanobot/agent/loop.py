@@ -239,6 +239,8 @@ class AgentLoop:
                 restrict_to_workspace=self.restrict_to_workspace,
                 path_append=self.exec_config.path_append,
                 deny_patterns=self.exec_config.deny_patterns or None,
+                exec_max_tier=3,
+                exec_tier_context="interactive",
             ))
         self.tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
@@ -249,6 +251,12 @@ class AgentLoop:
             self.tools.register(
                 CronTool(self.cron_service, default_timezone=self.context.timezone or "UTC")
             )
+        # Memory search tool — exposes FTS5 + embedding search (F-010/F-031)
+        try:
+            from nanobot.agent.tools.memory_search import MemorySearchTool
+            self.tools.register(MemorySearchTool(workspace=self.workspace))
+        except Exception as exc:
+            logger.debug("MemorySearchTool not registered: {}", exc)
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
@@ -284,15 +292,17 @@ class AgentLoop:
         for name in ("message", "spawn", "cron"):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
-                    extra: list[Any] = []
-                    if name == "message" and message_id is not None:
-                        extra.append(message_id)
-                    if name == "spawn":
-                        if message_thread_id is not None:
-                            extra.append(message_thread_id)
-                        if request_id is not None:
-                            extra.append(request_id)
-                    tool.set_context(channel, chat_id, *extra)
+                    if name == "message":
+                        tool.set_context(channel, chat_id, message_id)
+                    elif name == "spawn":
+                        tool.set_context(
+                            channel,
+                            chat_id,
+                            message_thread_id=message_thread_id,
+                            request_id=request_id,
+                        )
+                    else:
+                        tool.set_context(channel, chat_id)
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:

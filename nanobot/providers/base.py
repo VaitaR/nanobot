@@ -9,6 +9,8 @@ from typing import Any
 
 from loguru import logger
 
+from nanobot.providers.circuit_breaker import CircuitBreaker
+
 
 @dataclass
 class ToolCallRequest:
@@ -100,6 +102,7 @@ class LLMProvider(ABC):
         self.api_key = api_key
         self.api_base = api_base
         self.generation: GenerationSettings = GenerationSettings()
+        self.circuit_breaker = CircuitBreaker()
 
     @staticmethod
     def _sanitize_empty_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -289,19 +292,27 @@ class LLMProvider(ABC):
             on_content_delta=on_content_delta,
         )
 
+        # Circuit breaker pre-check — reject early if provider is unhealthy
+        self.circuit_breaker.pre_call()
+
         for attempt, delay in enumerate(self._CHAT_RETRY_DELAYS, start=1):
             response = await self._safe_chat_stream(**kw)
 
             if response.finish_reason != "error":
+                self.circuit_breaker.record_success()
                 return response
 
             if not self._is_transient_error(response.content):
                 stripped = self._strip_image_content(messages)
                 if stripped is not None:
                     logger.warning("Non-transient LLM error with image content, retrying without images")
-                    return await self._safe_chat_stream(**{**kw, "messages": stripped})
+                    result = await self._safe_chat_stream(**{**kw, "messages": stripped})
+                    if result.finish_reason != "error":
+                        self.circuit_breaker.record_success()
+                    return result
                 return response
 
+            self.circuit_breaker.record_failure()
             logger.warning(
                 "LLM transient error (attempt {}/{}), retrying in {}s: {}",
                 attempt, len(self._CHAT_RETRY_DELAYS), delay,
@@ -340,19 +351,27 @@ class LLMProvider(ABC):
             reasoning_effort=reasoning_effort, tool_choice=tool_choice,
         )
 
+        # Circuit breaker pre-check — reject early if provider is unhealthy
+        self.circuit_breaker.pre_call()
+
         for attempt, delay in enumerate(self._CHAT_RETRY_DELAYS, start=1):
             response = await self._safe_chat(**kw)
 
             if response.finish_reason != "error":
+                self.circuit_breaker.record_success()
                 return response
 
             if not self._is_transient_error(response.content):
                 stripped = self._strip_image_content(messages)
                 if stripped is not None:
                     logger.warning("Non-transient LLM error with image content, retrying without images")
-                    return await self._safe_chat(**{**kw, "messages": stripped})
+                    result = await self._safe_chat(**{**kw, "messages": stripped})
+                    if result.finish_reason != "error":
+                        self.circuit_breaker.record_success()
+                    return result
                 return response
 
+            self.circuit_breaker.record_failure()
             logger.warning(
                 "LLM transient error (attempt {}/{}), retrying in {}s: {}",
                 attempt, len(self._CHAT_RETRY_DELAYS), delay,

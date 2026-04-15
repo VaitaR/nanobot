@@ -20,7 +20,7 @@ class _FakeAsyncWebClient:
         self.reactions_add_calls: list[dict[str, object | None]] = []
         self.reactions_remove_calls: list[dict[str, object | None]] = []
 
-    async def chat_postMessage(
+    async def chat_postMessage(  # noqa: N802
         self,
         *,
         channel: str,
