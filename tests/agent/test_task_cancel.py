@@ -21,8 +21,8 @@ def _make_loop(*, exec_config=None):
 
     with patch("nanobot.agent.loop.ContextBuilder"), \
          patch("nanobot.agent.loop.SessionManager"), \
-         patch("nanobot.agent.loop.SubagentManager") as MockSubMgr:
-        MockSubMgr.return_value.cancel_by_session = AsyncMock(return_value=0)
+         patch("nanobot.agent.loop.SubagentManager") as mock_sub_mgr:
+        mock_sub_mgr.return_value.cancel_by_session = AsyncMock(return_value=0)
         loop = AgentLoop(bus=bus, provider=provider, workspace=workspace, exec_config=exec_config)
     return loop, bus
 
@@ -137,6 +137,66 @@ class TestDispatch:
         t2 = asyncio.create_task(loop._dispatch(msg2))
         await asyncio.gather(t1, t2)
         assert order == ["start-a", "end-a", "start-b", "end-b"]
+
+    @pytest.mark.asyncio
+    async def test_run_agent_loop_keeps_request_id_in_hook_context_reset(self):
+        from nanobot.agent.hook import AgentHookContext
+        from nanobot.agent.runner import AgentRunResult
+        from nanobot.providers.base import LLMResponse, ToolCallRequest
+
+        loop, _bus = _make_loop()
+        loop._set_tool_context = MagicMock()
+
+        async def fake_run(spec):
+            context = AgentHookContext(
+                iteration=0,
+                messages=list(spec.initial_messages),
+                response=LLMResponse(content="", tool_calls=[]),
+                tool_calls=[ToolCallRequest(id="tc1", name="spawn", arguments={"task": "x"})],
+            )
+            if spec.hook is not None:
+                await spec.hook.before_execute_tools(context)
+            return AgentRunResult(final_content="ok", messages=list(spec.initial_messages))
+
+        loop.runner.run = AsyncMock(side_effect=fake_run)
+
+        await loop._run_agent_loop(
+            initial_messages=[{"role": "user", "content": "hello"}],
+            channel="telegram",
+            chat_id="chat-1",
+            message_id="m-1",
+            message_thread_id="thread-9",
+            request_id="req-42",
+        )
+
+        loop._set_tool_context.assert_called_with(
+            "telegram", "chat-1", "m-1", "thread-9", "req-42"
+        )
+
+    @pytest.mark.asyncio
+    async def test_dispatch_exception_records_telemetry_with_request_id(self):
+        from nanobot.bus.events import InboundMessage
+
+        loop, bus = _make_loop()
+        loop._process_message = AsyncMock(side_effect=RuntimeError("boom"))
+        loop.telemetry.record_turn = MagicMock()
+
+        msg = InboundMessage(
+            channel="test",
+            sender_id="u1",
+            chat_id="c1",
+            content="hello",
+            request_id="req-explicit",
+        )
+
+        await loop._dispatch(msg)
+
+        out = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+        assert "System error:" in out.content
+        loop.telemetry.record_turn.assert_called_once()
+        kwargs = loop.telemetry.record_turn.call_args.kwargs
+        assert kwargs["request_id"] == "req-explicit"
+        assert kwargs["stop_reason"] == "exception"
 
 
 class TestSubagentCancellation:

@@ -27,7 +27,7 @@ def _make_loop(tmp_path):
 
 @pytest.mark.asyncio
 async def test_runner_preserves_reasoning_fields_and_tool_results():
-    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
 
     provider = MagicMock()
     captured_second_call: list[dict] = []
@@ -84,7 +84,7 @@ async def test_runner_preserves_reasoning_fields_and_tool_results():
 @pytest.mark.asyncio
 async def test_runner_calls_hooks_in_order():
     from nanobot.agent.hook import AgentHook, AgentHookContext
-    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
 
     provider = MagicMock()
     call_count = {"n": 0}
@@ -159,7 +159,7 @@ async def test_runner_calls_hooks_in_order():
 @pytest.mark.asyncio
 async def test_runner_streaming_hook_receives_deltas_and_end_signal():
     from nanobot.agent.hook import AgentHook, AgentHookContext
-    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
 
     provider = MagicMock()
     streamed: list[str] = []
@@ -202,7 +202,7 @@ async def test_runner_streaming_hook_receives_deltas_and_end_signal():
 
 @pytest.mark.asyncio
 async def test_runner_returns_max_iterations_fallback():
-    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
 
     provider = MagicMock()
     provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
@@ -230,7 +230,7 @@ async def test_runner_returns_max_iterations_fallback():
 
 @pytest.mark.asyncio
 async def test_runner_returns_structured_tool_error():
-    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
 
     provider = MagicMock()
     provider.chat_with_retry = AsyncMock(return_value=LLMResponse(

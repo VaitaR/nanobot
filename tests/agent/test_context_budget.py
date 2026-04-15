@@ -5,9 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pytest
-
-from nanobot.agent.context import ContextBuilder, _CHARS_PER_TOKEN, _SEPARATOR
+from nanobot.agent.context import _CHARS_PER_TOKEN, _SEPARATOR, ContextBuilder
 
 
 def _make_builder(
@@ -220,6 +218,7 @@ class TestTruncationWarnings:
 
     def test_truncation_logs_warning(self, tmp_path: Path) -> None:
         import io
+
         from loguru import logger as _logger
 
         # Add a string sink to capture warnings

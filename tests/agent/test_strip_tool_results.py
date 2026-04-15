@@ -2,7 +2,6 @@
 
 from nanobot.agent.memory import (
     _TOOL_RESULT_STRIP_PLACEHOLDER,
-    _DEFAULT_STRIP_KEEP_RECENT,
     strip_old_tool_results,
 )
 
@@ -161,8 +160,8 @@ class TestEdgeCases:
         # Old tool messages stripped
         assert msgs[2]["content"] == _TOOL_RESULT_STRIP_PLACEHOLDER
         # Recent messages untouched (indices 14+)
-        assert msgs[14]["content"] == f"file content 4" * 100
-        assert msgs[23]["content"] == f"file content 7" * 100
+        assert msgs[14]["content"] == "file content 4" * 100
+        assert msgs[23]["content"] == "file content 7" * 100
 
     def test_custom_placeholder(self) -> None:
         msgs = [_tool_msg("c0", "x", "data"), _user_msg("recent")]

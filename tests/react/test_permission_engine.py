@@ -7,10 +7,8 @@ import pytest
 from nanobot.react.permission_engine import (
     Permission,
     PermissionEngine,
-    PermissionResult,
     create_permission_engine,
 )
-
 
 # ---------------------------------------------------------------------------
 # Unit tests: PermissionEngine
@@ -163,10 +161,10 @@ class TestRunnerPermissionGate:
 
     @pytest.mark.asyncio
     async def test_denied_tool_returns_permission_error(self):
-        from nanobot.agent.runner import AgentRunSpec, AgentRunner
-        from nanobot.providers.base import LLMResponse, ToolCallRequest
-
         from unittest.mock import AsyncMock, MagicMock
+
+        from nanobot.agent.runner import AgentRunner, AgentRunSpec
+        from nanobot.providers.base import LLMResponse, ToolCallRequest
 
         provider = MagicMock()
         provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
@@ -196,10 +194,10 @@ class TestRunnerPermissionGate:
 
     @pytest.mark.asyncio
     async def test_allowed_tool_executes_normally(self):
-        from nanobot.agent.runner import AgentRunSpec, AgentRunner
-        from nanobot.providers.base import LLMResponse, ToolCallRequest
-
         from unittest.mock import AsyncMock, MagicMock
+
+        from nanobot.agent.runner import AgentRunner, AgentRunSpec
+        from nanobot.providers.base import LLMResponse, ToolCallRequest
 
         provider = MagicMock()
         call_count = {"n": 0}
@@ -236,10 +234,10 @@ class TestRunnerPermissionGate:
     @pytest.mark.asyncio
     async def test_no_permission_engine_allows_everything(self):
         """Without a permission engine, all tools execute normally."""
-        from nanobot.agent.runner import AgentRunSpec, AgentRunner
-        from nanobot.providers.base import LLMResponse, ToolCallRequest
-
         from unittest.mock import AsyncMock, MagicMock
+
+        from nanobot.agent.runner import AgentRunner, AgentRunSpec
+        from nanobot.providers.base import LLMResponse, ToolCallRequest
 
         provider = MagicMock()
         call_count = {"n": 0}

@@ -278,6 +278,7 @@ class AgentLoop:
         chat_id: str,
         message_id: str | None = None,
         message_thread_id: str | int | None = None,
+        request_id: str | None = None,
     ) -> None:
         """Update context for all tools that need routing info."""
         for name in ("message", "spawn", "cron"):
@@ -286,8 +287,11 @@ class AgentLoop:
                     extra: list[Any] = []
                     if name == "message" and message_id is not None:
                         extra.append(message_id)
-                    if name == "spawn" and message_thread_id is not None:
-                        extra.append(message_thread_id)
+                    if name == "spawn":
+                        if message_thread_id is not None:
+                            extra.append(message_thread_id)
+                        if request_id is not None:
+                            extra.append(request_id)
                     tool.set_context(channel, chat_id, *extra)
 
     @staticmethod
@@ -320,6 +324,7 @@ class AgentLoop:
         chat_id: str = "direct",
         message_id: str | None = None,
         message_thread_id: str | int | None = None,
+        request_id: str | None = None,
     ) -> tuple[str | None, list[str], list[dict], dict, str, str | None, list[dict]]:
         """Run the agent iteration loop.
 
@@ -363,7 +368,13 @@ class AgentLoop:
                 for tc in context.tool_calls:
                     args_str = json.dumps(tc.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tc.name, args_str[:200])
-                loop_self._set_tool_context(channel, chat_id, message_id, message_thread_id)
+                loop_self._set_tool_context(
+                    channel,
+                    chat_id,
+                    message_id,
+                    message_thread_id,
+                    request_id,
+                )
 
             def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
                 return loop_self._strip_think(content)
@@ -508,6 +519,10 @@ class AgentLoop:
                         tools_used=[],
                         skills=[],
                         files_touched=[],
+                        request_id=msg.request_id,
+                        estimated_cost_usd=(
+                            self._cost_guard.session_cost_usd if self._cost_guard is not None else None
+                        ),
                     )
                     await self.bus.publish_outbound(OutboundMessage(
                         channel=msg.channel, chat_id=msg.chat_id,
@@ -528,6 +543,24 @@ class AgentLoop:
             except Exception as exc:
                 logger.exception("Error processing message for session {}", msg.session_key)
                 error_detail = f"{type(exc).__name__}: {exc}"
+                self.telemetry.record_turn(
+                    ts=datetime.now(timezone.utc).isoformat(),
+                    session=msg.session_key,
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    model=self.model,
+                    usage={},
+                    duration_ms=0,
+                    stop_reason="exception",
+                    error=error_detail,
+                    tools_used=[],
+                    skills=[],
+                    files_touched=[],
+                    request_id=msg.request_id,
+                    estimated_cost_usd=(
+                        self._cost_guard.session_cost_usd if self._cost_guard is not None else None
+                    ),
+                )
                 await self.bus.publish_outbound(OutboundMessage(
                     channel=msg.channel, chat_id=msg.chat_id,
                     content=f"System error: {error_detail[:400]}",
@@ -574,8 +607,13 @@ class AgentLoop:
             key = f"{channel}:{chat_id}"
             session = self.sessions.get_or_create(key)
             await self.memory_consolidator.maybe_consolidate_by_tokens(session)
-            self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"),
-                                  msg.metadata.get("message_thread_id"))
+            self._set_tool_context(
+                channel,
+                chat_id,
+                msg.metadata.get("message_id"),
+                msg.metadata.get("message_thread_id"),
+                msg.request_id,
+            )
             # Initialise MessageTool so intermediate sends preserve topic routing
             if message_tool := self.tools.get("message"):
                 if isinstance(message_tool, MessageTool):
@@ -593,9 +631,10 @@ class AgentLoop:
                 messages, channel=channel, chat_id=chat_id,
                 message_id=msg.metadata.get("message_id"),
                 message_thread_id=msg.metadata.get("message_thread_id"),
+                request_id=msg.request_id,
             )
             skills, files_touched = self.telemetry.extract_from_events(tool_events)
-            self.telemetry.record_turn(ts=datetime.now(timezone.utc).isoformat(), session=key, channel=channel, chat_id=chat_id, model=self.model, usage=usage, duration_ms=int((time.monotonic() - t0) * 1000), stop_reason=stop_reason, error=run_error, tools_used=sys_tools_used, skills=skills, files_touched=files_touched)
+            self.telemetry.record_turn(ts=datetime.now(timezone.utc).isoformat(), session=key, channel=channel, chat_id=chat_id, model=self.model, usage=usage, duration_ms=int((time.monotonic() - t0) * 1000), stop_reason=stop_reason, error=run_error, tools_used=sys_tools_used, skills=skills, files_touched=files_touched, request_id=msg.request_id, estimated_cost_usd=(self._cost_guard.session_cost_usd if self._cost_guard is not None else None))
             # --- Workspace feedback loop: diagnose failures ---
             if run_error and self._diagnose_failure is not None:
                 try:
@@ -623,8 +662,13 @@ class AgentLoop:
 
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
-        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"),
-                              msg.metadata.get("message_thread_id"))
+        self._set_tool_context(
+            msg.channel,
+            msg.chat_id,
+            msg.metadata.get("message_id"),
+            msg.metadata.get("message_thread_id"),
+            msg.request_id,
+        )
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
@@ -655,6 +699,7 @@ class AgentLoop:
             channel=msg.channel, chat_id=msg.chat_id,
             message_id=msg.metadata.get("message_id"),
             message_thread_id=msg.metadata.get("message_thread_id"),
+            request_id=msg.request_id,
         )
 
         # --- SignalDetector: detect failure/correction patterns ---
@@ -670,7 +715,7 @@ class AgentLoop:
                 pass  # silently skip — signal detection is non-critical
 
         skills, files_touched = self.telemetry.extract_from_events(tool_events)
-        self.telemetry.record_turn(ts=datetime.now(timezone.utc).isoformat(), session=key, channel=msg.channel, chat_id=msg.chat_id, model=self.model, usage=usage, duration_ms=int((time.monotonic() - t0) * 1000), stop_reason=stop_reason, error=run_error, tools_used=tools_used, skills=skills, files_touched=files_touched)
+        self.telemetry.record_turn(ts=datetime.now(timezone.utc).isoformat(), session=key, channel=msg.channel, chat_id=msg.chat_id, model=self.model, usage=usage, duration_ms=int((time.monotonic() - t0) * 1000), stop_reason=stop_reason, error=run_error, tools_used=tools_used, skills=skills, files_touched=files_touched, request_id=msg.request_id, estimated_cost_usd=(self._cost_guard.session_cost_usd if self._cost_guard is not None else None))
         # --- Workspace feedback loop: diagnose failures ---
         if run_error and self._diagnose_failure is not None:
             try:

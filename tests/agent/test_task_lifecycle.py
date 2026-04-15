@@ -10,11 +10,14 @@ import pytest
 
 from nanobot.agent.task_lifecycle import (
     _build_cmd,
+    _parse_utc_ts,
     extract_task_id,
     mark_task_delegated,
     mark_task_delegation_failure,
     mark_task_delegation_success,
     query_pending_review,
+    query_stale_delegations,
+    reap_stale_delegations,
 )
 
 # ── extract_task_id ──────────────────────────────────────────────────────────
@@ -231,3 +234,72 @@ class TestQueryPendingReview:
             pending = await query_pending_review()
 
         assert pending == [{"id": task_id, "title": "Recover delegated task", "status": "open"}]
+
+
+class TestParseUtcTimestamp:
+    def test_parse_zulu_timestamp(self):
+        dt = _parse_utc_ts("2026-04-15T10:00:00Z")
+        assert dt is not None
+        assert dt.tzinfo is not None
+
+    def test_parse_invalid_returns_none(self):
+        assert _parse_utc_ts("not-a-ts") is None
+
+
+class TestQueryStaleDelegations:
+    @pytest.mark.asyncio
+    async def test_returns_stale_delegated_task_without_terminal_event(self):
+        task_id = "20260329T140912_stale_delegated_task"
+
+        async def fake_shell(cmd, *, stdout, stderr):
+            proc = AsyncMock()
+            proc.returncode = 0
+
+            if "list --status in_progress --json" in cmd:
+                payload = [
+                    {
+                        "id": task_id,
+                        "title": "Stale delegated task",
+                        "status": "in_progress",
+                        "updated": "2020-01-01T00:00:00Z",
+                    }
+                ]
+                proc.communicate = AsyncMock(return_value=(json.dumps(payload).encode("utf-8"), b""))
+            elif "list --status open --json" in cmd:
+                proc.communicate = AsyncMock(return_value=(b"[]", b""))
+            elif f"show {task_id}" in cmd:
+                proc.communicate = AsyncMock(
+                    return_value=(b"[delegated] delegated to subagent\n", b"")
+                )
+            else:
+                proc.communicate = AsyncMock(return_value=(b"", b""))
+            return proc
+
+        with patch("nanobot.agent.task_lifecycle.asyncio.create_subprocess_shell", side_effect=fake_shell):
+            stale = await query_stale_delegations(timeout_s=3600)
+
+        assert len(stale) == 1
+        assert stale[0]["id"] == task_id
+        assert "stale delegated task" in stale[0]["reason"]
+
+
+class TestReapStaleDelegations:
+    @pytest.mark.asyncio
+    async def test_routes_open_to_blocked_and_in_progress_to_review(self):
+        stale = [
+            {"id": "open_1", "status": "open", "reason": "stale open"},
+            {"id": "prog_1", "status": "in_progress", "reason": "stale progress"},
+        ]
+
+        with (
+            patch("nanobot.agent.task_lifecycle.query_stale_delegations", new=AsyncMock(return_value=stale)),
+            patch("nanobot.agent.task_lifecycle.mark_task_delegation_failure", new=AsyncMock(return_value=True)) as mark_fail,
+            patch("nanobot.agent.task_lifecycle.mark_task_needs_review", new=AsyncMock(return_value=True)) as mark_review,
+        ):
+            out = await reap_stale_delegations(timeout_s=10)
+
+        assert len(out) == 2
+        assert any(item["task_id"] == "open_1" and item["target"] == "blocked" for item in out)
+        assert any(item["task_id"] == "prog_1" and item["target"] == "review" for item in out)
+        mark_fail.assert_awaited_once_with("open_1", "stale open")
+        mark_review.assert_awaited_once_with("prog_1", "stale progress")

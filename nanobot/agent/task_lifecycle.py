@@ -8,9 +8,11 @@ violations between nanobot (core) and nanobot_workspace (workspace package).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import shlex
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -61,6 +63,7 @@ def extract_task_id(label: str) -> str | None:
 
 _WORKSPACE_DIR = Path.home() / ".nanobot" / "workspace"
 _NANOBOT_TASKS_CMD = "uv run nanobot-tasks"
+_STALE_DELEGATION_TIMEOUT_S = 2 * 60 * 60
 
 
 def _build_cmd(args: str) -> str:
@@ -126,6 +129,120 @@ async def mark_task_delegation_failure(task_id: str, reason: str) -> bool:
     return await _run_cli(
         f"event {shlex.quote(task_id)} {shlex.quote(f'delegation failed: {safe_reason}')} --kind progress"
     )
+
+
+async def mark_task_needs_review(task_id: str, reason: str) -> bool:
+    """Move task to review status with a reason."""
+    safe_reason = reason[:200]
+    return await _run_cli(
+        f"update {shlex.quote(task_id)} --status review --reason {shlex.quote(safe_reason)}"
+    )
+
+
+def _parse_utc_ts(raw: str | None) -> datetime | None:
+    """Parse ISO timestamp from task JSON into UTC-aware datetime."""
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+async def query_stale_delegations(timeout_s: int = _STALE_DELEGATION_TIMEOUT_S) -> list[dict[str, str]]:
+    """Find delegated tasks that are stale and missing completion/failure signals."""
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(seconds=max(timeout_s, 1))
+
+    tasks_by_id: dict[str, dict] = {}
+    for status in ("in_progress", "open"):
+        cmd = _build_cmd(f"list --status {status} --json")
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+            if proc.returncode != 0:
+                logger.warning(
+                    "query_stale_delegations: list(%s) failed: %s",
+                    status,
+                    stderr.decode(errors="replace"),
+                )
+                continue
+            for task in json.loads(stdout.decode("utf-8")):
+                tid = task.get("id")
+                if tid and tid not in tasks_by_id:
+                    tasks_by_id[tid] = task
+        except Exception as exc:
+            logger.warning("query_stale_delegations: list(%s) error: %s", status, exc)
+
+    stale: list[dict[str, str]] = []
+    for task in tasks_by_id.values():
+        tid = task.get("id", "")
+        if not tid:
+            continue
+
+        updated_dt = _parse_utc_ts(task.get("updated"))
+        if updated_dt is None or updated_dt > cutoff:
+            continue
+
+        show_cmd = _build_cmd(f"show {shlex.quote(tid)}")
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                show_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+            content = stdout.decode("utf-8", errors="replace")
+            has_delegated = "[delegated]" in content
+            has_success = "delegation completed successfully" in content
+            has_failure = "delegation failed:" in content
+            if has_delegated and not has_success and not has_failure:
+                stale.append(
+                    {
+                        "id": tid,
+                        "title": task.get("title", ""),
+                        "status": task.get("status", ""),
+                        "updated": task.get("updated", ""),
+                        "reason": f"stale delegated task (> {timeout_s // 3600}h without completion/failure)",
+                    }
+                )
+        except Exception:
+            continue
+
+    return stale
+
+
+async def reap_stale_delegations(
+    timeout_s: int = _STALE_DELEGATION_TIMEOUT_S,
+) -> list[dict[str, str | bool]]:
+    """Reap stale delegated tasks and move them to review/blocked."""
+    stale = await query_stale_delegations(timeout_s=timeout_s)
+    if not stale:
+        return []
+
+    results: list[dict[str, str | bool]] = []
+    for task in stale:
+        tid = task.get("id", "")
+        reason = task.get("reason", "stale delegated task")
+        status = task.get("status", "")
+        if not tid:
+            continue
+        if status == "open":
+            ok = await mark_task_delegation_failure(tid, reason)
+            target = "blocked"
+        else:
+            ok = await mark_task_needs_review(tid, reason)
+            target = "review"
+        results.append({"task_id": tid, "target": target, "ok": ok, "reason": reason})
+
+    return results
 
 
 async def query_pending_review() -> list[dict[str, str]]:

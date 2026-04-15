@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
-
-import pytest
+from unittest.mock import MagicMock
 
 
 def _make_subagent_manager(tmp_path):
@@ -23,7 +21,7 @@ class TestBuildSubagentPromptMemory:
 
     def test_includes_memory_content_when_present(self, tmp_path):
         mgr = _make_subagent_manager(tmp_path)
-        (tmp_path / "memory").mkdir()
+        (tmp_path / "memory").mkdir(exist_ok=True)
         (tmp_path / "memory" / "MEMORY.md").write_text(
             "## Preferences\n- Always use pytest\n\n## Facts\n- Project uses Python 3.12\n",
             encoding="utf-8",
@@ -45,7 +43,7 @@ class TestBuildSubagentPromptMemory:
 
     def test_truncation_of_long_memory(self, tmp_path):
         mgr = _make_subagent_manager(tmp_path)
-        (tmp_path / "memory").mkdir()
+        (tmp_path / "memory").mkdir(exist_ok=True)
         long_content = "A" * 5000
         (tmp_path / "memory" / "MEMORY.md").write_text(long_content, encoding="utf-8")
 
@@ -65,7 +63,7 @@ class TestBuildSubagentPromptMemory:
 
     def test_empty_memory_file_omits_section(self, tmp_path):
         mgr = _make_subagent_manager(tmp_path)
-        (tmp_path / "memory").mkdir()
+        (tmp_path / "memory").mkdir(exist_ok=True)
         (tmp_path / "memory" / "MEMORY.md").write_text("   \n  \n", encoding="utf-8")
 
         prompt = mgr._build_subagent_prompt()
@@ -75,7 +73,7 @@ class TestBuildSubagentPromptMemory:
 
     def test_workspace_and_skills_still_present(self, tmp_path):
         mgr = _make_subagent_manager(tmp_path)
-        (tmp_path / "memory").mkdir()
+        (tmp_path / "memory").mkdir(exist_ok=True)
         (tmp_path / "memory" / "MEMORY.md").write_text("some memory", encoding="utf-8")
 
         prompt = mgr._build_subagent_prompt()

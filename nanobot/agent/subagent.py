@@ -6,6 +6,7 @@ import asyncio
 import json
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -27,6 +28,7 @@ from nanobot.agent.task_lifecycle import (
     mark_task_delegation_failure,
     mark_task_delegation_success,
 )
+from nanobot.agent.telemetry import TelemetryCollector
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
@@ -68,6 +70,7 @@ class SubagentManager:
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
         self.runner = AgentRunner(provider)
+        self.telemetry = TelemetryCollector(workspace)
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
         self._checkpoint_brokers: dict[str, Any] = {}  # task_id -> CheckpointBroker
@@ -78,6 +81,7 @@ class SubagentManager:
         label: str | None = None,
         origin_channel: str = "cli",
         origin_chat_id: str = "direct",
+        request_id: str | None = None,
         session_key: str | None = None,
         message_thread_id: str | int | None = None,
         max_iterations: int | None = None,
@@ -93,6 +97,7 @@ class SubagentManager:
             label: Display label (defaults to first 30 chars of task).
             origin_channel: Channel to announce results to.
             origin_chat_id: Chat ID to announce results to.
+            request_id: Correlation ID from the parent inbound message.
             session_key: Session key for cancellation grouping.
             message_thread_id: Forum topic thread ID to preserve topic routing.
             max_iterations: Max tool iterations (default: from config.agents.defaults.max_tool_iterations).
@@ -122,6 +127,7 @@ class SubagentManager:
             "channel": origin_channel,
             "chat_id": origin_chat_id,
             "message_thread_id": message_thread_id,
+            "request_id": request_id,
         }
 
         bg_task = asyncio.create_task(
@@ -168,17 +174,43 @@ class SubagentManager:
 
         if acpx_agent is None:
             logger.error("Subagent [{}]: executor '{}' has no acpx_agent mapping", task_id, alias)
-            await self._announce_result(origin, task, label, False,
-                                        f"Executor '{alias}' has no acpx_agent mapping", time.monotonic(), task_id)
+            self._record_subagent_telemetry(
+                task_id=task_id, model=alias, start_time=time.monotonic(),
+                stop_reason="error", error=f"Executor '{alias}' has no acpx_agent mapping",
+                origin=origin,
+            )
+            await self._announce_result(
+                task_id, label, task,
+                self._build_envelope(
+                    f"Executor '{alias}' has no acpx_agent mapping", "error",
+                    stop_reason="error",
+                    error=f"Executor '{alias}' has no acpx_agent mapping",
+                ),
+                origin,
+            )
             return
 
         start_time = time.monotonic()
 
         result = await execute_acpx(acpx_agent, task, self.workspace, timeout_s=hard_cap)
 
+        stop_reason = "completed" if result.success else "error"
+        self._record_subagent_telemetry(
+            task_id=task_id, model=alias, start_time=start_time,
+            stop_reason=stop_reason,
+            error=None if result.success else result.summary,
+            origin=origin,
+        )
         logger.info("Subagent [{}]: CLI executor finished, success={}", task_id, result.success)
-        await self._announce_result(origin, task, label, result.success,
-                                    result.summary, start_time, task_id)
+        await self._announce_result(
+            task_id, label, task,
+            self._build_envelope(
+                result.summary,
+                "ok" if result.success else "error",
+                stop_reason=stop_reason,
+            ),
+            origin,
+        )
 
     async def _run_subagent(
         self,
@@ -239,6 +271,9 @@ class SubagentManager:
 
         start_time = time.monotonic()
         last_activity = start_time
+        # Telemetry tracking variables — recorded at every exit point (CRIT-01)
+        _telem_tool_events: list[dict[str, Any]] = []
+        _telem_usage: dict[str, Any] = {}
 
         try:
             # Build subagent tools (no message tool, no spawn tool)
@@ -319,7 +354,7 @@ class SubagentManager:
                 run_hook = _SubagentHook()
 
             # ── Execute ─────────────────────────────────────────────────
-            runner = AgentRunner(effective_provider)
+            runner = self.runner if effective_provider is self.provider else AgentRunner(effective_provider)
             spec = AgentRunSpec(
                 initial_messages=messages,
                 tools=tools,
@@ -396,9 +431,18 @@ class SubagentManager:
                     task_id, label, task, origin, max_iterations, result, checkpoint_policy,
                 )
 
+            # Capture telemetry data from runner result (CRIT-01)
+            _telem_tool_events = result.tool_events
+            _telem_usage = result.usage
+
             if result.stop_reason == "tool_error":
                 if nb_task_id:
                     await mark_task_delegation_failure(nb_task_id, "tool_error during execution")
+                self._record_subagent_telemetry(
+                    task_id=task_id, model=effective_model, start_time=start_time,
+                    stop_reason="tool_error", error=result.error,
+                    tool_events=_telem_tool_events, usage=_telem_usage, origin=origin,
+                )
                 await self._announce_result(
                     task_id, label, task,
                     self._build_envelope(
@@ -415,6 +459,11 @@ class SubagentManager:
                     await mark_task_delegation_failure(
                         nb_task_id, result.error or "subagent execution failed",
                     )
+                self._record_subagent_telemetry(
+                    task_id=task_id, model=effective_model, start_time=start_time,
+                    stop_reason="error", error=result.error,
+                    tool_events=_telem_tool_events, usage=_telem_usage, origin=origin,
+                )
                 await self._announce_result(
                     task_id, label, task,
                     self._build_envelope(
@@ -436,6 +485,11 @@ class SubagentManager:
                                 task_id, len(completed))
                     if nb_task_id:
                         await mark_task_delegation_success(nb_task_id)
+                    self._record_subagent_telemetry(
+                        task_id=task_id, model=effective_model, start_time=start_time,
+                        stop_reason="max_iterations",
+                        tool_events=_telem_tool_events, usage=_telem_usage, origin=origin,
+                    )
                     await self._announce_result(
                         task_id, label, task,
                         self._build_envelope(
@@ -451,6 +505,12 @@ class SubagentManager:
                         nb_task_id,
                         "max_iterations reached without completed tool steps",
                     )
+                self._record_subagent_telemetry(
+                    task_id=task_id, model=effective_model, start_time=start_time,
+                    stop_reason="max_iterations",
+                    error="max_iterations reached without completed tool steps",
+                    tool_events=_telem_tool_events, usage=_telem_usage, origin=origin,
+                )
                 await self._announce_result(
                     task_id, label, task,
                     self._build_envelope(
@@ -472,6 +532,11 @@ class SubagentManager:
                         nb_task_id,
                         f"subagent stopped with reason: {stop_reason}",
                     )
+                self._record_subagent_telemetry(
+                    task_id=task_id, model=effective_model, start_time=start_time,
+                    stop_reason=stop_reason, error=result.error,
+                    tool_events=_telem_tool_events, usage=_telem_usage, origin=origin,
+                )
                 await self._announce_result(
                     task_id, label, task,
                     self._build_envelope(
@@ -490,6 +555,11 @@ class SubagentManager:
             logger.info("Subagent [{}] completed successfully", task_id)
             if nb_task_id:
                 await mark_task_delegation_success(nb_task_id)
+            self._record_subagent_telemetry(
+                task_id=task_id, model=effective_model, start_time=start_time,
+                stop_reason="completed",
+                tool_events=_telem_tool_events, usage=_telem_usage, origin=origin,
+            )
             await self._announce_result(
                 task_id, label, task,
                 self._build_envelope(
@@ -505,6 +575,11 @@ class SubagentManager:
             logger.warning("Subagent [{}] {}", task_id, msg)
             if nb_task_id:
                 await mark_task_delegation_failure(nb_task_id, msg)
+            self._record_subagent_telemetry(
+                task_id=task_id, model=effective_model, start_time=start_time,
+                stop_reason="timeout", error=msg,
+                tool_events=_telem_tool_events, usage=_telem_usage, origin=origin,
+            )
             await self._announce_result(
                 task_id, label, task,
                 self._build_envelope(msg, "error", stop_reason="timeout"),
@@ -513,6 +588,11 @@ class SubagentManager:
 
         except asyncio.CancelledError:
             logger.info("Subagent [{}] cancelled", task_id)
+            self._record_subagent_telemetry(
+                task_id=task_id, model=effective_model, start_time=start_time,
+                stop_reason="cancelled",
+                tool_events=_telem_tool_events, usage=_telem_usage, origin=origin,
+            )
             raise
 
         except Exception as e:
@@ -520,6 +600,11 @@ class SubagentManager:
             logger.error("Subagent [{}] failed: {}", task_id, e)
             if nb_task_id:
                 await mark_task_delegation_failure(nb_task_id, error_msg)
+            self._record_subagent_telemetry(
+                task_id=task_id, model=effective_model, start_time=start_time,
+                stop_reason="exception", error=error_msg,
+                tool_events=_telem_tool_events, usage=_telem_usage, origin=origin,
+            )
             await self._announce_result(
                 task_id, label, task,
                 self._build_envelope(error_msg, "error", stop_reason="exception"),
@@ -761,6 +846,7 @@ class SubagentManager:
             chat_id=f"{origin['channel']}:{origin['chat_id']}",
             content=content,
             metadata=metadata,
+            request_id=origin.get("request_id"),
         )
         await self.bus.publish_inbound(msg)
         logger.debug(
@@ -788,6 +874,53 @@ class SubagentManager:
             lines.append("Failure:")
             lines.append(f"- {result.error}")
         return "\n".join(lines) or (result.error or "Error: subagent execution failed.")
+
+    def _record_subagent_telemetry(
+        self,
+        *,
+        task_id: str,
+        model: str,
+        start_time: float,
+        stop_reason: str,
+        error: str | None = None,
+        tool_events: list[dict[str, Any]] | None = None,
+        usage: dict[str, Any] | None = None,
+        origin: dict[str, Any] | None = None,
+    ) -> None:
+        """Record a telemetry turn for subagent execution (CRIT-01 fix)."""
+        duration_ms = int((time.monotonic() - start_time) * 1000)
+        tools_used: list[str] = []
+        if tool_events:
+            tools_used = list({e.get("name", "") for e in tool_events if e.get("name")})
+        skills, files_touched = self.telemetry.extract_from_events(tool_events or [])
+        channel = (origin or {}).get("channel", "subagent")
+        chat_id = (origin or {}).get("chat_id", "background")
+        request_id = (origin or {}).get("request_id")
+        estimated_cost_usd: float | None = None
+        try:
+            from nanobot.agent.cost_guard import _estimate_cost
+
+            prompt_tokens = int((usage or {}).get("prompt_tokens", 0) or 0)
+            completion_tokens = int((usage or {}).get("completion_tokens", 0) or 0)
+            estimated_cost_usd = _estimate_cost(model, prompt_tokens, completion_tokens)
+        except Exception:
+            estimated_cost_usd = None
+        self.telemetry.record_turn(
+            ts=datetime.now(timezone.utc).isoformat(),
+            session=f"subagent:{task_id}",
+            channel=channel,
+            chat_id=chat_id,
+            model=model,
+            usage=usage or {},
+            duration_ms=duration_ms,
+            stop_reason=stop_reason,
+            error=error,
+            tools_used=tools_used,
+            skills=skills,
+            files_touched=files_touched,
+            request_id=request_id,
+            estimated_cost_usd=estimated_cost_usd,
+        )
 
     def _build_subagent_prompt(self) -> str:
         """Build a focused system prompt for the subagent."""
@@ -822,24 +955,26 @@ Tools like 'read_file' and 'web_fetch' can return native image content. Read vis
             parts.append(f"## Skills\n\nRead SKILL.md with read_file to use a skill.\n\n{skills_summary}")
 
         # Inject quality gates — every subagent must verify before finishing
-        parts.append("""## Quality Gates (MANDATORY before finishing)
+        # Resolve repo root dynamically (works on both macOS dev and Linux VPS)
+        repo_root = str(Path(self.workspace).resolve())
+        parts.append(f"""## Quality Gates (MANDATORY before finishing)
 
 Before you report the task as complete, you MUST run these checks:
 
-1. **Linter**: `cd <repo_root> && uv run ruff check src/ tests/` — must have ZERO errors
+1. **Linter**: `cd {repo_root} && uv run ruff check src/ tests/` — must have ZERO errors
    - Fix any errors before finishing
    - If you introduced no new errors, confirm with a comment
 
-2. **Formatter**: `cd <repo_root> && uv run ruff format --check src/ tests/` — must pass
+2. **Formatter**: `cd {repo_root} && uv run ruff format --check src/ tests/` — must pass
    - If it fails, run `uv run ruff format src/ tests/` to auto-fix
 
-3. **Tests**: `cd <repo_root> && uv run pytest tests/ -q` — ALL tests must pass
+3. **Tests**: `cd {repo_root} && uv run pytest tests/ -q` — ALL tests must pass
    - Even if your task didn't touch test files, existing tests must not break
    - If a test breaks because of your changes, fix the root cause
 
 If any check fails, fix the issue and re-run. Do NOT report success with failing checks.
 
-Repo root: /root/Projects/nanobot""")
+Repo root: {repo_root}""")
 
         return "\n\n".join(parts)
 

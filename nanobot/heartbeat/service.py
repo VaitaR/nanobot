@@ -72,6 +72,16 @@ class HeartbeatService:
             return []
 
     @staticmethod
+    async def _reap_stale_delegations() -> list[dict[str, str | bool]]:
+        """Reap stale delegated tasks (F-007)."""
+        try:
+            from nanobot.agent.task_lifecycle import reap_stale_delegations
+
+            return await reap_stale_delegations(timeout_s=2 * 60 * 60)
+        except Exception:
+            return []
+
+    @staticmethod
     async def _process_reviews(review_decisions: list[dict[str, str]]) -> list[dict]:
         """Process review decisions: close tasks or mark failures.
 
@@ -87,6 +97,11 @@ class HeartbeatService:
             if not tid:
                 continue
             if verdict == "done" and note:
+                # Prefix heartbeat source and ensure evidence marker (F-015 fix)
+                if not any(m in note.lower() for m in ("checked:", "verified:", "confirmed:", "tested:", "ran:", "output:")):
+                    note = f"verified: [heartbeat-review] {note}"
+                else:
+                    note = f"[heartbeat-review] {note}"
                 ok = await close_task(tid, note)
                 logger.info("Heartbeat: closed task {} as {}", tid[:20], "done" if ok else "failed")
                 results.append({"task_id": tid, "verdict": verdict, "ok": ok})
@@ -200,6 +215,13 @@ class HeartbeatService:
             await self.on_tick_report("start", "", None)
 
         try:
+            stale_reaped = await self._reap_stale_delegations()
+            if stale_reaped:
+                logger.warning(
+                    "Heartbeat reaper: processed {} stale delegated task(s)",
+                    len(stale_reaped),
+                )
+
             pending_review = await self._fetch_pending_review()
             if pending_review:
                 logger.info("Heartbeat: {} tasks pending review", len(pending_review))
@@ -247,6 +269,13 @@ class HeartbeatService:
             if self.on_tick_report:
                 await self.on_tick_report("skip", "", None)
             return r
+
+        stale_reaped = await self._reap_stale_delegations()
+        if stale_reaped:
+            logger.warning(
+                "Heartbeat reaper(trigger_now): processed {} stale delegated task(s)",
+                len(stale_reaped),
+            )
 
         action, tasks, review_decisions = await self._decide(
             content, await self._fetch_pending_review() or None,

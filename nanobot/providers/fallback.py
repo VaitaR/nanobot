@@ -14,7 +14,6 @@ from loguru import logger
 
 from nanobot.providers.base import LLMProvider, LLMResponse
 
-
 # Phrases that indicate a hard quota/limit (not a transient network error).
 # These are NOT retried by the base retry loop, so we intercept them here.
 _QUOTA_MARKERS: tuple[str, ...] = (

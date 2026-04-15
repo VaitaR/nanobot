@@ -162,7 +162,7 @@ def resolve_dynamic_slots(
         command = match.group(1).strip()
         if not _is_whitelisted(command):
             logger.debug("Rejected non-whitelisted dynamic slot: {}", command[:120])
-            return f"[unavailable: command not whitelisted]"
+            return "[unavailable: command not whitelisted]"
 
         cached = slot_cache.get(command)
         if cached is not None:
