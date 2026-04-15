@@ -62,7 +62,7 @@ def test_openrouter_spec_is_gateway() -> None:
 
 def test_openrouter_sets_default_attribution_headers() -> None:
     spec = find_by_name("openrouter")
-    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI") as MockClient:
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI") as MockClient:  # noqa: N806
         OpenAICompatProvider(
             api_key="sk-or-test-key",
             api_base="https://openrouter.ai/api/v1",
@@ -79,7 +79,7 @@ def test_openrouter_sets_default_attribution_headers() -> None:
 
 def test_openrouter_user_headers_override_default_attribution() -> None:
     spec = find_by_name("openrouter")
-    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI") as MockClient:
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI") as MockClient:  # noqa: N806
         OpenAICompatProvider(
             api_key="sk-or-test-key",
             api_base="https://openrouter.ai/api/v1",
@@ -105,7 +105,7 @@ async def test_openrouter_keeps_model_name_intact() -> None:
     mock_create = AsyncMock(return_value=_fake_chat_response())
     spec = find_by_name("openrouter")
 
-    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI") as MockClient:
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI") as MockClient:  # noqa: N806
         client_instance = MockClient.return_value
         client_instance.chat.completions.create = mock_create
 
@@ -130,7 +130,7 @@ async def test_aihubmix_strips_model_prefix() -> None:
     mock_create = AsyncMock(return_value=_fake_chat_response())
     spec = find_by_name("aihubmix")
 
-    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI") as MockClient:
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI") as MockClient:  # noqa: N806
         client_instance = MockClient.return_value
         client_instance.chat.completions.create = mock_create
 
@@ -155,7 +155,7 @@ async def test_standard_provider_passes_model_through() -> None:
     mock_create = AsyncMock(return_value=_fake_chat_response())
     spec = find_by_name("deepseek")
 
-    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI") as MockClient:
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI") as MockClient:  # noqa: N806
         client_instance = MockClient.return_value
         client_instance.chat.completions.create = mock_create
 
@@ -179,7 +179,7 @@ async def test_openai_compat_preserves_extra_content_on_tool_calls() -> None:
     mock_create = AsyncMock(return_value=_fake_tool_call_response())
     spec = find_by_name("gemini")
 
-    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI") as MockClient:
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI") as MockClient:  # noqa: N806
         client_instance = MockClient.return_value
         client_instance.chat.completions.create = mock_create
 

@@ -1,6 +1,7 @@
 """Feishu/Lark channel implementation using lark-oapi SDK with WebSocket long connection."""
 
 import asyncio
+import importlib.util
 import json
 import os
 import re
@@ -9,19 +10,16 @@ import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Literal
 
 from loguru import logger
+from pydantic import Field
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import Base
-from pydantic import Field
-
-import importlib.util
 
 FEISHU_AVAILABLE = importlib.util.find_spec("lark_oapi") is not None
 
@@ -359,6 +357,7 @@ class FeishuChannel(BaseChannel):
         # "This event loop is already running" errors.
         def run_ws():
             import time
+
             import lark_oapi.ws.client as _lark_ws_client
             ws_loop = asyncio.new_event_loop()
             asyncio.set_event_loop(ws_loop)
@@ -419,7 +418,11 @@ class FeishuChannel(BaseChannel):
 
     def _add_reaction_sync(self, message_id: str, emoji_type: str) -> None:
         """Sync helper for adding reaction (runs in thread pool)."""
-        from lark_oapi.api.im.v1 import CreateMessageReactionRequest, CreateMessageReactionRequestBody, Emoji
+        from lark_oapi.api.im.v1 import (
+            CreateMessageReactionRequest,
+            CreateMessageReactionRequestBody,
+            Emoji,
+        )
         try:
             request = CreateMessageReactionRequest.builder() \
                 .message_id(message_id) \
@@ -987,7 +990,10 @@ class FeishuChannel(BaseChannel):
 
     def _stream_update_text_sync(self, card_id: str, content: str, sequence: int) -> bool:
         """Stream-update the markdown element on a CardKit card (typewriter effect)."""
-        from lark_oapi.api.cardkit.v1 import ContentCardElementRequest, ContentCardElementRequestBody
+        from lark_oapi.api.cardkit.v1 import (
+            ContentCardElementRequest,
+            ContentCardElementRequestBody,
+        )
         try:
             request = ContentCardElementRequest.builder() \
                 .card_id(card_id) \
@@ -1202,7 +1208,7 @@ class FeishuChannel(BaseChannel):
             event = data.event
             message = event.message
             sender = event.sender
-            
+
             # Deduplication check
             message_id = message.message_id
             if message_id in self._processed_message_ids:

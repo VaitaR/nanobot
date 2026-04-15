@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from nanobot.agent.tools.base import Tool
+from nanobot.agent.tools.path_guard import PathGuard
 from nanobot.utils.helpers import build_image_content_blocks, detect_image_mime
 
 
@@ -43,10 +44,14 @@ class _FsTool(Tool):
         workspace: Path | None = None,
         allowed_dir: Path | None = None,
         extra_allowed_dirs: list[Path] | None = None,
+        path_guard: PathGuard | None = None,
     ):
         self._workspace = workspace
         self._allowed_dir = allowed_dir
         self._extra_allowed_dirs = extra_allowed_dirs
+        self._path_guard = path_guard or PathGuard(
+            workspace_root=str(workspace) if workspace else ".",
+        )
 
     def _resolve(self, path: str) -> Path:
         return _resolve_path(path, self._workspace, self._allowed_dir, self._extra_allowed_dirs)
@@ -183,6 +188,10 @@ class WriteFileTool(_FsTool):
             if content is None:
                 raise ValueError("Unknown content")
             fp = self._resolve(path)
+            # Protected-path enforcement
+            blocked = self._path_guard.check_write(str(fp))
+            if blocked:
+                return f"Error: {blocked}"
             fp.parent.mkdir(parents=True, exist_ok=True)
             fp.write_text(content, encoding="utf-8")
             return f"Successfully wrote {len(content)} bytes to {fp}"
@@ -208,13 +217,13 @@ def _find_match(content: str, old_text: str) -> tuple[str | None, int]:
     old_lines = old_text.splitlines()
     if not old_lines:
         return None, 0
-    stripped_old = [l.strip() for l in old_lines]
+    stripped_old = [ln.strip() for ln in old_lines]
     content_lines = content.splitlines()
 
     candidates = []
     for i in range(len(content_lines) - len(stripped_old) + 1):
         window = content_lines[i : i + len(stripped_old)]
-        if [l.strip() for l in window] == stripped_old:
+        if [ln.strip() for ln in window] == stripped_old:
             candidates.append("\n".join(window))
 
     if candidates:
@@ -269,6 +278,10 @@ class EditFileTool(_FsTool):
             fp = self._resolve(path)
             if not fp.exists():
                 return f"Error: File not found: {path}"
+            # Protected-path enforcement
+            blocked = self._path_guard.check_write(str(fp))
+            if blocked:
+                return f"Error: {blocked}"
 
             raw = fp.read_bytes()
             uses_crlf = b"\r\n" in raw

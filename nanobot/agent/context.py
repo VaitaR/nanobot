@@ -99,7 +99,7 @@ class ContextBuilder:
         for label in removable:
             if total_chars // _CHARS_PER_TOKEN <= budget:
                 break
-            idx = next((i for i, (l, _) in enumerate(result) if l == label), None)
+            idx = next((i for i, (lbl, _) in enumerate(result) if lbl == label), None)
             if idx is None:
                 continue
             section_chars = len(result[idx][1])
@@ -114,13 +114,22 @@ class ContextBuilder:
 
         # Truncate memory if still over budget (identity is never touched)
         if total_chars // _CHARS_PER_TOKEN > budget:
-            mem_idx = next((i for i, (l, _) in enumerate(result) if l == "memory"), None)
+            mem_idx = next((i for i, (lbl, _) in enumerate(result) if lbl == "memory"), None)
             if mem_idx is not None:
                 remaining = budget * _CHARS_PER_TOKEN
-                remaining -= sum(len(c) for l, c in result if l != "memory")
+                remaining -= sum(len(c) for lbl, c in result if lbl != "memory")
                 remaining -= _SEPARATOR.__len__() * max(0, len(result) - 1)
-                # TODO: smart memory truncation (LLM summarization) instead of raw character cutoff
-                result[mem_idx] = ("memory", result[mem_idx][1][:max(0, remaining)])
+                # Truncate at line boundary for clean Markdown (F-019 fix)
+                raw_limit = max(0, remaining)
+                mem_text = result[mem_idx][1]
+                if len(mem_text) > raw_limit:
+                    cut = mem_text.rfind("\n", 0, raw_limit)
+                    if cut <= 0:
+                        cut = mem_text.rfind(" ", 0, raw_limit)
+                    if cut <= 0:
+                        cut = raw_limit
+                    mem_text = mem_text[:cut] + "\n\n[... memory truncated ...]"
+                result[mem_idx] = ("memory", mem_text)
                 logger.warning("System prompt budget: truncated memory section")
 
         return result

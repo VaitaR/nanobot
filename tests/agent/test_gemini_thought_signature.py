@@ -11,7 +11,6 @@ from unittest.mock import patch
 from nanobot.providers.base import ToolCallRequest
 from nanobot.providers.openai_compat_provider import OpenAICompatProvider
 
-
 GEMINI_EXTRA = {"google": {"thought_signature": "sig-abc-123"}}
 
 

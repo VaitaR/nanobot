@@ -255,8 +255,9 @@ class TestTelegramInlineKeyboard:
     async def test_send_with_reply_markup(self) -> None:
         """send() passes reply_markup to send_message via _send_text."""
         try:
-            from nanobot.channels.telegram import TelegramChannel, TelegramConfig
             from telegram import InlineKeyboardMarkup
+
+            from nanobot.channels.telegram import TelegramChannel, TelegramConfig
         except ImportError:
             pytest.skip("python-telegram-bot not installed")
 
@@ -336,8 +337,9 @@ class TestTelegramInlineKeyboard:
     async def test_build_inline_markup_converts_dict(self) -> None:
         """_build_inline_markup correctly converts dict to InlineKeyboardMarkup."""
         try:
-            from nanobot.channels.telegram import TelegramChannel
             from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+            from nanobot.channels.telegram import TelegramChannel
         except ImportError:
             pytest.skip("python-telegram-bot not installed")
 

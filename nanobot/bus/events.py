@@ -25,6 +25,11 @@ class InboundMessage:
     session_key_override: str | None = None  # Optional override for thread-scoped sessions
     request_id: str | None = None  # OBS-001: correlation ID for request tracing
 
+    def __post_init__(self) -> None:
+        """Auto-generate request_id if not provided (CRIT-02 fix)."""
+        if self.request_id is None:
+            self.request_id = generate_request_id()
+
     @property
     def session_key(self) -> str:
         """Unique key for session identification."""

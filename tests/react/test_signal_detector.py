@@ -12,7 +12,6 @@ from nanobot.react.signal_detector import (
     create_signal_detector,
 )
 
-
 # ---------------------------------------------------------------------------
 # Unit tests: pattern detection
 # ---------------------------------------------------------------------------

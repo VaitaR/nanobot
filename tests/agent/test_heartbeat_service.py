@@ -349,3 +349,64 @@ async def test_trigger_now_returns_structured_result(tmp_path) -> None:
     assert result_empty["action"] == "skip"
     assert "missing" in result_empty["result"]
 
+
+@pytest.mark.asyncio
+async def test_tick_calls_stale_delegation_reaper(tmp_path, monkeypatch) -> None:
+    (tmp_path / "HEARTBEAT.md").write_text("- [ ] do nothing", encoding="utf-8")
+    provider = DummyProvider([
+        LLMResponse(
+            content="",
+            tool_calls=[
+                ToolCallRequest(id="hb_1", name="heartbeat", arguments={"action": "skip"}),
+            ],
+        )
+    ])
+
+    service = HeartbeatService(
+        workspace=tmp_path,
+        provider=provider,
+        model="openai/gpt-4o-mini",
+    )
+
+    called = {"reap": 0}
+
+    async def _reap_stub():
+        called["reap"] += 1
+        return [{"task_id": "t1", "target": "review", "ok": True, "reason": "stale"}]
+
+    monkeypatch.setattr(service, "_reap_stale_delegations", _reap_stub)
+    await service._tick()
+
+    assert called["reap"] == 1
+
+
+@pytest.mark.asyncio
+async def test_trigger_now_calls_stale_delegation_reaper(tmp_path, monkeypatch) -> None:
+    (tmp_path / "HEARTBEAT.md").write_text("- [ ] do nothing", encoding="utf-8")
+    provider = DummyProvider([
+        LLMResponse(
+            content="",
+            tool_calls=[
+                ToolCallRequest(id="hb_1", name="heartbeat", arguments={"action": "skip"}),
+            ],
+        )
+    ])
+
+    service = HeartbeatService(
+        workspace=tmp_path,
+        provider=provider,
+        model="openai/gpt-4o-mini",
+    )
+
+    called = {"reap": 0}
+
+    async def _reap_stub():
+        called["reap"] += 1
+        return [{"task_id": "t1", "target": "review", "ok": True, "reason": "stale"}]
+
+    monkeypatch.setattr(service, "_reap_stale_delegations", _reap_stub)
+    result = await service.trigger_now()
+
+    assert called["reap"] == 1
+    assert result["action"] == "skip"
+

@@ -10,8 +10,7 @@ except ImportError:
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.channels.slack import SlackChannel
-from nanobot.channels.slack import SlackConfig
+from nanobot.channels.slack import SlackChannel, SlackConfig
 
 
 class _FakeAsyncWebClient:
@@ -21,7 +20,7 @@ class _FakeAsyncWebClient:
         self.reactions_add_calls: list[dict[str, object | None]] = []
         self.reactions_remove_calls: list[dict[str, object | None]] = []
 
-    async def chat_postMessage(
+    async def chat_postMessage(  # noqa: N802
         self,
         *,
         channel: str,

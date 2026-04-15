@@ -4,7 +4,6 @@ import json
 
 from nanobot.config.loader import _resolve_env_vars, load_config, save_config
 
-
 # ---------------------------------------------------------------------------
 # _resolve_env_vars unit tests
 # ---------------------------------------------------------------------------

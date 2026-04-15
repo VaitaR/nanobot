@@ -1,0 +1,9 @@
+{
+  "include": ["nanobot"],
+  "exclude": ["**/node_modules", "**/__pycache__", ".venv", "bridge"],
+  "typeCheckingMode": "basic",
+  "pythonVersion": "3.11",
+  "reportMissingImports": "warning",
+  "reportMissingTypeStubs": false,
+  "reportUnusedImport": false
+}

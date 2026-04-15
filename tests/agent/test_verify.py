@@ -4,11 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 from nanobot.agent.result_envelope import Artifact, ResultEnvelope
 from nanobot.agent.verify import verify_artifact_exists, verify_envelope
-
 
 # ---------------------------------------------------------------------------
 # verify_artifact_exists
@@ -18,7 +15,7 @@ class TestVerifyArtifactExists:
     def test_file_exists_verified_true(self, tmp_path: Path) -> None:
         """Existing file gets verified=True."""
         f = tmp_path / "hello.py"
-        f.write_text("print('hello')")
+        f.write_text("print('hello')\n")
         a = Artifact(path=str(f), description="hello", kind="file")
         result = verify_artifact_exists(a)
         assert result.verified is True
@@ -32,7 +29,7 @@ class TestVerifyArtifactExists:
     def test_diff_exists_verified_true(self, tmp_path: Path) -> None:
         """Diff artifact for existing file gets verified=True."""
         f = tmp_path / "changed.py"
-        f.write_text("x = 1")
+        f.write_text("x = 1\n")
         a = Artifact(path=str(f), description="edited", kind="diff")
         result = verify_artifact_exists(a)
         assert result.verified is True
@@ -58,7 +55,7 @@ class TestVerifyEnvelope:
     def test_all_verified_envelope_ok(self, tmp_path: Path) -> None:
         """All artifacts verified → status stays 'ok'."""
         f = tmp_path / "a.py"
-        f.write_text("# ok")
+        f.write_text("# ok\n")
         env = ResultEnvelope(
             status="ok",
             summary="done",
@@ -71,7 +68,7 @@ class TestVerifyEnvelope:
     def test_missing_files_downgrades_to_partial(self, tmp_path: Path) -> None:
         """Some missing files → status='partial', summary has warning."""
         exists = tmp_path / "yes.py"
-        exists.write_text("# yes")
+        exists.write_text("# yes\n")
         missing = tmp_path / "no.py"
         env = ResultEnvelope(
             status="ok",
@@ -83,7 +80,7 @@ class TestVerifyEnvelope:
         )
         result = verify_envelope(env)
         assert result.status == "partial"
-        assert "1 file(s) not found on disk" in result.summary
+        assert "failed verification" in result.summary
 
     def test_error_envelope_unchanged(self, tmp_path: Path) -> None:
         """Envelope with status='error' is returned as-is (no verification)."""
@@ -108,7 +105,7 @@ class TestVerifyEnvelope:
     def test_envelope_preserves_other_fields(self, tmp_path: Path) -> None:
         """details, stop_reason, error are preserved through verification."""
         f = tmp_path / "x.py"
-        f.write_text("pass")
+        f.write_text("pass\n")
         env = ResultEnvelope(
             status="ok",
             summary="wrote x",

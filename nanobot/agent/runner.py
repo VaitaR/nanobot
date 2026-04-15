@@ -12,6 +12,7 @@ from loguru import logger
 from nanobot.agent.cost_guard import CostGuard
 from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.checkpoint.loop_detector import LoopDetector
 from nanobot.providers.base import LLMProvider, ToolCallRequest
 from nanobot.react.permission_engine import PermissionEngine
 from nanobot.utils.helpers import build_assistant_message
@@ -81,6 +82,9 @@ class AgentRunner:
         error: str | None = None
         stop_reason = "completed"
         tool_events: list[dict[str, str]] = []
+
+        # Proactive loop detector — observes tool calls and can intervene
+        loop_detector = LoopDetector(window=8)
 
         # Compute initial effective max (may grow via CheckpointHook)
         eff_max = self._effective_max(hook, spec)
@@ -168,6 +172,33 @@ class AgentRunner:
                 tool_events.extend(new_events)
                 context.tool_results = list(results)
                 context.tool_events = list(new_events)
+
+                # Proactive loop detection: observe + check
+                for ev in new_events:
+                    loop_detector.observe(
+                        ev.get("name", "?"),
+                        ev.get("detail", ""),
+                        iteration,
+                    )
+                loop_signal = loop_detector.detect()
+                if loop_signal is not None:
+                    logger.warning(
+                        "Loop detected (proactive): {} — {}",
+                        loop_signal.pattern,
+                        loop_signal.evidence,
+                    )
+                    # Inject a system message forcing approach change
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "[SYSTEM] Repetitive tool-call loop detected: "
+                            f"{loop_signal.evidence}. "
+                            "You are repeating the same actions. "
+                            "Change your approach or conclude your response."
+                        ),
+                    })
+                    loop_detector.reset()
+
                 if fatal_error is not None:
                     error = f"Error: {type(fatal_error).__name__}: {fatal_error}"
                     stop_reason = "tool_error"

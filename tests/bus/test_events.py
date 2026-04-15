@@ -8,9 +8,11 @@ from nanobot.bus.events import InboundMessage, generate_request_id
 
 
 def test_inbound_message_defaults() -> None:
-    """All optional fields have defaults; request_id is None."""
+    """All optional fields have defaults; request_id is auto-generated."""
     msg = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="hi")
-    assert msg.request_id is None
+    # CRIT-02: request_id is now auto-generated (no longer None)
+    assert msg.request_id is not None
+    assert len(msg.request_id) == 12  # uuid4 hex[:12]
     assert msg.session_key_override is None
     assert msg.media == []
     assert msg.metadata == {}

@@ -19,9 +19,7 @@ class _StopGatewayError(RuntimeError):
     pass
 
 
-import shutil
-
-import pytest
+import shutil  # noqa: E402
 
 
 @pytest.fixture

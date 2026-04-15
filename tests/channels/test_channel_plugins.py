@@ -14,7 +14,6 @@ from nanobot.channels.base import BaseChannel
 from nanobot.channels.manager import ChannelManager
 from nanobot.config.schema import ChannelsConfig
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -193,9 +192,10 @@ async def test_manager_loads_plugin_from_dict_config():
 
 
 def test_channels_login_uses_discovered_plugin_class(monkeypatch):
+    from typer.testing import CliRunner
+
     from nanobot.cli.commands import app
     from nanobot.config.schema import Config
-    from typer.testing import CliRunner
 
     runner = CliRunner()
     seen: dict[str, object] = {}

@@ -66,6 +66,7 @@ class TelemetryCollector:
         skills: list[str],
         files_touched: list[str],
         request_id: str | None = None,  # OBS-001
+        estimated_cost_usd: float | None = None,
     ) -> None:
         record = {
             "ts": ts,
@@ -75,6 +76,7 @@ class TelemetryCollector:
             "model": model,
             "request_id": request_id,  # OBS-001
             "usage": usage,
+            "estimated_cost_usd": estimated_cost_usd,
             # OBS-003: cumulative token totals at top level
             "total_tokens": usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0),
             "prompt_tokens": usage.get("prompt_tokens", 0),

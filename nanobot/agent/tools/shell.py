@@ -5,10 +5,11 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from loguru import logger
 
+from nanobot.agent.exec_tier_gate import check_exec_tier
 from nanobot.agent.tools.base import Tool
 
 
@@ -23,6 +24,9 @@ class ExecTool(Tool):
         allow_patterns: list[str] | None = None,
         restrict_to_workspace: bool = False,
         path_append: str = "",
+        exec_max_tier: int = 3,
+        exec_tier_context: str = "interactive",
+        exec_tier_checker: Callable[..., Any] | None = None,
     ):
         self.timeout = timeout
         self.working_dir = working_dir
@@ -45,6 +49,9 @@ class ExecTool(Tool):
         self.allow_patterns = allow_patterns or []
         self.restrict_to_workspace = restrict_to_workspace
         self.path_append = path_append
+        self.exec_max_tier = max(0, min(3, int(exec_max_tier)))
+        self.exec_tier_context = exec_tier_context
+        self.exec_tier_checker = exec_tier_checker or check_exec_tier
 
     @property
     def name(self) -> str:
@@ -159,6 +166,14 @@ class ExecTool(Tool):
         """Best-effort safety guard for potentially destructive commands."""
         cmd = command.strip()
         lower = cmd.lower()
+
+        tier_result = self.exec_tier_checker(
+            cmd,
+            max_tier=self.exec_max_tier,
+            context=self.exec_tier_context,
+        )
+        if not tier_result.allowed:
+            return f"Error: Command blocked by exec tier gate ({tier_result.reason})"
 
         for pattern in self.deny_patterns:
             if re.search(pattern, lower):
