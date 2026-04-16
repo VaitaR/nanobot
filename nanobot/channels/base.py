@@ -10,6 +10,8 @@ from loguru import logger
 
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
+from nanobot.config.paths import get_workspace_path
+from nanobot.session.resume_state import persist_last_active_session
 
 
 class BaseChannel(ABC):
@@ -153,6 +155,16 @@ class BaseChannel(ABC):
         meta = metadata or {}
         if self.supports_streaming:
             meta = {**meta, "_wants_stream": True}
+
+        try:
+            persist_last_active_session(
+                get_workspace_path(),
+                channel=self.name,
+                chat_id=str(chat_id),
+                message_thread_id=meta.get("message_thread_id"),
+            )
+        except Exception as exc:
+            logger.debug("Failed to persist last active session for {}: {}", self.name, exc)
 
         msg = InboundMessage(
             channel=self.name,

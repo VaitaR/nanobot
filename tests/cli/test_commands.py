@@ -1,5 +1,6 @@
 import json
 import re
+import shutil
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -7,7 +8,7 @@ import pytest
 from typer.testing import CliRunner
 
 from nanobot.bus.events import OutboundMessage
-from nanobot.cli.commands import _make_provider, app
+from nanobot.cli.commands import _consume_restart_resume_payload, _make_provider, app
 from nanobot.config.schema import Config
 from nanobot.providers.openai_codex_provider import _strip_model_prefix
 from nanobot.providers.registry import find_by_name
@@ -17,11 +18,6 @@ runner = CliRunner()
 
 class _StopGatewayError(RuntimeError):
     pass
-
-
-import shutil
-
-import pytest
 
 
 @pytest.fixture
@@ -197,6 +193,12 @@ def test_onboard_wizard_preserves_explicit_config_in_next_steps(tmp_path, monkey
     resolved_config = str(config_path.resolve())
     assert f'nanobot agent -m "Hello!" --config {resolved_config}' in compact_output
     assert f"nanobot gateway --config {resolved_config}" in compact_output
+
+
+def test_consume_restart_resume_payload_ignores_reload_checkpoint(tmp_path):
+    payload = _consume_restart_resume_payload(tmp_path)
+
+    assert payload is None
 
 
 def test_config_matches_github_copilot_codex_with_hyphen_prefix():

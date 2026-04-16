@@ -1,4 +1,7 @@
+import json
 from types import SimpleNamespace
+
+import pytest
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
@@ -23,3 +26,21 @@ def test_is_allowed_requires_exact_match() -> None:
 
     assert channel.is_allowed("allow@email.com") is True
     assert channel.is_allowed("attacker|allow@email.com") is False
+
+
+@pytest.mark.asyncio
+async def test_handle_message_persists_last_active_session(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("nanobot.channels.base.get_workspace_path", lambda: tmp_path)
+    channel = _DummyChannel(SimpleNamespace(allow_from=["sender"]), MessageBus())
+
+    await channel._handle_message(
+        sender_id="sender",
+        chat_id="chat-1",
+        content="hello",
+        metadata={"message_thread_id": "42"},
+    )
+
+    payload = json.loads((tmp_path / "data" / "last_active_session.json").read_text())
+    assert payload["channel"] == "dummy"
+    assert payload["chat_id"] == "chat-1"
+    assert payload["message_thread_id"] == "42"

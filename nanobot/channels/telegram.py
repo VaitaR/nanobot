@@ -21,7 +21,7 @@ from telegram import (
     ReplyParameters,
     Update,
 )
-from telegram.error import BadRequest, TimedOut
+from telegram.error import BadRequest, RetryAfter, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -32,7 +32,7 @@ from telegram.ext import (
 )
 from telegram.request import HTTPXRequest
 
-from nanobot.bus.events import OutboundMessage
+from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.paths import get_media_dir
@@ -240,6 +240,18 @@ class TelegramChannel(BaseChannel):
         self._bot_username: str | None = None
         self._stream_bufs: dict[str, _StreamBuf] = {}  # stream_key -> streaming state
         self._checkpoint_resolver: Any | None = None  # (task_id, action, param) -> bool
+        self._subagent_manager: Any | None = None
+        self._agent_loop: Any | None = None
+        self._processing_messages: dict[str, int] = {}
+        self._status_reactions: dict[tuple[str, int], set[str]] = {}
+
+    def set_subagent_manager(self, manager: Any) -> None:
+        """Wire the subagent manager for direct status reporting."""
+        self._subagent_manager = manager
+
+    def set_agent_loop(self, loop: Any) -> None:
+        """Wire the agent loop for direct status reporting."""
+        self._agent_loop = loop
 
     def is_allowed(self, sender_id: str) -> bool:
         """Preserve Telegram's legacy id|username allowlist matching."""
@@ -299,7 +311,7 @@ class TelegramChannel(BaseChannel):
         self._app.add_handler(CommandHandler("new", self._forward_command))
         self._app.add_handler(CommandHandler("stop", self._forward_command))
         self._app.add_handler(CommandHandler("restart", self._forward_command))
-        self._app.add_handler(CommandHandler("status", self._forward_command))
+        self._app.add_handler(CommandHandler("status", self._on_status))
         self._app.add_handler(CommandHandler("tasks", self._forward_command))
         self._app.add_handler(CommandHandler("heartbeat", self._forward_command))
         self._app.add_handler(CommandHandler("help", self._on_help))
@@ -399,6 +411,10 @@ class TelegramChannel(BaseChannel):
         except ValueError:
             logger.error("Invalid chat_id: {}", msg.chat_id)
             return
+
+        if msg.metadata.get("_subagent_spawned", False):
+            await self.mark_subagent_waiting(msg.chat_id)
+
         reply_to_message_id = msg.metadata.get("message_id")
         message_thread_id = msg.metadata.get("message_thread_id")
         if message_thread_id is None and reply_to_message_id is not None:
@@ -480,11 +496,20 @@ class TelegramChannel(BaseChannel):
                 else:
                     logger.warning("Failed to edit reply markup: {}", e)
 
+        if not msg.metadata.get("_progress", False):
+            await self._finalize_status_reaction(msg.chat_id)
+
     async def _call_with_retry(self, fn, *args, **kwargs):
-        """Call an async Telegram API function with retry on pool/network timeout."""
+        """Call an async Telegram API function with retry on pool/network timeout.
+
+        RetryAfter (flood control) is re-raised immediately so the
+        ChannelManager can honour the exact back-off time Telegram requests.
+        """
         for attempt in range(1, _SEND_MAX_RETRIES + 1):
             try:
                 return await fn(*args, **kwargs)
+            except RetryAfter:
+                raise  # let ChannelManager handle flood control
             except TimedOut:
                 if attempt == _SEND_MAX_RETRIES:
                     raise
@@ -837,6 +862,70 @@ class TelegramChannel(BaseChannel):
             session_key=self._derive_topic_session_key(message),
         )
 
+    @staticmethod
+    def _format_elapsed(elapsed_seconds: float) -> str:
+        """Format elapsed seconds for status output."""
+        elapsed = max(0, int(elapsed_seconds))
+        minutes, seconds = divmod(elapsed, 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            return f"{hours}h {minutes}m {seconds}s"
+        if minutes:
+            return f"{minutes}m {seconds}s"
+        return f"{seconds}s"
+
+    def _build_subagent_section(self) -> str:
+        """Build a status section listing active subagents and loop tasks."""
+        lines: list[str] = []
+        if self._subagent_manager is not None:
+            count = self._subagent_manager.get_running_count()
+            if count > 0:
+                lines.append(f"Субагенты ({count}):")
+                for item in self._subagent_manager.get_active_tasks():
+                    executor = item.get("executor") or "default"
+                    elapsed = self._format_elapsed(item.get("elapsed_seconds", 0.0))
+                    lines.append(f"  • {item.get('label', item.get('task_id', 'task'))} [{executor}] {elapsed}")
+
+        if self._agent_loop is not None and hasattr(self._agent_loop, "get_active_tasks"):
+            loop_tasks = self._agent_loop.get_active_tasks()
+            if loop_tasks:
+                lines.append(f"Активные запросы ({len(loop_tasks)}):")
+                for item in loop_tasks:
+                    elapsed = self._format_elapsed(item.get("elapsed_seconds", 0.0))
+                    lines.append(f"  • {item.get('session_key', 'unknown')} {elapsed}")
+
+        return "\n".join(lines)
+
+    async def _on_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /status — enrich standard status with subagent info."""
+        del context
+        if not update.message:
+            return
+
+        # Delegate to standard cmd_status via bus (it shows version, model, uptime, etc.)
+        chat_id = str(update.effective_chat.id)
+        message_thread_id = update.message.message_thread_id
+        await self.bus.publish_inbound(
+            InboundMessage(
+                channel="telegram",
+                sender_id=str(update.effective_user.id) if update.effective_user else "unknown",
+                chat_id=chat_id,
+                content="/status",
+                metadata={"message_thread_id": message_thread_id} if message_thread_id else {},
+                session_key_override=(
+                    f"telegram:{chat_id}:topic:{message_thread_id}"
+                    if message_thread_id
+                    else f"telegram:{chat_id}"
+                ),
+            )
+        )
+
+        # Also send subagent section as a follow-up if there are active tasks
+        subagent_section = self._build_subagent_section()
+        if subagent_section:
+            await asyncio.sleep(0.5)  # slight delay so it arrives after main status
+            await update.message.reply_text(subagent_section)
+
     async def _on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming messages (text, photos, voice, documents)."""
         if not update.message or not update.effective_user:
@@ -901,9 +990,11 @@ class TelegramChannel(BaseChannel):
                     "contents": [], "media": [],
                     "metadata": metadata,
                     "session_key": session_key,
+                    "message_id": message.message_id,
                 }
                 self._start_typing(str_chat_id)
                 await self._add_reaction(str_chat_id, message.message_id, self.config.react_emoji)
+                await self._mark_processing(str_chat_id, message.message_id)
             buf = self._media_group_buffers[key]
             if content and content != "[empty message]":
                 buf["contents"].append(content)
@@ -915,6 +1006,7 @@ class TelegramChannel(BaseChannel):
         # Start typing indicator before processing
         self._start_typing(str_chat_id)
         await self._add_reaction(str_chat_id, message.message_id, self.config.react_emoji)
+        await self._mark_processing(str_chat_id, message.message_id)
 
         # Forward to the message bus
         await self._handle_message(
@@ -958,14 +1050,47 @@ class TelegramChannel(BaseChannel):
         """Add emoji reaction to a message (best-effort, non-blocking)."""
         if not self._app or not emoji:
             return
+        await self._set_reactions(chat_id, message_id, {emoji})
+
+    async def _set_reactions(self, chat_id: str, message_id: int, emojis: set[str]) -> None:
+        """Set the full reaction list on a message."""
+        if not self._app:
+            return
         try:
             await self._app.bot.set_message_reaction(
                 chat_id=int(chat_id),
                 message_id=message_id,
-                reaction=[ReactionTypeEmoji(emoji=emoji)],
+                reaction=[ReactionTypeEmoji(emoji=emoji) for emoji in sorted(emojis)],
             )
+            self._status_reactions[(chat_id, message_id)] = set(emojis)
         except Exception as e:
             logger.debug("Telegram reaction failed: {}", e)
+
+    async def _set_status_emoji(self, chat_id: str, message_id: int, emoji: str) -> None:
+        """Add or replace known status reactions on the tracked inbound message."""
+        current = set(self._status_reactions.get((chat_id, message_id), set()))
+        current.discard("👀")
+        current.discard("⏳")
+        current.discard("✅")
+        current.add(emoji)
+        await self._set_reactions(chat_id, message_id, current)
+
+    async def _mark_processing(self, chat_id: str, message_id: int) -> None:
+        """Remember the inbound message and mark it as processing."""
+        self._processing_messages[chat_id] = message_id
+        await self._set_status_emoji(chat_id, message_id, "👀")
+
+    async def mark_subagent_waiting(self, chat_id: str) -> None:
+        """Mark the tracked inbound message as waiting on a subagent."""
+        if message_id := self._processing_messages.get(chat_id):
+            await self._set_status_emoji(chat_id, message_id, "⏳")
+
+    async def _finalize_status_reaction(self, chat_id: str) -> None:
+        """Mark the tracked inbound message as completed."""
+        message_id = self._processing_messages.pop(chat_id, None)
+        if message_id is None:
+            return
+        await self._set_status_emoji(chat_id, message_id, "✅")
 
     async def _typing_loop(self, chat_id: str) -> None:
         """Repeatedly send 'typing' action until cancelled."""

@@ -28,7 +28,12 @@ def _make_workspace(tmp_path: Path) -> Path:
 def test_bootstrap_files_are_backed_by_templates() -> None:
     template_dir = pkg_files("nanobot") / "templates"
 
+    # AGENT_RULES.md is workspace-only (no runtime template fallback)
+    workspace_only = {"AGENT_RULES.md"}
+
     for filename in ContextBuilder.BOOTSTRAP_FILES:
+        if filename in workspace_only:
+            continue
         assert (template_dir / filename).is_file(), f"missing bootstrap template: {filename}"
 
 

@@ -3,12 +3,44 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
+from pathlib import Path
 
 from nanobot import __version__
 from nanobot.command.router import CommandContext, CommandRouter
 from nanobot.utils.helpers import build_status_content
+
+
+def _load_health_summary(workspace: Path | None) -> str | None:
+    """Load the compact workspace health summary for `/status`."""
+    if not isinstance(workspace, Path):
+        return None
+    path = workspace / "data" / "health" / "current_state.json"
+    if not path.exists():
+        return None
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    overall = state.get("overall", {})
+    levels = state.get("levels", {})
+    l1 = levels.get("l1", {})
+    summary = str(overall.get("summary") or "").strip()
+    queue_depth = l1.get("task_queue_depth")
+    heartbeat = l1.get("last_heartbeat_at")
+    error = (l1.get("last_error") or {}).get("category")
+    parts = [f"\u2764\ufe0f Health: {overall.get('status', 'unknown')}"]
+    if summary:
+        parts[0] += f" — {summary}"
+    detail = []
+    if heartbeat:
+        detail.append(f"heartbeat {heartbeat}")
+    if queue_depth is not None:
+        detail.append(f"queue {queue_depth}")
+    detail.append(f"last error {error or 'none'}")
+    return "\n".join([parts[0], "\U0001fa7a Snapshot: " + " | ".join(detail)])
 
 
 async def cmd_stop(ctx: CommandContext):
@@ -49,6 +81,7 @@ async def cmd_restart(ctx: CommandContext):
                         {
                             "channel": msg.channel,
                             "chat_id": msg.chat_id,
+                            "message_thread_id": (msg.metadata or {}).get("message_thread_id"),
                             "resume_prompt": resume_prompt,
                         }
                     )
@@ -86,17 +119,45 @@ async def cmd_status(ctx: CommandContext):
     except Exception:
         pass
 
-    return ctx.outbound(
-        build_status_content(
-            version=__version__, model=loop.model,
-            start_time=loop._start_time, last_usage=loop._last_usage,
-            context_window_tokens=loop.context_window_tokens,
-            session_msg_count=len(session.get_history(max_messages=0)),
-            context_tokens_estimate=ctx_est,
-            usage_snapshot=usage_snapshot,
-        ),
-        render_as="text",
+    # Refresh health state for fresh status
+    workspace = getattr(loop, "workspace", None)
+    if workspace:
+        try:
+            from nanobot_workspace.observability import build_current_state
+            await asyncio.to_thread(build_current_state, workspace)
+        except Exception:
+            pass
+
+    content = build_status_content(
+        version=__version__, model=loop.model,
+        start_time=loop._start_time, last_usage=loop._last_usage,
+        context_window_tokens=loop.context_window_tokens,
+        session_msg_count=len(session.get_history(max_messages=0)),
+        context_tokens_estimate=ctx_est,
+        usage_snapshot=usage_snapshot,
     )
+    health_summary = _load_health_summary(getattr(loop, "workspace", None))
+    if health_summary:
+        content = f"{content}\n{health_summary}"
+
+    # Executor health
+    workspace = getattr(loop, "workspace", None)
+    if workspace:
+        try:
+            from nanobot.agent.execution import get_executor_status
+            ex_status = get_executor_status(workspace)
+            if ex_status:
+                icons = {"ok": "✅", "unauthorized": "❌", "rate_limited": "⏳", "error": "⚠️"}
+                labels = {"ok": "", "unauthorized": "auth", "rate_limited": "quota", "error": ""}
+                parts = [
+                    f"{icons.get(v, '❓')} {k}" + (f" ({labels[v]})" if labels.get(v) else "")
+                    for k, v in ex_status.items()
+                ]
+                content = f"{content}\n🤖 Executors: {' | '.join(parts)}"
+        except Exception:
+            pass
+
+    return ctx.outbound(content, render_as="text")
 
 
 async def cmd_new(ctx: CommandContext):
@@ -183,9 +244,8 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.priority("/stop", cmd_stop)
     router.priority("/restart", cmd_restart)
     router.priority("/status", cmd_status)
-    router.exact("/new", cmd_new)
-    router.exact("/heartbeat", cmd_heartbeat)
-    router.exact("/status", cmd_status)
-    router.exact("/tasks", cmd_tasks)
-    router.prefix("/tasks ", cmd_tasks)
-    router.exact("/help", cmd_help)
+    router.priority("/heartbeat", cmd_heartbeat)
+    router.priority("/new", cmd_new)
+    router.priority("/tasks", cmd_tasks)
+    router.priority_prefix("/tasks ", cmd_tasks)
+    router.priority("/help", cmd_help)

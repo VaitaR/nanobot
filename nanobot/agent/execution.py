@@ -14,7 +14,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -135,6 +135,114 @@ ACPX_TIMEOUT_S: int = _DEFAULT_TIMEOUT_S
 # ---------------------------------------------------------------------------
 
 
+def get_executor_status(workspace: Path) -> dict[str, str]:
+    """Return CLI executor health from acpx telemetry.
+
+    Scans ``memory/improvement-log.jsonl`` for recent acpx session entries
+    and returns the *last known status* per agent.
+
+    Returns
+    -------
+    dict[str, str]
+        Mapping ``"codex" | "claude"`` → ``"ok" | "unauthorized" | "rate_limited" | "error"``.
+    """
+    log_path = workspace / "memory" / "improvement-log.jsonl"
+    if not log_path.exists():
+        return {}
+
+    cutoff = datetime.now(UTC) - timedelta(hours=1)
+
+    try:
+        lines = log_path.read_text(encoding="utf-8").strip().splitlines()
+    except OSError:
+        return {}
+
+    status: dict[str, str] = {}
+    for line in reversed(lines):
+        try:
+            obj = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if obj.get("session") != "acpx":
+            continue
+        model = obj.get("model", "")
+        if model not in ("codex", "claude"):
+            continue
+        if model in status:
+            continue  # already have latest
+        # Parse timestamp; skip stale entries older than 1 hour
+        ts_str = obj.get("checked_at") or obj.get("timestamp") or obj.get("created_at")
+        if ts_str:
+            try:
+                ts = datetime.fromisoformat(ts_str)
+                if ts < cutoff:
+                    continue
+            except (ValueError, TypeError):
+                pass
+        error_cat = obj.get("error_category")
+        if error_cat == "unauthorized":
+            status[model] = "unauthorized"
+        elif error_cat == "rate_limited":
+            status[model] = "rate_limited"
+        elif obj.get("stop_reason") == "completed" and not error_cat:
+            status[model] = "ok"
+        else:
+            status[model] = "error"
+
+    return status
+
+
+def _detect_acpx_error_type(
+    stdout: str, stderr: str, returncode: int
+) -> str:
+    """Classify ACPX execution errors into semantic types for fallback routing.
+
+    Returns one of: 'unauthorized', 'rate_limited', 'config', 'timeout', 'exit_nonzero', '' (success).
+    """
+    # Check for known auth error patterns in JSON-RPC error responses
+    combined = stdout + "\n" + stderr
+    combined_lower = combined.lower()
+
+    rate_limit_markers = [
+        "usage limit",
+        "rate limit",
+        "rate limited",
+        "too many requests",
+        "quota exceeded",
+        "hit your usage limit",
+    ]
+    for marker in rate_limit_markers:
+        if marker in combined_lower:
+            return "rate_limited"
+
+    auth_markers = [
+        "refresh token was already used",
+        "access token could not be refreshed",
+        "unauthorized",
+        "authentication failed",
+        "not authenticated",
+        "login required",
+        "sign in again",
+        "codex_error_info",
+    ]
+    for marker in auth_markers:
+        if marker.lower() in combined_lower:
+            return "unauthorized"
+
+    config_markers = [
+        "acpx_claude.sh not found",
+        "unknown agent:",
+        "no acpx_agent mapping",
+    ]
+    for marker in config_markers:
+        if marker.lower() in combined_lower:
+            return "config"
+
+    if returncode != 0:
+        return "exit_nonzero"
+    return ""
+
+
 def _parse_acpx_json_output(stdout: str, stderr: str, duration: float) -> DelegatedResult:
     """Parse ACPX JSON-RPC output and extract structured data.
 
@@ -163,7 +271,39 @@ def _parse_acpx_json_output(stdout: str, stderr: str, duration: float) -> Delega
             except json.JSONDecodeError:
                 continue
 
-            # Parse JSON-RPC 2.0 messages
+            msg_type = msg.get("type", "")
+
+            # Handle Codex CLI format: {"type": "error", "message": "..."}
+            if msg_type == "error":
+                has_valid_json = True
+                error_message = msg.get("message", "")
+                if error_message:
+                    error = error_message[:500]
+                continue
+
+            # Handle Codex CLI format: {"type": "turn.failed", "error": {...}}
+            if msg_type == "turn.failed":
+                has_valid_json = True
+                err_obj = msg.get("error", {})
+                if isinstance(err_obj, dict):
+                    error_message = err_obj.get("message", "")
+                    if error_message:
+                        error = error_message[:500]
+                stop_reason = "turn_failed"
+                continue
+
+            # Handle Codex CLI format: {"type": "turn.completed", ...}
+            if msg_type == "turn.completed":
+                has_valid_json = True
+                stop_reason = "end_turn"
+                continue
+
+            # Handle Codex CLI format: {"type": "thread.started", ...}
+            if msg_type == "thread.started":
+                has_valid_json = True
+                continue
+
+            # Parse JSON-RPC 2.0 messages (ACPX format)
             if msg.get("jsonrpc") == "2.0":
                 has_valid_json = True
 
@@ -339,6 +479,9 @@ async def _execute_acpx_impl(
             if not parsed._has_valid_json:
                 raise ValueError("No valid JSON-RPC messages found")
 
+            # Detect auth/config errors from JSON-RPC error responses
+            error_type = _detect_acpx_error_type(stdout, stderr, process.returncode)
+
             result = DelegatedResult(
                 success=parsed.success and (process.returncode == 0),
                 final_message=parsed.final_message,
@@ -348,7 +491,7 @@ async def _execute_acpx_impl(
                 exit_code=process.returncode,
                 stdout=stdout,
                 stderr=stderr,
-                error_type="exit_nonzero" if process.returncode != 0 else "",
+                error_type=error_type,
                 _has_valid_json=True,
             )
 

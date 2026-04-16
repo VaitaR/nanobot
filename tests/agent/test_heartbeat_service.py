@@ -3,6 +3,9 @@ from types import SimpleNamespace
 
 import pytest
 
+# Body text that makes a task "complete" (has ## Files + ## Acceptance Criteria)
+_COMPLETE_BODY = "## Description\ntest\n\n## Files\nfoo.py\n\n## Acceptance Criteria\n- passes"
+
 from nanobot.heartbeat.service import HeartbeatService
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
@@ -29,6 +32,18 @@ def stub_pending_review(monkeypatch) -> None:
         return []
 
     monkeypatch.setattr(HeartbeatService, "_fetch_pending_review", staticmethod(_empty_pending_review))
+
+
+@pytest.fixture(autouse=True)
+def stub_tasks_in_review(monkeypatch, request) -> None:
+    """Prevent real subprocess calls to nanobot-tasks in non-review-gate tests."""
+    if "review_gate" in request.node.name or "spawn_reviewer" in request.node.name:
+        return
+
+    async def _empty_tasks_in_review() -> list[dict[str, str]]:
+        return []
+
+    monkeypatch.setattr(HeartbeatService, "_fetch_tasks_in_review", staticmethod(_empty_tasks_in_review))
 
 
 @pytest.fixture(autouse=True)
@@ -66,36 +81,103 @@ async def test_start_is_idempotent(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_decide_returns_skip_when_no_tool_call(tmp_path) -> None:
-    provider = DummyProvider([LLMResponse(content="no tool call", tool_calls=[])])
+async def test_check_actionable_tasks_finds_open_unblocked(tmp_path, monkeypatch) -> None:
+    """_check_actionable_tasks returns open/unblocked tasks only."""
+    fake_tasks = [
+        SimpleNamespace(id="t1", status="open", title="Fix bug", blocked_reason=None, body=_COMPLETE_BODY),
+        SimpleNamespace(id="t2", status="blocked", title="Old audit", blocked_reason="user decision", body=""),
+        SimpleNamespace(id="t3", status="open", title="Also open", blocked_reason="", body=_COMPLETE_BODY),
+    ]
+
+    def _fake_list(self, scope):
+        return fake_tasks
+
+    monkeypatch.setattr("nanobot_workspace.tasks.store.TaskStore.list_tasks", _fake_list)
+
     service = HeartbeatService(
         workspace=tmp_path,
-        provider=provider,
+        provider=DummyProvider([]),
         model="openai/gpt-4o-mini",
     )
 
-    action, tasks, review_decisions = await service._decide("heartbeat content")
-    assert action == "skip"
-    assert tasks == ""
-    assert review_decisions == []
+    actionable, incomplete = service._check_actionable_tasks()
+    assert len(actionable) == 2
+    assert len(incomplete) == 0
+    assert actionable[0]["id"] == "t1"
+    assert actionable[1]["id"] == "t3"
 
 
 @pytest.mark.asyncio
-async def test_trigger_now_executes_when_decision_is_run(tmp_path) -> None:
+async def test_check_actionable_tasks_sorted_by_priority_then_complexity(tmp_path, monkeypatch) -> None:
+    """Actionable tasks are sorted: critical > high > normal > low, then s < m < l < xl."""
+    fake_tasks = [
+        SimpleNamespace(id="t_low", status="open", title="Low prio", blocked_reason=None, body=_COMPLETE_BODY, priority="low", complexity="m"),
+        SimpleNamespace(id="t_high", status="open", title="High prio", blocked_reason=None, body=_COMPLETE_BODY, priority="high", complexity="m"),
+        SimpleNamespace(id="t_normal_l", status="open", title="Normal prio L", blocked_reason=None, body=_COMPLETE_BODY, priority="normal", complexity="l"),
+        SimpleNamespace(id="t_normal_s", status="open", title="Normal prio S", blocked_reason=None, body=_COMPLETE_BODY, priority="normal", complexity="s"),
+        SimpleNamespace(id="t_critical", status="open", title="Critical", blocked_reason=None, body=_COMPLETE_BODY, priority="critical", complexity="xl"),
+    ]
+    monkeypatch.setattr("nanobot_workspace.tasks.store.TaskStore.list_tasks", lambda self, scope: fake_tasks)
+
+    service = HeartbeatService(workspace=tmp_path, provider=DummyProvider([]), model="test-model")
+    actionable, incomplete = service._check_actionable_tasks()
+
+    ids = [t["id"] for t in actionable]
+    assert ids == ["t_critical", "t_high", "t_normal_s", "t_normal_l", "t_low"]
+    assert incomplete == []
+
+
+@pytest.mark.asyncio
+async def test_check_actionable_tasks_missing_priority_uses_normal_default(tmp_path, monkeypatch) -> None:
+    """Tasks without priority/complexity attributes sort as 'normal'/'m'."""
+    fake_tasks = [
+        SimpleNamespace(id="t_no_attr", status="open", title="No attrs", blocked_reason=None, body=_COMPLETE_BODY),
+        SimpleNamespace(id="t_high", status="open", title="High", blocked_reason=None, body=_COMPLETE_BODY, priority="high", complexity="m"),
+    ]
+    monkeypatch.setattr("nanobot_workspace.tasks.store.TaskStore.list_tasks", lambda self, scope: fake_tasks)
+
+    service = HeartbeatService(workspace=tmp_path, provider=DummyProvider([]), model="test-model")
+    actionable, _ = service._check_actionable_tasks()
+
+    assert [t["id"] for t in actionable] == ["t_high", "t_no_attr"]
+
+
+@pytest.mark.asyncio
+async def test_check_actionable_tasks_ties_preserve_input_order(tmp_path, monkeypatch) -> None:
+    """Tasks with identical priority+complexity preserve their relative input order."""
+    fake_tasks = [
+        SimpleNamespace(id="t1", status="open", title="First", blocked_reason=None, body=_COMPLETE_BODY, priority="normal", complexity="m"),
+        SimpleNamespace(id="t2", status="open", title="Second", blocked_reason=None, body=_COMPLETE_BODY, priority="normal", complexity="m"),
+        SimpleNamespace(id="t3", status="open", title="Third", blocked_reason=None, body=_COMPLETE_BODY, priority="normal", complexity="m"),
+    ]
+    monkeypatch.setattr("nanobot_workspace.tasks.store.TaskStore.list_tasks", lambda self, scope: fake_tasks)
+
+    service = HeartbeatService(workspace=tmp_path, provider=DummyProvider([]), model="test-model")
+    actionable, _ = service._check_actionable_tasks()
+
+    assert [t["id"] for t in actionable] == ["t1", "t2", "t3"]
+
+
+@pytest.mark.asyncio
+async def test_check_actionable_tasks_returns_empty_when_no_tasks(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("nanobot_workspace.tasks.store.TaskStore.list_tasks", lambda self, scope: [])
+
+    service = HeartbeatService(
+        workspace=tmp_path,
+        provider=DummyProvider([]),
+        model="openai/gpt-4o-mini",
+    )
+
+    assert service._check_actionable_tasks() == ([], [])
+
+
+@pytest.mark.asyncio
+async def test_trigger_now_executes_when_actionable_tasks_exist(tmp_path, monkeypatch) -> None:
+    """With open/unblocked tasks, trigger_now runs Phase 2 without LLM."""
     (tmp_path / "HEARTBEAT.md").write_text("- [ ] do thing", encoding="utf-8")
 
-    provider = DummyProvider([
-        LLMResponse(
-            content="",
-            tool_calls=[
-                ToolCallRequest(
-                    id="hb_1",
-                    name="heartbeat",
-                    arguments={"action": "run", "tasks": "check open tasks"},
-                )
-            ],
-        )
-    ])
+    fake_tasks = [SimpleNamespace(id="t1", status="open", title="Fix bug", blocked_reason=None, body=_COMPLETE_BODY)]
+    monkeypatch.setattr("nanobot_workspace.tasks.store.TaskStore.list_tasks", lambda self, scope: fake_tasks)
 
     called_with: list[str] = []
 
@@ -105,40 +187,31 @@ async def test_trigger_now_executes_when_decision_is_run(tmp_path) -> None:
 
     service = HeartbeatService(
         workspace=tmp_path,
-        provider=provider,
+        provider=DummyProvider([]),  # no LLM calls needed
         model="openai/gpt-4o-mini",
         on_execute=_on_execute,
     )
 
     result = await service.trigger_now()
     assert result["action"] == "run"
-    assert result["result"] == "done"
-    assert called_with == ["check open tasks"]
+    assert result["result"] == ""
+    assert len(called_with) == 1
+    assert "do thing" in called_with[0]
 
 
 @pytest.mark.asyncio
-async def test_trigger_now_returns_none_when_decision_is_skip(tmp_path) -> None:
+async def test_trigger_now_skips_when_no_actionable_tasks(tmp_path, monkeypatch) -> None:
+    """With no open/unblocked tasks, trigger_now returns skip without LLM."""
     (tmp_path / "HEARTBEAT.md").write_text("- [ ] do thing", encoding="utf-8")
 
-    provider = DummyProvider([
-        LLMResponse(
-            content="",
-            tool_calls=[
-                ToolCallRequest(
-                    id="hb_1",
-                    name="heartbeat",
-                    arguments={"action": "skip"},
-                )
-            ],
-        )
-    ])
+    monkeypatch.setattr("nanobot_workspace.tasks.store.TaskStore.list_tasks", lambda self, scope: [])
 
     async def _on_execute(tasks: str) -> str:
-        return tasks
+        raise AssertionError("should not execute when no actionable tasks")
 
     service = HeartbeatService(
         workspace=tmp_path,
-        provider=provider,
+        provider=DummyProvider([]),
         model="openai/gpt-4o-mini",
         on_execute=_on_execute,
     )
@@ -149,21 +222,11 @@ async def test_trigger_now_returns_none_when_decision_is_skip(tmp_path) -> None:
 
 @pytest.mark.asyncio
 async def test_tick_notifies_when_evaluator_says_yes(tmp_path, monkeypatch) -> None:
-    """Phase 1 run -> Phase 2 execute -> Phase 3 evaluate=notify -> on_notify called."""
+    """Actionable tasks -> Phase 2 execute -> evaluate=notify -> on_notify called."""
     (tmp_path / "HEARTBEAT.md").write_text("- [ ] check deployments", encoding="utf-8")
 
-    provider = DummyProvider([
-        LLMResponse(
-            content="",
-            tool_calls=[
-                ToolCallRequest(
-                    id="hb_1",
-                    name="heartbeat",
-                    arguments={"action": "run", "tasks": "check deployments"},
-                )
-            ],
-        ),
-    ])
+    fake_tasks = [SimpleNamespace(id="t1", status="open", title="Fix bug", blocked_reason=None, body=_COMPLETE_BODY)]
+    monkeypatch.setattr("nanobot_workspace.tasks.store.TaskStore.list_tasks", lambda self, scope: fake_tasks)
 
     executed: list[str] = []
     notified: list[str] = []
@@ -177,7 +240,7 @@ async def test_tick_notifies_when_evaluator_says_yes(tmp_path, monkeypatch) -> N
 
     service = HeartbeatService(
         workspace=tmp_path,
-        provider=provider,
+        provider=DummyProvider([]),
         model="openai/gpt-4o-mini",
         on_execute=_on_execute,
         on_notify=_on_notify,
@@ -189,27 +252,18 @@ async def test_tick_notifies_when_evaluator_says_yes(tmp_path, monkeypatch) -> N
     monkeypatch.setattr("nanobot.utils.evaluator.evaluate_response", _eval_notify)
 
     await service._tick()
-    assert executed == ["check deployments"]
+    assert len(executed) == 1
+    assert "check deployments" in executed[0]
     assert notified == ["deployment failed on staging"]
 
 
 @pytest.mark.asyncio
 async def test_tick_suppresses_when_evaluator_says_no(tmp_path, monkeypatch) -> None:
-    """Phase 1 run -> Phase 2 execute -> Phase 3 evaluate=silent -> on_notify NOT called."""
+    """Actionable tasks -> Phase 2 execute -> evaluate=silent -> on_notify NOT called."""
     (tmp_path / "HEARTBEAT.md").write_text("- [ ] check status", encoding="utf-8")
 
-    provider = DummyProvider([
-        LLMResponse(
-            content="",
-            tool_calls=[
-                ToolCallRequest(
-                    id="hb_1",
-                    name="heartbeat",
-                    arguments={"action": "run", "tasks": "check status"},
-                )
-            ],
-        ),
-    ])
+    fake_tasks = [SimpleNamespace(id="t1", status="open", title="Fix bug", blocked_reason=None, body=_COMPLETE_BODY)]
+    monkeypatch.setattr("nanobot_workspace.tasks.store.TaskStore.list_tasks", lambda self, scope: fake_tasks)
 
     executed: list[str] = []
     notified: list[str] = []
@@ -223,7 +277,7 @@ async def test_tick_suppresses_when_evaluator_says_no(tmp_path, monkeypatch) -> 
 
     service = HeartbeatService(
         workspace=tmp_path,
-        provider=provider,
+        provider=DummyProvider([]),
         model="openai/gpt-4o-mini",
         on_execute=_on_execute,
         on_notify=_on_notify,
@@ -235,7 +289,8 @@ async def test_tick_suppresses_when_evaluator_says_no(tmp_path, monkeypatch) -> 
     monkeypatch.setattr("nanobot.utils.evaluator.evaluate_response", _eval_silent)
 
     await service._tick()
-    assert executed == ["check status"]
+    assert len(executed) == 1
+    assert "check status" in executed[0]
     assert notified == []
 
 
@@ -363,7 +418,22 @@ async def test_run_boredom_tick_does_not_block_on_background_spawn(tmp_path, mon
 
 
 @pytest.mark.asyncio
-async def test_decide_retries_transient_error_then_succeeds(tmp_path, monkeypatch) -> None:
+async def test_review_pending_returns_empty_when_no_tool_call(tmp_path) -> None:
+    """_review_pending returns [] when LLM response has no tool calls."""
+    provider = DummyProvider([LLMResponse(content="no tool call", tool_calls=[])])
+    service = HeartbeatService(
+        workspace=tmp_path,
+        provider=provider,
+        model="openai/gpt-4o-mini",
+    )
+
+    review = await service._review_pending([{"id": "t1", "title": "Test task"}])
+    assert review == []
+
+
+@pytest.mark.asyncio
+async def test_review_pending_retries_transient_error_then_succeeds(tmp_path, monkeypatch) -> None:
+    """_review_pending retries on transient LLM errors."""
     provider = DummyProvider([
         LLMResponse(content="429 rate limit", finish_reason="error"),
         LLMResponse(
@@ -372,7 +442,7 @@ async def test_decide_retries_transient_error_then_succeeds(tmp_path, monkeypatc
                 ToolCallRequest(
                     id="hb_1",
                     name="heartbeat",
-                    arguments={"action": "run", "tasks": "check open tasks"},
+                    arguments={"review_decision": [{"task_id": "t1", "verdict": "done", "note": "success"}]},
                 )
             ],
         ),
@@ -391,18 +461,17 @@ async def test_decide_retries_transient_error_then_succeeds(tmp_path, monkeypatc
         model="openai/gpt-4o-mini",
     )
 
-    action, tasks, review_decisions = await service._decide("heartbeat content")
+    review = await service._review_pending([{"id": "t1", "title": "Test task"}])
 
-    assert action == "run"
-    assert tasks == "check open tasks"
-    assert review_decisions == []
+    assert len(review) == 1
+    assert review[0]["verdict"] == "done"
     assert provider.calls == 2
     assert delays == [1]
 
 
 @pytest.mark.asyncio
-async def test_decide_prompt_includes_current_time(tmp_path) -> None:
-    """Phase 1 user prompt must contain current time so the LLM can judge task urgency."""
+async def test_review_pending_prompt_includes_current_time(tmp_path) -> None:
+    """_review_pending user prompt must contain current time for urgency judgment."""
 
     captured_messages: list[dict] = []
 
@@ -415,7 +484,7 @@ async def test_decide_prompt_includes_current_time(tmp_path) -> None:
                 tool_calls=[
                     ToolCallRequest(
                         id="hb_1", name="heartbeat",
-                        arguments={"action": "skip"},
+                        arguments={"review_decision": []},
                     )
                 ],
             )
@@ -429,7 +498,7 @@ async def test_decide_prompt_includes_current_time(tmp_path) -> None:
         model="test-model",
     )
 
-    await service._decide("- [ ] check servers at 10:00 UTC")
+    await service._review_pending([{"id": "t1", "title": "Check servers at 10:00"}])
 
     user_msg = captured_messages[1]
     assert user_msg["role"] == "user"
@@ -437,22 +506,14 @@ async def test_decide_prompt_includes_current_time(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_trigger_now_returns_structured_result(tmp_path) -> None:
+async def test_trigger_now_returns_structured_result(tmp_path, monkeypatch) -> None:
     """trigger_now always returns a dict with action, tasks, and result keys."""
     (tmp_path / "HEARTBEAT.md").write_text("- [ ] do thing", encoding="utf-8")
 
-    # --- skip path ---
-    provider_skip = DummyProvider([
-        LLMResponse(
-            content="",
-            tool_calls=[
-                ToolCallRequest(id="hb_1", name="heartbeat",
-                                arguments={"action": "skip"}),
-            ],
-        )
-    ])
+    # --- skip path (no actionable tasks) ---
+    monkeypatch.setattr("nanobot_workspace.tasks.store.TaskStore.list_tasks", lambda self, scope: [])
     service_skip = HeartbeatService(
-        workspace=tmp_path, provider=provider_skip,
+        workspace=tmp_path, provider=DummyProvider([]),
         model="openai/gpt-4o-mini",
     )
     result_skip = await service_skip.trigger_now()
@@ -460,33 +521,26 @@ async def test_trigger_now_returns_structured_result(tmp_path) -> None:
     assert result_skip["action"] == "skip"
     assert result_skip["result"] == ""
 
-    # --- run path ---
-    provider_run = DummyProvider([
-        LLMResponse(
-            content="",
-            tool_calls=[
-                ToolCallRequest(id="hb_1", name="heartbeat",
-                                arguments={"action": "run", "tasks": "fix bug"}),
-            ],
-        )
-    ])
+    # --- run path (actionable tasks exist) ---
+    fake_tasks = [SimpleNamespace(id="t1", status="open", title="fix bug", blocked_reason=None, body=_COMPLETE_BODY)]
+    monkeypatch.setattr("nanobot_workspace.tasks.store.TaskStore.list_tasks", lambda self, scope: fake_tasks)
+
     async def _exec(tasks: str) -> str:
         return "fixed"
 
     service_run = HeartbeatService(
-        workspace=tmp_path, provider=provider_run,
+        workspace=tmp_path, provider=DummyProvider([]),
         model="openai/gpt-4o-mini", on_execute=_exec,
     )
     result_run = await service_run.trigger_now()
     assert result_run["action"] == "run"
-    assert result_run["tasks"] == "fix bug"
-    assert result_run["result"] == "fixed"
+    assert result_run["result"] == ""
 
     # --- missing HEARTBEAT.md ---
     empty_dir = tmp_path / "empty"
     empty_dir.mkdir()
     service_empty = HeartbeatService(
-        workspace=empty_dir, provider=provider_skip,
+        workspace=empty_dir, provider=DummyProvider([]),
         model="openai/gpt-4o-mini",
     )
     result_empty = await service_empty.trigger_now()
@@ -498,23 +552,12 @@ async def test_trigger_now_returns_structured_result(tmp_path) -> None:
 async def test_trigger_now_notifies_when_evaluator_says_yes(tmp_path, monkeypatch) -> None:
     (tmp_path / "HEARTBEAT.md").write_text("- [ ] check deployments", encoding="utf-8")
 
-    provider = DummyProvider([
-        LLMResponse(
-            content="",
-            tool_calls=[
-                ToolCallRequest(
-                    id="hb_1",
-                    name="heartbeat",
-                    arguments={"action": "run", "tasks": "check deployments"},
-                )
-            ],
-        ),
-    ])
+    fake_tasks = [SimpleNamespace(id="t1", status="open", title="fix bug", blocked_reason=None, body=_COMPLETE_BODY)]
+    monkeypatch.setattr("nanobot_workspace.tasks.store.TaskStore.list_tasks", lambda self, scope: fake_tasks)
 
     notified: list[str] = []
 
     async def _on_execute(tasks: str) -> str:
-        assert tasks == "check deployments"
         return "deployment failed on staging"
 
     async def _on_notify(response: str) -> None:
@@ -527,7 +570,7 @@ async def test_trigger_now_notifies_when_evaluator_says_yes(tmp_path, monkeypatc
 
     service = HeartbeatService(
         workspace=tmp_path,
-        provider=provider,
+        provider=DummyProvider([]),
         model="openai/gpt-4o-mini",
         on_execute=_on_execute,
         on_notify=_on_notify,
@@ -535,8 +578,74 @@ async def test_trigger_now_notifies_when_evaluator_says_yes(tmp_path, monkeypatc
 
     result = await service.trigger_now()
     assert result["action"] == "run"
-    assert result["result"] == "deployment failed on staging"
+    assert result["result"] == ""
     assert notified == ["deployment failed on staging"]
+
+
+@pytest.mark.asyncio
+async def test_trigger_now_injects_zai_peak_instruction_into_execute_prompt(tmp_path, monkeypatch) -> None:
+    (tmp_path / "HEARTBEAT.md").write_text("- [ ] check status", encoding="utf-8")
+
+    fake_tasks = [SimpleNamespace(id="t1", status="open", title="fix bug", blocked_reason=None, body=_COMPLETE_BODY)]
+    monkeypatch.setattr("nanobot_workspace.tasks.store.TaskStore.list_tasks", lambda self, scope: fake_tasks)
+
+    prompts: list[str] = []
+
+    async def _on_execute(tasks: str) -> str:
+        prompts.append(tasks)
+        return "done"
+
+    async def _eval_silent(*a, **kw):
+        return False
+
+    monkeypatch.setattr("nanobot.utils.evaluator.evaluate_response", _eval_silent)
+    monkeypatch.setattr("nanobot.heartbeat.service.is_zai_peak", lambda: True)
+    monkeypatch.setattr("nanobot.heartbeat.service._refresh_health_state", lambda workspace: None)
+
+    service = HeartbeatService(
+        workspace=tmp_path,
+        provider=DummyProvider([]),
+        model="openai/gpt-4o-mini",
+        on_execute=_on_execute,
+    )
+
+    await service.trigger_now()
+
+    assert len(prompts) == 1
+    assert "ZAI peak hours active — model is unstable, minimize tool calls, do not spawn claude-zai subagents" in prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_trigger_now_omits_zai_peak_instruction_off_peak(tmp_path, monkeypatch) -> None:
+    (tmp_path / "HEARTBEAT.md").write_text("- [ ] check status", encoding="utf-8")
+
+    fake_tasks = [SimpleNamespace(id="t1", status="open", title="fix bug", blocked_reason=None, body=_COMPLETE_BODY)]
+    monkeypatch.setattr("nanobot_workspace.tasks.store.TaskStore.list_tasks", lambda self, scope: fake_tasks)
+
+    prompts: list[str] = []
+
+    async def _on_execute(tasks: str) -> str:
+        prompts.append(tasks)
+        return "done"
+
+    async def _eval_silent(*a, **kw):
+        return False
+
+    monkeypatch.setattr("nanobot.utils.evaluator.evaluate_response", _eval_silent)
+    monkeypatch.setattr("nanobot.heartbeat.service.is_zai_peak", lambda: False)
+    monkeypatch.setattr("nanobot.heartbeat.service._refresh_health_state", lambda workspace: None)
+
+    service = HeartbeatService(
+        workspace=tmp_path,
+        provider=DummyProvider([]),
+        model="openai/gpt-4o-mini",
+        on_execute=_on_execute,
+    )
+
+    await service.trigger_now()
+
+    assert len(prompts) == 1
+    assert "do not spawn claude-zai subagents" not in prompts[0]
 
 
 @pytest.mark.asyncio
@@ -633,6 +742,32 @@ async def test_boredom_spawn_callback_uses_runtime_fallback_chain(tmp_path) -> N
 
     assert task_id == "runtime-1"
     assert attempts == ["glm-5.1", "codex-5.4", "openrouter"]
+
+
+@pytest.mark.asyncio
+async def test_boredom_spawn_block_does_not_fallback_to_next_executor(tmp_path) -> None:
+    from nanobot.agent.subagent import PeakHoursSpawnBlockedError
+
+    provider = DummyProvider([])
+    service = HeartbeatService(workspace=tmp_path, provider=provider, model="test-model")
+    attempts: list[str] = []
+
+    async def _blocked(task: str, label: str, executor: str) -> str:
+        attempts.append(executor)
+        if executor == "claude-zai":
+            raise PeakHoursSpawnBlockedError("blocked by ZAI peak")
+        return "runtime-1"
+
+    service.set_spawn_callback(_blocked)
+
+    with pytest.raises(PeakHoursSpawnBlockedError):
+        await service._spawn_boredom_delegation(
+            "task body",
+            "boredom-idea-generation",
+            ["claude-zai", "openrouter"],
+        )
+
+    assert attempts == ["claude-zai"]
 
 
 # ---------------------------------------------------------------------------
@@ -936,3 +1071,137 @@ async def test_delegate_boredom_initiative_notifies_success_when_result_processi
     await service._delegate_boredom_initiative(_SAFE_INITIATIVE)
 
     assert completions == [(True, None)]
+
+
+# ------------------------------------------------------------------
+# Review gate tests
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_review_gate_spawns_reviewer_for_tasks_in_review(tmp_path, monkeypatch) -> None:
+    """_run_tick spawns a reviewer subagent for each task with status='review'."""
+    (tmp_path / "HEARTBEAT.md").write_text("# Heartbeat", encoding="utf-8")
+    (tmp_path / "skills" / "reviewer").mkdir(parents=True)
+    (tmp_path / "skills" / "reviewer" / "SKILL.md").write_text("# Reviewer instructions", encoding="utf-8")
+
+    review_tasks = [{"id": "20260415T120000_review_me", "title": "Review me"}]
+
+    async def _fake_tasks_in_review() -> list[dict[str, str]]:
+        return review_tasks
+
+    monkeypatch.setattr(HeartbeatService, "_fetch_tasks_in_review", staticmethod(_fake_tasks_in_review))
+    monkeypatch.setattr("nanobot_workspace.tasks.store.TaskStore.list_tasks", lambda self, scope: [])
+
+    spawned: list[tuple[str, str, str]] = []
+
+    async def _fake_spawn_cb(prompt: str, label: str, executor: str) -> str:
+        spawned.append((prompt, label, executor))
+        return "spawned"
+
+    service = HeartbeatService(
+        workspace=tmp_path,
+        provider=DummyProvider([]),
+        model="test-model",
+    )
+    service._spawn_reviewer_cb = _fake_spawn_cb
+
+    await service._run_tick()
+
+    assert len(spawned) == 1
+    prompt, label, executor = spawned[0]
+    assert "20260415T120000_review_me" in prompt
+    assert "review: 20260415T120000_review_me" == label
+    assert executor == "glm-turbo"
+    assert "Reviewer instructions" in prompt
+
+
+@pytest.mark.asyncio
+async def test_review_gate_skips_spawn_when_no_tasks_in_review(tmp_path, monkeypatch) -> None:
+    """_run_tick does not spawn reviewers when no tasks are in 'review' status."""
+    (tmp_path / "HEARTBEAT.md").write_text("# Heartbeat", encoding="utf-8")
+
+    async def _empty_tasks_in_review() -> list[dict[str, str]]:
+        return []
+
+    monkeypatch.setattr(HeartbeatService, "_fetch_tasks_in_review", staticmethod(_empty_tasks_in_review))
+    monkeypatch.setattr("nanobot_workspace.tasks.store.TaskStore.list_tasks", lambda self, scope: [])
+
+    spawned: list[tuple] = []
+
+    async def _fake_spawn_cb(prompt: str, label: str, executor: str) -> str:
+        spawned.append((prompt, label, executor))
+        return "spawned"
+
+    service = HeartbeatService(
+        workspace=tmp_path,
+        provider=DummyProvider([]),
+        model="test-model",
+    )
+    service._spawn_reviewer_cb = _fake_spawn_cb
+
+    await service._run_tick()
+
+    assert spawned == []
+
+
+@pytest.mark.asyncio
+async def test_spawn_reviewer_skips_without_delegation_cb(tmp_path) -> None:
+    """_spawn_reviewer is a no-op when _spawn_reviewer_cb is None."""
+    service = HeartbeatService(
+        workspace=tmp_path,
+        provider=DummyProvider([]),
+        model="test-model",
+    )
+    # _spawn_reviewer_cb defaults to None; should not raise
+    await service._spawn_reviewer({"id": "20260415T120000_no_cb", "title": "No callback"})
+
+
+@pytest.mark.asyncio
+async def test_spawn_reviewer_includes_skill_instructions_when_skill_file_exists(tmp_path) -> None:
+    """_spawn_reviewer includes SKILL.md content in the prompt."""
+    skill_dir = tmp_path / "skills" / "reviewer"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("# Custom review skill\nRun ruff first.", encoding="utf-8")
+
+    spawned_prompts: list[str] = []
+
+    async def _fake_spawn_cb(prompt: str, label: str, executor: str) -> str:
+        spawned_prompts.append(prompt)
+        return "spawned"
+
+    service = HeartbeatService(
+        workspace=tmp_path,
+        provider=DummyProvider([]),
+        model="test-model",
+    )
+    service._spawn_reviewer_cb = _fake_spawn_cb
+
+    await service._spawn_reviewer({"id": "20260415T120000_skill_test", "title": "Skill test"})
+
+    assert len(spawned_prompts) == 1
+    assert "Custom review skill" in spawned_prompts[0]
+    assert "Run ruff first." in spawned_prompts[0]
+    assert "20260415T120000_skill_test" in spawned_prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_spawn_reviewer_gracefully_handles_missing_skill_file(tmp_path) -> None:
+    """_spawn_reviewer still spawns even if SKILL.md doesn't exist."""
+    spawned: list[tuple] = []
+
+    async def _fake_spawn_cb(prompt: str, label: str, executor: str) -> str:
+        spawned.append((prompt, label, executor))
+        return "spawned"
+
+    service = HeartbeatService(
+        workspace=tmp_path,
+        provider=DummyProvider([]),
+        model="test-model",
+    )
+    service._spawn_reviewer_cb = _fake_spawn_cb
+
+    await service._spawn_reviewer({"id": "20260415T120000_no_skill", "title": "No skill file"})
+
+    assert len(spawned) == 1
+    assert spawned[0][2] == "glm-turbo"

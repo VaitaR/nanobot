@@ -85,13 +85,13 @@ class TestBuildCmd:
         args = "update '20260329T140912_add_fts5' --status in_progress --reason 'delegated'"
         cmd = _build_cmd(args)
         assert cmd.startswith("cd ")
-        assert "uv run nanobot-tasks" in cmd
+        assert "python3 -m nanobot_workspace.tasks.cli" in cmd
         assert args in cmd
 
     def test_event_command(self):
         args = "event '20260329T140912_add_fts5' 'delegation completed successfully'"
         cmd = _build_cmd(args)
-        assert "uv run nanobot-tasks event" in cmd
+        assert "python3 -m nanobot_workspace.tasks.cli event" in cmd
 
 
 # ── CLI bridge (mocked subprocess) ──────────────────────────────────────────

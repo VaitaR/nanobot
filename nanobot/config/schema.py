@@ -73,10 +73,19 @@ class AgentDefaults(Base):
     compaction: CompactionConfig = Field(default_factory=CompactionConfig)
 
 
+class SubagentConfig(Base):
+    """Subagent execution timeouts."""
+
+    hard_cap: int = Field(default=1800, ge=1)
+    idle_timeout: int = Field(default=1200, ge=1)
+    watchdog_poll_interval: int = Field(default=30, ge=1)
+
+
 class AgentsConfig(Base):
     """Agent configuration."""
 
     defaults: AgentDefaults = Field(default_factory=AgentDefaults)
+    subagent: SubagentConfig = Field(default_factory=SubagentConfig)
 
 
 class ProviderConfig(Base):
@@ -315,3 +324,6 @@ class Config(BaseSettings):
         return None
 
     model_config = ConfigDict(env_prefix="NANOBOT_", env_nested_delimiter="__")
+
+
+ConfigSchema = Config

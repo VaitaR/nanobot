@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from nanobot.bus.events import InboundMessage, OutboundMessage
+from nanobot.bus.events import InboundMessage
 from nanobot.providers.base import LLMResponse
 
 
@@ -22,6 +25,22 @@ def _make_loop():
     provider.get_default_model.return_value = "test-model"
     workspace = MagicMock()
     workspace.__truediv__ = MagicMock(return_value=MagicMock())
+
+    with patch("nanobot.agent.loop.ContextBuilder"), \
+         patch("nanobot.agent.loop.SessionManager"), \
+         patch("nanobot.agent.loop.SubagentManager"):
+        loop = AgentLoop(bus=bus, provider=provider, workspace=workspace)
+    return loop, bus
+
+
+def _make_loop_with_workspace(workspace: Path):
+    """Create a minimal AgentLoop with a real workspace path."""
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.queue import MessageBus
+
+    bus = MessageBus()
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
 
     with patch("nanobot.agent.loop.ContextBuilder"), \
          patch("nanobot.agent.loop.SessionManager"), \
@@ -47,6 +66,31 @@ class TestRestartCommand:
 
             await asyncio.sleep(1.5)
             mock_execv.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_restart_writes_topic_to_restart_pending_marker(self, tmp_path: Path):
+        from nanobot.command.builtin import cmd_restart
+        from nanobot.command.router import CommandContext
+
+        loop = SimpleNamespace(workspace=tmp_path)
+        msg = InboundMessage(
+            channel="telegram",
+            sender_id="u1",
+            chat_id="chat-1",
+            content="/restart",
+            metadata={"message_thread_id": "42"},
+        )
+        ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw="/restart", loop=loop)
+
+        with patch("nanobot.command.builtin.os.execv"):
+            out = await cmd_restart(ctx)
+            assert "Restarting" in out.content
+            await asyncio.sleep(1.5)
+
+        payload = json.loads((tmp_path / "restart_pending.json").read_text())
+        assert payload["channel"] == "telegram"
+        assert payload["chat_id"] == "chat-1"
+        assert payload["message_thread_id"] == "42"
 
     @pytest.mark.asyncio
     async def test_restart_intercepted_in_run_loop(self):
@@ -79,7 +123,8 @@ class TestRestartCommand:
         msg = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="/status")
 
         with patch.object(loop, "_dispatch", new_callable=AsyncMock) as mock_dispatch, \
-             patch("nanobot_workspace.observability.usage_tracker.run_checks", return_value=[]):
+             patch("nanobot_workspace.observability.usage_tracker.run_checks", return_value=[]), \
+             patch("nanobot_workspace.observability.usage_tracker.load_latest_snapshot", return_value=None):
             await bus.publish_inbound(msg)
 
             loop._running = True
@@ -190,6 +235,61 @@ class TestRestartCommand:
 
         assert response is not None
         assert response.metadata == {"render_as": "text"}
+
+    @pytest.mark.asyncio
+    async def test_process_message_persists_last_active_session(self, tmp_path: Path):
+        loop, _bus = _make_loop_with_workspace(tmp_path)
+        session = MagicMock()
+        loop.sessions.get_or_create.return_value = session
+
+        response = await loop._process_message(
+            InboundMessage(
+                channel="telegram",
+                sender_id="u1",
+                chat_id="c1",
+                content="/help",
+                metadata={"message_thread_id": "77"},
+            )
+        )
+
+        assert response is not None
+        payload = json.loads((tmp_path / "data" / "last_active_session.json").read_text())
+        assert payload["channel"] == "telegram"
+        assert payload["chat_id"] == "c1"
+        assert payload["message_thread_id"] == "77"
+
+    def test_consume_restart_resume_payload_falls_back_to_last_active_session(self, tmp_path: Path):
+        from nanobot.cli.commands import _consume_restart_resume_payload
+
+        (tmp_path / "data").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "data" / "last_active_session.json").write_text(
+            json.dumps(
+                {
+                    "channel": "telegram",
+                    "chat_id": "fallback-chat",
+                    "message_thread_id": "9",
+                    "timestamp": "2026-04-14T17:34:59+00:00",
+                }
+            )
+        )
+
+        payload = _consume_restart_resume_payload(tmp_path)
+
+        assert payload is not None
+        assert payload["channel"] == "telegram"
+        assert payload["chat_id"] == "fallback-chat"
+        assert payload["message_thread_id"] == "9"
+        assert "Gateway restart complete" in (payload["resume_prompt"] or "")
+
+    def test_record_cli_last_active_session_persists_restart_fallback(self, tmp_path: Path):
+        from nanobot.cli.commands import _record_cli_last_active_session
+
+        _record_cli_last_active_session(tmp_path, "cli", "direct")
+
+        payload = json.loads((tmp_path / "data" / "last_active_session.json").read_text())
+        assert payload["channel"] == "cli"
+        assert payload["chat_id"] == "direct"
+        assert payload["message_thread_id"] is None
 
     @pytest.mark.asyncio
     async def test_tasks_handles_missing_workspace_dependency(self):

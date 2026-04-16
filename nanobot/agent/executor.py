@@ -57,7 +57,7 @@ _EXECUTOR_REGISTRY: dict[str, tuple[str, str, str, str | None]] = {
     # alias: (config provider key, default model, mode, acpx_agent)
     "glm-turbo": ("custom", "glm-5-turbo", "api", None),
     "glm-5.1": ("custom", "glm-5.1", "api", None),
-    "openrouter": ("openrouter", "stepfun/step-3.5-flash", "api", None),
+    "openrouter": ("openrouter", "google/gemma-4-26b-a4b-it:free", "api", None),
     # CLI-based — routed through ACPX subprocess
     "claude-native": ("", "claude-sonnet-4-20250514", "cli", "claude"),
     "claude-zai": ("", "claude-sonnet-4-20250514", "cli", "claude"),

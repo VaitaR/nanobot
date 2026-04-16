@@ -18,14 +18,10 @@ logger = logging.getLogger(__name__)
 # ── Task ID extraction ──────────────────────────────────────────────────────
 
 # nanobot-tasks IDs look like: 20260329T140912_phase_2_add_fts5_memory_search
-_TASK_ID_RE = re.compile(
-    r"\b(\d{8}T\d{6}_[a-z0-9_]{3,})\b"
-)
+_TASK_ID_RE = re.compile(r"\b(\d{8}T\d{6}_[a-z0-9_]{3,})\b")
 
 # Parenthetical hints: "(hb: 152315)" or "(task: 20260329T140912_phase_2_add_fts5_memory_search)"
-_PAREN_HINT_RE = re.compile(
-    r"\(\s*(?:hb|task)\s*:\s*(\S+?)\s*\)"
-)
+_PAREN_HINT_RE = re.compile(r"\(\s*(?:hb|task)\s*:\s*(\S+?)\s*\)")
 
 
 def extract_task_id(label: str) -> str | None:
@@ -60,7 +56,7 @@ def extract_task_id(label: str) -> str | None:
 # ── CLI bridge ───────────────────────────────────────────────────────────────
 
 _WORKSPACE_DIR = Path.home() / ".nanobot" / "workspace"
-_NANOBOT_TASKS_CMD = "uv run nanobot-tasks"
+_NANOBOT_TASKS_CMD = "python3 -m nanobot_workspace.tasks.cli"
 
 
 def _build_cmd(args: str) -> str:
@@ -101,20 +97,31 @@ async def mark_task_delegated(task_id: str) -> bool:
     Returns True if at least one CLI call succeeded.
     """
     # Update status to in_progress
-    status_ok = await _run_cli(f"update {shlex.quote(task_id)} --status in_progress --reason 'delegated to subagent'")
+    status_ok = await _run_cli(
+        f"update {shlex.quote(task_id)} --status in_progress --reason 'delegated to subagent'"
+    )
     # Add a typed event
-    event_ok = await _run_cli(f"event {shlex.quote(task_id)} 'delegated to subagent' --kind delegated")
+    event_ok = await _run_cli(
+        f"event {shlex.quote(task_id)} 'delegated to subagent' --kind delegated"
+    )
     return status_ok or event_ok
 
 
 async def mark_task_delegation_success(task_id: str) -> bool:
     """Record successful delegation completion on a task.
 
-    Does NOT close the task — the coordinator decides that.
+    Updates status to 'review' and records a progress event.
+    The coordinator reviews and closes the task.
     """
-    return await _run_cli(
-        f"event {shlex.quote(task_id)} 'delegation completed successfully' --kind progress"
+    # Update status to review
+    status_ok = await _run_cli(
+        f"update {shlex.quote(task_id)} --status review --reason 'delegation completed by subagent, ready for review'"
     )
+    # Add a typed event
+    event_ok = await _run_cli(
+        f"event {shlex.quote(task_id)} 'delegation completed successfully, moved to review' --kind progress"
+    )
+    return status_ok or event_ok
 
 
 async def mark_task_delegation_failure(task_id: str, reason: str) -> bool:
@@ -149,6 +156,7 @@ async def query_pending_review() -> list[dict[str, str]]:
             logger.warning("query_pending_review: list failed: %s", stderr.decode(errors="replace"))
             return []
         import json
+
         tasks = json.loads(stdout.decode("utf-8"))
     except Exception as exc:
         logger.warning("query_pending_review error: %s", exc)
@@ -166,6 +174,7 @@ async def query_pending_review() -> list[dict[str, str]]:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
         if proc.returncode == 0:
             import json
+
             open_tasks = json.loads(stdout.decode("utf-8"))
             known_ids = {t["id"] for t in tasks}
             for t in open_tasks:
@@ -190,10 +199,39 @@ async def query_pending_review() -> list[dict[str, str]]:
             has_delegated = "[delegated]" in content
             has_success = "delegation completed successfully" in content
             if has_delegated and has_success:
-                pending.append({"id": tid, "title": task.get("title", ""), "status": task.get("status", "")})
+                pending.append(
+                    {"id": tid, "title": task.get("title", ""), "status": task.get("status", "")}
+                )
         except Exception:
             pass
     return pending
+
+
+async def query_tasks_in_review() -> list[dict[str, str]]:
+    """Find tasks with status 'review' awaiting independent verification.
+
+    Returns a list of dicts with keys: id, title.
+    """
+    cmd = _build_cmd("list --status review --json")
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        if proc.returncode != 0:
+            logger.warning(
+                "query_tasks_in_review: list failed: %s", stderr.decode(errors="replace")
+            )
+            return []
+        import json
+
+        tasks = json.loads(stdout.decode("utf-8"))
+        return [{"id": t["id"], "title": t.get("title", "")} for t in tasks]
+    except Exception as exc:
+        logger.warning("query_tasks_in_review error: %s", exc)
+        return []
 
 
 async def close_task(task_id: str, validation_note: str) -> bool:
@@ -202,6 +240,4 @@ async def close_task(task_id: str, validation_note: str) -> bool:
     Returns True if the command succeeded.
     """
     safe_note = validation_note[:300]
-    return await _run_cli(
-        f"done {shlex.quote(task_id)} --validation-note {shlex.quote(safe_note)}"
-    )
+    return await _run_cli(f"done {shlex.quote(task_id)} --validation-note {shlex.quote(safe_note)}")

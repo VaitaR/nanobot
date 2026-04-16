@@ -6,6 +6,8 @@ import asyncio
 import json
 import time
 import uuid
+from collections import deque
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -18,6 +20,7 @@ if TYPE_CHECKING:
 
 from loguru import logger
 from nanobot_workspace.agent.exec_tier_gate import DEFAULT_SUBAGENT_MAX_TIER
+from nanobot_workspace.core.peak_hours import is_claude_peak, is_zai_peak
 from nanobot_workspace.tasks.concurrency import ConcurrencyGuard, FileConflictError
 
 from nanobot.agent.hook import AgentHook, AgentHookContext
@@ -44,6 +47,185 @@ from nanobot.providers.base import LLMProvider
 _SUBAGENT_HARD_CAP = 1800  # 30 min absolute maximum
 _SUBAGENT_IDLE_TIMEOUT = 600  # 10 min no progress = dead
 _WATCHDOG_POLL_INTERVAL = 30  # seconds between idle-activity checks
+_LOW_ITERATION_WINDOW = 600
+_HIGH_ITERATION_WINDOW = 300
+_MIN_HEALTHY_ITERATIONS = 3
+_HIGH_ITERATION_THRESHOLD = 5
+_HIGH_ITERATION_EXTENSION_FACTOR = 0.5
+_LONG_RUNNING_EXTENSION = 600
+_READ_ONLY_IDLE_TOOLS = frozenset({"read_file", "list_dir"})
+_LONG_RUNNING_IDLE_TOOLS = frozenset({"exec", "spawn"})
+
+# Executor fallback chain — tried in order when primary executor fails
+# with an unrecoverable error (auth, config, etc.).
+_EXECUTOR_FALLBACK_CHAIN: list[str] = [
+    "claude-zai",
+    "claude-native",
+    "glm-5.1",
+]
+
+# Error types that trigger executor fallback (vs. task failure)
+_FALLBACK_ERROR_TYPES = frozenset({"unauthorized", "rate_limited", "config", "config_error"})
+
+
+class PeakHoursSpawnBlockedError(RuntimeError):
+    """Raised when an executor is blocked by peak-hours policy."""
+
+
+@dataclass(slots=True)
+class _WatchdogSnapshot:
+    """Current watchdog decision inputs."""
+
+    idle_for: float
+    no_progress_for: float
+    iterations_last_10m: int
+    iterations_last_5m: int
+    effective_timeout: float
+    extension_reasons: tuple[str, ...] = ()
+    recent_tool_names: tuple[str, ...] = ()
+    last_progress_reason: str = "none"
+
+
+@dataclass(slots=True)
+class _SubagentWatchdogState:
+    """Cheap state container for adaptive watchdog decisions."""
+
+    last_activity: float
+    last_progress: float
+    workspace: Path | None = None
+    iteration_times: deque[float] = field(default_factory=deque)
+    recent_tool_names: deque[tuple[float, str]] = field(default_factory=deque)
+    tracked_paths: dict[str, float] = field(default_factory=dict)
+    last_long_running_tool: float | None = None
+    last_progress_reason: str = "startup"
+
+    def record_tool_calls(self, tool_calls: list[Any], now: float) -> None:
+        """Record a new tool iteration."""
+        self.last_activity = now
+        self.iteration_times.append(now)
+        for tool_call in tool_calls:
+            tool_name = getattr(tool_call, "name", "")
+            if not tool_name:
+                continue
+            self.recent_tool_names.append((now, tool_name))
+            if tool_name in _LONG_RUNNING_IDLE_TOOLS:
+                self.last_long_running_tool = now
+
+    def record_iteration_result(self, tool_events: list[dict[str, Any]], now: float) -> None:
+        """Record post-tool progress signals."""
+        self.last_activity = now
+        progress_reasons = self._collect_progress_reasons(tool_events)
+        if progress_reasons:
+            self.last_progress = now
+            self.last_progress_reason = ", ".join(progress_reasons)
+        self._trim(now)
+
+    def snapshot(self, now: float, idle_timeout: int) -> _WatchdogSnapshot:
+        """Return derived metrics used by the adaptive watchdog."""
+        self._trim(now)
+        iterations_last_10m = sum(ts >= now - _LOW_ITERATION_WINDOW for ts in self.iteration_times)
+        iterations_last_5m = sum(ts >= now - _HIGH_ITERATION_WINDOW for ts in self.iteration_times)
+        recent_tool_names = tuple(
+            name for ts, name in self.recent_tool_names if ts >= now - _HIGH_ITERATION_WINDOW
+        )
+
+        effective_timeout = float(idle_timeout)
+        extension_reasons: list[str] = []
+
+        if iterations_last_5m > _HIGH_ITERATION_THRESHOLD:
+            effective_timeout += idle_timeout * _HIGH_ITERATION_EXTENSION_FACTOR
+            extension_reasons.append("high_iteration_rate")
+
+        if self.last_long_running_tool is not None and (
+            now - self.last_long_running_tool
+        ) <= max(idle_timeout + _LONG_RUNNING_EXTENSION, _LOW_ITERATION_WINDOW):
+            effective_timeout += _LONG_RUNNING_EXTENSION
+            extension_reasons.append("long_running_tool")
+
+        return _WatchdogSnapshot(
+            idle_for=now - self.last_activity,
+            no_progress_for=now - self.last_progress,
+            iterations_last_10m=iterations_last_10m,
+            iterations_last_5m=iterations_last_5m,
+            effective_timeout=effective_timeout,
+            extension_reasons=tuple(extension_reasons),
+            recent_tool_names=recent_tool_names,
+            last_progress_reason=self.last_progress_reason,
+        )
+
+    def _trim(self, now: float) -> None:
+        cutoff = now - max(_LOW_ITERATION_WINDOW, _HIGH_ITERATION_WINDOW)
+        while self.iteration_times and self.iteration_times[0] < cutoff:
+            self.iteration_times.popleft()
+        while self.recent_tool_names and self.recent_tool_names[0][0] < cutoff:
+            self.recent_tool_names.popleft()
+
+    def _collect_progress_reasons(self, tool_events: list[dict[str, Any]]) -> list[str]:
+        reasons: list[str] = []
+        for event in tool_events:
+            tool_name = str(event.get("name", ""))
+            if _tool_event_counts_as_progress(event):
+                reasons.append(f"tool:{tool_name}")
+            if self._record_file_progress(event):
+                reasons.append(f"file_change:{tool_name}")
+            if extract_artifacts([event]):
+                reasons.append(f"artifact:{tool_name}")
+        # Preserve order while deduplicating repeated signals from the same iteration.
+        return list(dict.fromkeys(reasons))
+
+    def _record_file_progress(self, event: dict[str, Any]) -> bool:
+        changed = False
+        for path in self._iter_progress_paths(event):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            path_key = str(path)
+            previous_mtime = self.tracked_paths.get(path_key)
+            current_mtime = stat.st_mtime
+            self.tracked_paths[path_key] = current_mtime
+            if previous_mtime is None or current_mtime > previous_mtime:
+                changed = True
+        return changed
+
+    def _iter_progress_paths(self, event: dict[str, Any]) -> list[Path]:
+        arguments = event.get("arguments") or {}
+        raw_paths: list[str] = []
+        for key in ("path", "file_path"):
+            value = arguments.get(key)
+            if isinstance(value, str) and value:
+                raw_paths.append(value)
+        raw_paths.extend(artifact.path for artifact in extract_artifacts([event]) if artifact.path)
+
+        paths: list[Path] = []
+        for raw_path in raw_paths:
+            path = Path(raw_path).expanduser()
+            if not path.is_absolute() and self.workspace is not None:
+                path = self.workspace / path
+            paths.append(path)
+        return paths
+
+
+def _tool_event_counts_as_progress(event: dict[str, Any]) -> bool:
+    """Return whether a tool result should keep the watchdog alive."""
+    if event.get("status") != "ok":
+        return False
+
+    name = event.get("name", "")
+    if name in _READ_ONLY_IDLE_TOOLS:
+        return False
+
+    arguments = event.get("arguments") or {}
+    if name in {"write_file", "edit_file"} and (
+        arguments.get("path") or arguments.get("file_path")
+    ):
+        return True
+
+    if name in _LONG_RUNNING_IDLE_TOOLS:
+        return True
+
+    detail = event.get("detail")
+    return bool(detail or extract_artifacts([event]))
 
 
 def _write_subagent_telemetry(
@@ -122,6 +304,7 @@ class SubagentManager:
         self.runner = AgentRunner(provider)
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
+        self._task_info: dict[str, dict[str, Any]] = {}
         self._checkpoint_brokers: dict[str, Any] = {}  # task_id -> CheckpointBroker
         self._boredom_callback_tasks: set[asyncio.Task[None]] = set()
         self._concurrency_guard = ConcurrencyGuard(max_concurrency=1)
@@ -174,6 +357,40 @@ class SubagentManager:
         )
         self._boredom_callback_tasks.add(callback_task)
         callback_task.add_done_callback(self._boredom_callback_tasks.discard)
+
+    @staticmethod
+    def _resolve_subagent_watchdog_settings(
+        requested_hard_cap: int,
+        requested_idle_timeout: int,
+    ) -> tuple[int, int, int]:
+        """Resolve runtime timeout settings with config-aware backward compatibility."""
+        resolved_hard_cap = requested_hard_cap
+        resolved_idle_timeout = requested_idle_timeout
+        resolved_poll_interval = _WATCHDOG_POLL_INTERVAL
+
+        try:
+            from nanobot.config.loader import load_config
+
+            cfg = load_config()
+            agents_fields = getattr(cfg.agents, "model_fields_set", set())
+            subagent_cfg = cfg.agents.subagent
+            subagent_fields = getattr(subagent_cfg, "model_fields_set", set())
+            has_subagent_config = "subagent" in agents_fields
+
+            if requested_hard_cap == _SUBAGENT_HARD_CAP and (
+                has_subagent_config or "hard_cap" in subagent_fields
+            ):
+                resolved_hard_cap = subagent_cfg.hard_cap
+            if requested_idle_timeout == _SUBAGENT_IDLE_TIMEOUT and (
+                has_subagent_config or "idle_timeout" in subagent_fields
+            ):
+                resolved_idle_timeout = subagent_cfg.idle_timeout
+            if has_subagent_config or "watchdog_poll_interval" in subagent_fields:
+                resolved_poll_interval = subagent_cfg.watchdog_poll_interval
+        except Exception as exc:
+            logger.debug("Subagent watchdog config unavailable, using legacy defaults: {}", exc)
+
+        return resolved_hard_cap, resolved_idle_timeout, resolved_poll_interval
 
     async def _notify_boredom_completion(
         self,
@@ -285,6 +502,20 @@ class SubagentManager:
             if executor not in get_known_executors():
                 available = ", ".join(get_known_executors())
                 raise ValueError(f"Unknown executor '{executor}'. Known executors: {available}")
+            if executor == "claude-zai" and is_zai_peak():
+                message = (
+                    "Spawn blocked: executor 'claude-zai' is unavailable during "
+                    "ZAI peak hours (06:00-10:00 UTC weekdays)."
+                )
+                logger.warning(message)
+                raise PeakHoursSpawnBlockedError(message)
+            if executor == "claude-native" and is_claude_peak():
+                message = (
+                    "Spawn blocked: executor 'claude-native' is unavailable during "
+                    "Claude peak hours (12:00-18:00 UTC weekdays)."
+                )
+                logger.warning(message)
+                raise PeakHoursSpawnBlockedError(message)
 
         task_id = str(uuid.uuid4())[:8]
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
@@ -308,11 +539,20 @@ class SubagentManager:
             )
         )
         self._running_tasks[task_id] = bg_task
+        self._task_info[task_id] = {
+            "label": display_label,
+            "started_at": time.monotonic(),
+            "executor": executor,
+            "session_key": session_key,
+            "origin": origin,
+            "announced": False,  # idempotency guard for _announce_result
+        }
         if session_key:
             self._session_tasks.setdefault(session_key, set()).add(task_id)
 
         def _cleanup(_: asyncio.Task) -> None:
             self._running_tasks.pop(task_id, None)
+            self._task_info.pop(task_id, None)
             self._checkpoint_brokers.pop(task_id, None)
             if session_key and (ids := self._session_tasks.get(session_key)):
                 ids.discard(task_id)
@@ -448,6 +688,268 @@ class SubagentManager:
             reason=None if result.success and verified else (result.error_type or error or "cli_executor_failed"),
         )
 
+    async def _run_cli_executor_with_fallback(
+        self,
+        task_id: str,
+        task: str,
+        label: str,
+        origin: dict[str, Any],
+        primary_ex_info: Any,
+        cfg: Any,
+        *,
+        max_iterations: int | None = None,
+        hard_cap: int = 1800,
+        idle_timeout: int = 300,
+    ) -> None:
+        """Run CLI executor with automatic fallback on auth/config errors.
+
+        If the primary executor fails with an unrecoverable error (unauthorized,
+        config_error), tries each executor in _EXECUTOR_FALLBACK_CHAIN until one
+        succeeds or all are exhausted.
+        """
+        from nanobot.agent.executor import resolve_executor
+
+        # Try primary executor first
+        result = await self._try_cli_executor(
+            task_id, task, label, origin, primary_ex_info,
+            max_iterations=max_iterations, hard_cap=hard_cap, idle_timeout=idle_timeout,
+        )
+        if result is None or result.success:
+            return  # Primary succeeded or was handled internally
+
+        # Primary failed — check if it's a fallback-eligible error
+        error_type = result.error_type or ""
+        if error_type not in _FALLBACK_ERROR_TYPES:
+            return  # Non-recoverable error (timeout, etc.) — don't retry
+
+        logger.warning(
+            "Subagent [{}]: executor '{}' failed with '{}', trying fallback chain: {}",
+            task_id, primary_ex_info.alias, error_type,
+            _EXECUTOR_FALLBACK_CHAIN,
+        )
+
+        # Try fallback chain
+        for fallback_alias in _EXECUTOR_FALLBACK_CHAIN:
+            # Skip self (already failed) and peak-blocked executors
+            if fallback_alias == primary_ex_info.alias:
+                continue
+            if fallback_alias == "claude-zai" and is_zai_peak():
+                logger.info("Subagent [{}]: fallback '{}' blocked by peak hours", task_id, fallback_alias)
+                continue
+            if fallback_alias == "claude-native" and is_claude_peak():
+                logger.info("Subagent [{}]: fallback '{}' blocked by peak hours", task_id, fallback_alias)
+                continue
+
+            try:
+                fallback_info = resolve_executor(fallback_alias, cfg)
+            except Exception as exc:
+                logger.debug("Subagent [{}]: fallback '{}' not resolvable: {}", task_id, fallback_alias, exc)
+                continue
+
+            if not fallback_info.is_cli and fallback_info.provider is not None:
+                # API-based fallback — run via AgentRunner instead
+                logger.info(
+                    "Subagent [{}]: trying API-based fallback '{}' (model={})",
+                    task_id, fallback_alias, fallback_info.model,
+                )
+                await self._run_api_fallback(
+                    task_id, task, label, origin, fallback_info,
+                    max_iterations=max_iterations, hard_cap=hard_cap, idle_timeout=idle_timeout,
+                )
+                self._task_info[task_id]["executor"] = fallback_alias
+                return
+
+            if fallback_info.is_cli:
+                logger.info(
+                    "Subagent [{}]: trying CLI fallback '{}' (acpx_agent={})",
+                    task_id, fallback_alias, fallback_info.acpx_agent,
+                )
+                fb_result = await self._try_cli_executor(
+                    task_id, task, label, origin, fallback_info,
+                    max_iterations=max_iterations, hard_cap=hard_cap, idle_timeout=idle_timeout,
+                )
+                if fb_result is not None and fb_result.success:
+                    self._task_info[task_id]["executor"] = fallback_alias
+                    return
+                # Fallback also failed — continue to next in chain
+
+        logger.error(
+            "Subagent [{}]: all executors exhausted. Primary: {}, fallbacks tried from: {}",
+            task_id, primary_ex_info.alias, _EXECUTOR_FALLBACK_CHAIN,
+        )
+        # Final error envelope — all executors failed
+        envelope = self._build_envelope(
+            f"All executors failed. Primary '{primary_ex_info.alias}' errored ({error_type}), "
+            f"fallback chain {_EXECUTOR_FALLBACK_CHAIN} also failed.",
+            "error",
+            stop_reason="all_executors_failed",
+        )
+        await self._announce_result(task_id, label, task, envelope, origin)
+        self._schedule_boredom_completion_callback(
+            task_id=task_id, label=label, origin=origin,
+            succeeded=False, reason="all_executors_failed",
+        )
+
+    async def _try_cli_executor(
+        self,
+        task_id: str,
+        task: str,
+        label: str,
+        origin: dict[str, Any],
+        ex_info: Any,
+        *,
+        max_iterations: int | None = None,
+        hard_cap: int = 1800,
+        idle_timeout: int = 300,
+    ) -> Any:
+        """Run a single CLI executor and return the result.
+
+        Returns None if the executor had a config error (no acpx_agent),
+        or the DelegatedResult otherwise.
+        """
+        from nanobot.agent.execution import execute_acpx
+
+        alias = ex_info.alias
+        acpx_agent = ex_info.acpx_agent
+        nb_task_id = extract_task_id(label)
+
+        if acpx_agent is None:
+            logger.error("Subagent [{}]: executor '{}' has no acpx_agent mapping", task_id, alias)
+            envelope = self._build_envelope(
+                f"Executor '{alias}' has no acpx_agent mapping", "error", stop_reason="config_error"
+            )
+            await self._announce_result(task_id, label, task, envelope, origin)
+            self._schedule_boredom_completion_callback(
+                task_id=task_id, label=label, origin=origin,
+                succeeded=False, reason="config_error",
+            )
+            return None
+
+        started_at = datetime.now(UTC).isoformat()
+        result = await execute_acpx(acpx_agent, task, self.workspace, timeout_s=hard_cap)
+
+        finished_at = datetime.now(UTC).isoformat()
+        logger.info("Subagent [{}]: CLI executor '{}' finished, success={}", task_id, alias, result.success)
+        await self._check_convergence(
+            runtime_task_id=task_id, task=task, label=label, origin=origin,
+            nb_task_id=nb_task_id,
+            decision="completed" if result.success else (result.error_type or "error"),
+            completed=result.success, timed_out=result.error_type == "timeout",
+            fallback_created_at=started_at,
+        )
+
+        # ── Delivery record ────────────────────────────────────────────────
+        try:
+            from nanobot_workspace.agent.delivery import (
+                DeliveryRecord,
+                is_transient_failure,
+                write_delivery_record,
+            )
+
+            summary = result.final_message or ""
+            if len(summary) > 400:
+                summary = summary[:400]
+
+            stderr_tail = result.stderr[-500:] if (not result.success and result.stderr) else ""
+
+            write_delivery_record(
+                self.workspace,
+                DeliveryRecord(
+                    task_id=task_id, agent=alias, attempt=1,
+                    started_at=started_at, finished_at=finished_at,
+                    success=result.success, transient=is_transient_failure(result),
+                    exit_code=result.exit_code, error_type=result.error_type or "",
+                    summary=summary, stderr_tail=stderr_tail,
+                ),
+            )
+        except Exception:
+            logger.exception("Subagent [{}]: failed to write delivery record", task_id)
+
+        # ── Post-delegation verification ────────────────────────────────────
+        verified = True
+        if result.success and getattr(result, "tool_calls", None):
+            try:
+                from nanobot_workspace.agent.verification import verify_delegation
+
+                outcome = verify_delegation(result, self.workspace, correlation_id=task_id)
+                if not outcome.passed and not outcome.timed_out and not outcome.skipped:
+                    verified = False
+                    error_summary = (
+                        f"Verification failed. "
+                        f"Lint: {len(outcome.lint_errors)} errors, "
+                        f"Tests: {len(outcome.test_failures)} failures"
+                    )
+                    logger.warning("Subagent [{}]: {}", task_id, error_summary)
+            except Exception:
+                logger.exception("Subagent [{}]: verification check failed", task_id)
+
+        status = "ok" if verified and result.success else "error"
+        summary_text = result.final_message or (result.summary if hasattr(result, "summary") else "")
+        error = "" if verified and result.success else (result.error or summary_text)
+        envelope = self._build_envelope(
+            summary_text, status,
+            stop_reason="completed" if result.success else "error",
+            error=error if not (verified and result.success) else None,
+        )
+        await self._announce_result(task_id, label, task, envelope, origin)
+        self._schedule_boredom_completion_callback(
+            task_id=task_id, label=label, origin=origin,
+            succeeded=result.success and verified,
+            reason=None if result.success and verified else (result.error_type or error or "cli_executor_failed"),
+        )
+        return result
+
+    async def _run_api_fallback(
+        self,
+        task_id: str,
+        task: str,
+        label: str,
+        origin: dict[str, Any],
+        ex_info: Any,
+        *,
+        max_iterations: int | None = None,
+        hard_cap: int = 1800,
+        idle_timeout: int = 300,
+    ) -> None:
+        """Run an API-based executor fallback via AgentRunner."""
+        logger.info(
+            "Subagent [{}]: API fallback executor '{}', model={}", task_id, ex_info.alias, ex_info.model
+        )
+        # Reuse the existing API-based subagent path
+        nb_task_id = extract_task_id(label)
+        if nb_task_id:
+            await mark_task_delegated(nb_task_id)
+
+        if max_iterations is None:
+            try:
+                from nanobot.config.loader import load_config
+
+                cfg = load_config()
+                max_iterations = cfg.agents.defaults.max_tool_iterations
+            except Exception:
+                max_iterations = 20
+
+        runner = AgentRunner(
+            provider=ex_info.provider,
+            model=ex_info.model,
+            tools=self._build_tool_registry(origin_channel=origin.get("channel", "cli")),
+            max_iterations=max_iterations,
+            idle_timeout=idle_timeout,
+        )
+        result = await asyncio.wait_for(runner.run(task), timeout=hard_cap)
+
+        envelope = self._build_envelope(
+            result.final_message or "",
+            "ok" if result.stop_reason == "end_turn" else "error",
+            stop_reason=result.stop_reason,
+        )
+        await self._announce_result(task_id, label, task, envelope, origin)
+        if nb_task_id:
+            if result.stop_reason == "end_turn":
+                await mark_task_delegation_success(nb_task_id)
+            else:
+                await mark_task_delegation_failure(nb_task_id, reason=result.stop_reason)
+
     async def _run_subagent(
         self,
         task_id: str,
@@ -506,6 +1008,11 @@ class SubagentManager:
         executor: str | None = None,
     ) -> None:
         """Inner execution body wrapped by ConcurrencyGuard."""
+        hard_cap, idle_timeout, watchdog_poll_interval = self._resolve_subagent_watchdog_settings(
+            hard_cap,
+            idle_timeout,
+        )
+
         # ── Resolve executor ────────────────────────────────────────────
         effective_provider = self.provider
         effective_model = self.model
@@ -522,17 +1029,20 @@ class SubagentManager:
 
             ex_info = resolve_executor(executor, cfg)
             if ex_info.is_cli:
-                # CLI-based executors: delegate via ACPX subprocess
-                return await self._run_cli_executor(
+                # CLI-based executors: delegate via ACPX with fallback
+                result = await self._run_cli_executor_with_fallback(
                     task_id,
                     task,
                     label,
                     origin,
                     ex_info,
+                    cfg,
                     max_iterations=max_iterations,
                     hard_cap=hard_cap,
                     idle_timeout=idle_timeout,
                 )
+                if result is not None:
+                    return result
             if ex_info.provider is not None:
                 effective_provider = ex_info.provider
             effective_model = ex_info.model
@@ -555,15 +1065,20 @@ class SubagentManager:
             except Exception:
                 max_iterations = 40
         logger.info(
-            "Subagent [{}]: max_iterations={}, hard_cap={}s, idle={}s",
+            "Subagent [{}]: max_iterations={}, hard_cap={}s, idle={}s, watchdog_poll={}s",
             task_id,
             max_iterations,
             hard_cap,
             idle_timeout,
+            watchdog_poll_interval,
         )
 
         start_time = time.monotonic()
-        last_activity = start_time
+        watchdog_state = _SubagentWatchdogState(
+            last_activity=start_time,
+            last_progress=start_time,
+            workspace=self.workspace,
+        )
 
         try:
             # Build subagent tools (no message tool, no spawn tool)
@@ -629,8 +1144,8 @@ class SubagentManager:
             if checkpoint_hook is not None:
                 # CheckpointHook is the primary hook; wire idle-time tracking
                 async def _track_activity(context: AgentHookContext) -> None:
-                    nonlocal last_activity
-                    last_activity = time.monotonic()
+                    now = time.monotonic()
+                    watchdog_state.record_tool_calls(context.tool_calls, now)
                     for tool_call in context.tool_calls:
                         args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                         logger.debug(
@@ -641,6 +1156,14 @@ class SubagentManager:
                         )
 
                 checkpoint_hook._on_before_execute_tools = _track_activity
+
+                original_after_iteration = checkpoint_hook.after_iteration
+
+                async def _after_iteration(context: AgentHookContext) -> None:
+                    await original_after_iteration(context)
+                    watchdog_state.record_iteration_result(context.tool_events, time.monotonic())
+
+                checkpoint_hook.after_iteration = _after_iteration
                 run_hook = checkpoint_hook
             else:
 
@@ -648,8 +1171,8 @@ class SubagentManager:
                     """Hook to track progress and log tool execution."""
 
                     async def before_execute_tools(self, context: AgentHookContext) -> None:
-                        nonlocal last_activity
-                        last_activity = time.monotonic()
+                        now = time.monotonic()
+                        watchdog_state.record_tool_calls(context.tool_calls, now)
                         for tool_call in context.tool_calls:
                             args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                             logger.debug(
@@ -658,6 +1181,9 @@ class SubagentManager:
                                 tool_call.name,
                                 args_str,
                             )
+
+                    async def after_iteration(self, context: AgentHookContext) -> None:
+                        watchdog_state.record_iteration_result(context.tool_events, time.monotonic())
 
                 run_hook = _SubagentHook()
 
@@ -686,15 +1212,53 @@ class SubagentManager:
             run_task: asyncio.Task = asyncio.create_task(runner.run(spec))
 
             async def _idle_watchdog() -> None:
-                """Cancel run_task if no progress detected for idle_timeout seconds."""
+                """Cancel run_task only when the subagent looks genuinely stuck."""
+                last_extension_reasons: tuple[str, ...] = ()
                 while not run_task.done():
-                    await asyncio.sleep(_WATCHDOG_POLL_INTERVAL)
-                    if not run_task.done() and (time.monotonic() - last_activity) > idle_timeout:
-                        logger.warning(
-                            "Subagent [{}] idle for {}s (timeout: {}s)",
+                    await asyncio.sleep(watchdog_poll_interval)
+                    if run_task.done():
+                        return
+
+                    now = time.monotonic()
+                    snapshot = watchdog_state.snapshot(now, idle_timeout)
+
+                    if snapshot.extension_reasons and snapshot.extension_reasons != last_extension_reasons:
+                        logger.debug(
+                            "Subagent [{}] watchdog extending timeout to {}s ({})",
                             task_id,
-                            int(time.monotonic() - last_activity),
-                            idle_timeout,
+                            int(snapshot.effective_timeout),
+                            ", ".join(snapshot.extension_reasons),
+                        )
+                        last_extension_reasons = snapshot.extension_reasons
+
+                    logger.debug(
+                        "Subagent [{}] watchdog poll: idle={}s progress={}s iter10m={} iter5m={} timeout={}s last_progress_reason={} recent_tools={}",
+                        task_id,
+                        int(snapshot.idle_for),
+                        int(snapshot.no_progress_for),
+                        snapshot.iterations_last_10m,
+                        snapshot.iterations_last_5m,
+                        int(snapshot.effective_timeout),
+                        snapshot.last_progress_reason,
+                        ",".join(snapshot.recent_tool_names[-6:]) or "none",
+                    )
+
+                    looks_stuck = (
+                        snapshot.idle_for > snapshot.effective_timeout
+                        and snapshot.no_progress_for > snapshot.effective_timeout
+                        and snapshot.iterations_last_10m < _MIN_HEALTHY_ITERATIONS
+                    )
+                    if looks_stuck:
+                        logger.warning(
+                            "Subagent [{}] watchdog cancelling stuck run: idle={}s progress={}s iter10m={} iter5m={} timeout={}s last_progress_reason={} recent_tools={}",
+                            task_id,
+                            int(snapshot.idle_for),
+                            int(snapshot.no_progress_for),
+                            snapshot.iterations_last_10m,
+                            snapshot.iterations_last_5m,
+                            int(snapshot.effective_timeout),
+                            snapshot.last_progress_reason,
+                            ",".join(snapshot.recent_tool_names[-6:]) or "none",
                         )
                         run_task.cancel()
                         return
@@ -711,10 +1275,13 @@ class SubagentManager:
                         result = run_task.result()
                     except asyncio.CancelledError:
                         # Runner cancelled by idle watchdog
-                        idle_secs = int(time.monotonic() - last_activity)
+                        snapshot = watchdog_state.snapshot(time.monotonic(), idle_timeout)
                         raise asyncio.TimeoutError(
-                            f"Task idle for {idle_secs}s without progress"
-                            f" (timeout: {idle_timeout}s)."
+                            "Task appeared stuck: "
+                            f"idle={int(snapshot.idle_for)}s, "
+                            f"no_progress={int(snapshot.no_progress_for)}s, "
+                            f"iterations_10m={snapshot.iterations_last_10m}, "
+                            f"adaptive_timeout={int(snapshot.effective_timeout)}s."
                         )
                 else:
                     # Wall-clock timeout — neither task completed in time
@@ -1390,7 +1957,20 @@ class SubagentManager:
         is published directly (skipping the main-agent LLM round-trip).
         Complex, partial, or error results are routed through the main
         agent for interpretation.
+
+        Idempotent: only the first call for a given task_id sends a message.
+        Subsequent calls (e.g. from fallback chain) are silently skipped.
         """
+        # ── Idempotency guard ───────────────────────────────────────────
+        info = self._task_info.get(task_id)
+        if info and info.get("announced"):
+            logger.debug(
+                "Subagent [{}] skipping duplicate announce (already announced)", task_id
+            )
+            return
+        if info is not None:
+            info["announced"] = True
+
         # Verify claimed artifacts exist on disk (detect illusion of execution)
         envelope = verify_envelope(envelope, correlation_id=task_id)
 
@@ -1535,3 +2115,26 @@ Repo root: /root/Projects/nanobot""")
     def get_running_count(self) -> int:
         """Return the number of currently running subagents."""
         return len(self._running_tasks)
+
+    def get_active_tasks(self) -> list[dict[str, Any]]:
+        """Return lightweight metadata for running subagent tasks."""
+        now = time.monotonic()
+        active: list[dict[str, Any]] = []
+        for task_id, task in self._running_tasks.items():
+            if task.done():
+                continue
+            info = self._task_info.get(task_id, {})
+            started_at = info.get("started_at")
+            elapsed = max(0.0, now - started_at) if isinstance(started_at, (int, float)) else 0.0
+            active.append(
+                {
+                    "task_id": task_id,
+                    "label": info.get("label", task_id),
+                    "executor": info.get("executor"),
+                    "session_key": info.get("session_key"),
+                    "origin": info.get("origin"),
+                    "elapsed_seconds": elapsed,
+                }
+            )
+        active.sort(key=lambda item: item["elapsed_seconds"], reverse=True)
+        return active

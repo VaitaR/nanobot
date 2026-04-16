@@ -108,9 +108,16 @@ class RestartGatewayTool(Tool):
                     "type": "string",
                     "description": "Originating chat ID for the chat to resume after restart.",
                 },
+                "message_thread_id": {
+                    "type": "string",
+                    "description": "Telegram topic/thread ID to resume in after restart.",
+                },
                 "resume_prompt": {
                     "type": "string",
-                    "description": "System resume prompt injected after the gateway comes back online.",
+                    "description": (
+                        "System resume prompt injected after the gateway comes back online. "
+                        "Include enough context to continue the task and a concrete next action plan."
+                    ),
                     "maxLength": 1_000,
                 },
             },
@@ -125,6 +132,7 @@ class RestartGatewayTool(Tool):
         reason = reason.strip()[:200]
         channel = str(kwargs.get("channel") or "").strip()
         chat_id = str(kwargs.get("chat_id") or "").strip()
+        message_thread_id = str(kwargs.get("message_thread_id") or "").strip() or None
         resume_prompt = str(kwargs.get("resume_prompt") or "").strip()[:1000]
 
         # --- Safety checks (warnings only, never block) ---
@@ -149,6 +157,59 @@ class RestartGatewayTool(Tool):
         except Exception:
             pass
 
+        # --- Safety gate (blocks restart, defers to reload checker) ---
+        running_count = 0
+        if self._subagent_manager is not None:
+            try:
+                running_count = self._subagent_manager.get_running_count()
+            except Exception:
+                running_count = 0
+
+        bus_pending_count = 0
+        if self._bus is not None:
+            try:
+                bus_pending_count = self._bus.inbound_size + self._bus.outbound_size
+            except Exception:
+                bus_pending_count = 0
+
+        if running_count > 0 or bus_pending_count > 0:
+            pending_reload = self._workspace / ".pending-reload"
+            reload_payload = {
+                "reason": reason,
+                "subagent_id": None,
+                "task_id": None,
+                "files_modified": [],
+                "verification": {},
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            try:
+                pending_reload.write_text(json.dumps(reload_payload, indent=2))
+            except Exception:
+                pass
+
+            pending = self._workspace / self._PENDING_FILE
+            payload = {
+                "reason": reason,
+                "channel": channel,
+                "chat_id": chat_id,
+                "message_thread_id": message_thread_id,
+                "resume_prompt": resume_prompt,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            try:
+                pending.write_text(json.dumps(payload, indent=2))
+            except Exception:
+                pass
+
+            if running_count > 0:
+                logger.info("Restart deferred: %d subagent(s) running", running_count)
+            if bus_pending_count > 0:
+                logger.info("Restart deferred: %d queued bus message(s)", bus_pending_count)
+            return (
+                "⚠️ Рестарт отложен — есть активные задачи или сообщения в обработке. "
+                "Рестарт произойдёт автоматически в свободное окно."
+            )
+
         # --- Write pending marker ---
         try:
             pending = self._workspace / self._PENDING_FILE
@@ -156,6 +217,7 @@ class RestartGatewayTool(Tool):
                 "reason": reason,
                 "channel": channel,
                 "chat_id": chat_id,
+                "message_thread_id": message_thread_id,
                 "resume_prompt": resume_prompt,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }

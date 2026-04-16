@@ -114,3 +114,25 @@ async def test_subagent_exec_tool_is_tier_capped(tmp_path):
 
     assert captured["max_tier"] == DEFAULT_SUBAGENT_MAX_TIER
     assert captured["exec_context"] == "subagent"
+
+
+@pytest.mark.asyncio
+async def test_spawn_blocks_claude_zai_during_zai_peak(tmp_path):
+    from nanobot.agent.subagent import PeakHoursSpawnBlockedError
+
+    mgr = _make_subagent_manager(tmp_path)
+
+    with patch("nanobot.agent.subagent.is_zai_peak", return_value=True):
+        with pytest.raises(PeakHoursSpawnBlockedError, match="claude-zai"):
+            await mgr.spawn("investigate throttling", executor="claude-zai")
+
+
+@pytest.mark.asyncio
+async def test_spawn_blocks_claude_native_during_claude_peak(tmp_path):
+    from nanobot.agent.subagent import PeakHoursSpawnBlockedError
+
+    mgr = _make_subagent_manager(tmp_path)
+
+    with patch("nanobot.agent.subagent.is_claude_peak", return_value=True):
+        with pytest.raises(PeakHoursSpawnBlockedError, match="claude-native"):
+            await mgr.spawn("review changes", executor="claude-native")

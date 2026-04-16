@@ -16,6 +16,22 @@ from nanobot.config.schema import Config
 _SEND_RETRY_DELAYS = (1, 2, 4)
 
 
+def _extract_retry_after(exc: Exception) -> int | None:
+    """Extract retry_after seconds from a Telegram RetryAfter error, if any.
+
+    Returns None if the exception is not a RetryAfter.
+    Import is deferred to avoid hard dependency on telegram package in the
+    generic channel manager.
+    """
+    try:
+        from telegram.error import RetryAfter as _RetryAfterError
+        if isinstance(exc, _RetryAfterError):
+            return int(exc.retry_after) if isinstance(exc.retry_after, int) else int(exc.retry_after.total_seconds())
+    except Exception:
+        pass
+    return None
+
+
 class ChannelManager:
     """
     Manages chat channels and coordinates message routing.
@@ -227,9 +243,11 @@ class ChannelManager:
         return merged, non_matching
 
     async def _send_with_retry(self, channel: BaseChannel, msg: OutboundMessage) -> None:
-        """Send a message with retry on failure using exponential backoff.
+        """Send a message with retry on failure.
 
-        Note: CancelledError is re-raised to allow graceful shutdown.
+        * RetryAfter (Telegram flood control) — honour the exact back-off time.
+        * Other transient errors — exponential back-off.
+        CancelledError is re-raised to allow graceful shutdown.
         """
         max_attempts = max(self.config.channels.send_max_retries, 1)
 
@@ -240,6 +258,26 @@ class ChannelManager:
             except asyncio.CancelledError:
                 raise  # Propagate cancellation for graceful shutdown
             except Exception as e:
+                # Check for Telegram RetryAfter — honour the exact wait time
+                retry_seconds = _extract_retry_after(e)
+                if retry_seconds is not None:
+                    wait = float(retry_seconds) + 0.5  # small margin
+                    if attempt == max_attempts - 1:
+                        logger.error(
+                            "Failed to send to {} after {} attempts: {} - retry_after={}s",
+                            msg.channel, max_attempts, type(e).__name__, retry_seconds,
+                        )
+                        return
+                    logger.warning(
+                        "Send to {} flood-controlled (attempt {}/{}), waiting {:.1f}s",
+                        msg.channel, attempt + 1, max_attempts, wait,
+                    )
+                    try:
+                        await asyncio.sleep(wait)
+                    except asyncio.CancelledError:
+                        raise
+                    continue
+
                 if attempt == max_attempts - 1:
                     logger.error(
                         "Failed to send to {} after {} attempts: {} - {}",

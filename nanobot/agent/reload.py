@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import tempfile
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -50,6 +51,7 @@ class ReloadChecker:
         self._subagents = subagent_manager
         self.pending_reload = workspace / ".pending-reload"
         self.reloading = workspace / ".reloading"
+        self.checkpoint = workspace / ".reload-checkpoint.json"
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -113,6 +115,45 @@ class ReloadChecker:
             pass
         return False, None
 
+    def write_checkpoint(self, task_ids: list[str]) -> None:
+        """Atomically write checkpoint file with in-flight task IDs before reload.
+
+        Uses a temp file + os.replace so readers never see a partial write.
+        """
+        payload = json.dumps({"task_ids": task_ids, "timestamp": datetime.now(UTC).isoformat()})
+        fd, tmp_path = tempfile.mkstemp(dir=self._workspace, prefix=".reload-checkpoint-")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+            os.replace(tmp_path, self.checkpoint)
+        except Exception:
+            logger.warning("reload: could not write checkpoint")
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    def resume_from_checkpoint(self) -> list[str]:
+        """Return task IDs saved by write_checkpoint, or [] if none / malformed.
+
+        Successfully consumed checkpoints are deleted so resume is a one-shot handoff.
+        """
+        if not self.checkpoint.exists():
+            return []
+        try:
+            data = json.loads(self.checkpoint.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("checkpoint payload is not an object")
+            task_ids = data.get("task_ids", [])
+            if not isinstance(task_ids, list):
+                raise ValueError("task_ids is not a list")
+            result = [str(t) for t in task_ids]
+            self.checkpoint.unlink(missing_ok=True)
+            return result
+        except Exception:
+            logger.warning("reload: could not read checkpoint; ignoring")
+            return []
+
     def clear_markers(self) -> None:
         """Delete both .pending-reload and .reloading if present (startup cleanup)."""
         self.pending_reload.unlink(missing_ok=True)
@@ -149,6 +190,8 @@ class ReloadChecker:
         if not self.prepare_reload(state):
             return False
 
+        task_ids = [state.task_id] if state.task_id else []
+        self.write_checkpoint(task_ids)
         self.execute_reload(state)
         return True
 
@@ -165,6 +208,7 @@ def check_and_reload(running_tasks_count: int, active_tasks_count: int) -> bool:
     checker._subagents = None
     checker.pending_reload = workspace / ".pending-reload"
     checker.reloading = workspace / ".reloading"
+    checker.checkpoint = workspace / ".reload-checkpoint.json"
 
     state = checker.read_pending()
     if state is None:

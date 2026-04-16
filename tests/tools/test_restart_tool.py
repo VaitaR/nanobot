@@ -58,16 +58,35 @@ async def test_restart_tool_reason_required(tool: RestartGatewayTool) -> None:
 
 
 @pytest.mark.asyncio
-async def test_restart_tool_safety_warnings_subagents(workspace: Path) -> None:
-    """Active subagents produce a warning but restart still proceeds."""
+async def test_restart_tool_defers_when_subagents_running(workspace: Path) -> None:
+    """Active subagents cause restart to defer via .pending-reload marker."""
     mock_manager = MagicMock()
     mock_manager.get_running_count.return_value = 3
 
     tool = RestartGatewayTool(workspace=workspace, subagent_manager=mock_manager)
 
+    with patch("nanobot.agent.tools.restart.os.execv") as mock_execv:
+        result = await tool.execute(reason="subagent defer test")
+
+    mock_execv.assert_not_called()
+    assert "отложен" in result  # Russian: "deferred"
+    assert "Рестарт" in result
+    # Both markers should be written
+    assert (workspace / ".pending-reload").exists()
+    assert (workspace / ".restart-pending").exists()
+
+
+@pytest.mark.asyncio
+async def test_restart_tool_proceeds_when_no_subagents(workspace: Path) -> None:
+    """No active subagents → restart proceeds normally via os.execv."""
+    mock_manager = MagicMock()
+    mock_manager.get_running_count.return_value = 0
+
+    tool = RestartGatewayTool(workspace=workspace, subagent_manager=mock_manager)
+
     with patch("nanobot.agent.tools.restart.os.execv", side_effect=SystemExit) as mock_execv:
         with pytest.raises(SystemExit):
-            await tool.execute(reason="subagent warning test")
+            await tool.execute(reason="clean subagent test")
 
     mock_execv.assert_called_once()
     pending = workspace / ".restart-pending"

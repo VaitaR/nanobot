@@ -29,6 +29,7 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.restart import RestartGatewayTool
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
+from nanobot.agent.tools.spawn_status import SpawnStatusTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
@@ -36,6 +37,7 @@ from nanobot.command import CommandContext, CommandRouter, register_builtin_comm
 from nanobot.providers.base import LLMProvider
 from nanobot.react.signal_detector import SignalDetector
 from nanobot.session.manager import Session, SessionManager
+from nanobot.session.resume_state import persist_last_active_session
 from nanobot.utils.helpers import estimate_prompt_tokens_chain
 
 if TYPE_CHECKING:
@@ -140,6 +142,8 @@ class AgentLoop:
         self._mcp_connected = False
         self._mcp_connecting = False
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
+        self._active_task_ts: dict[int, float] = {}  # id(task) -> monotonic timestamp
+        self._STALE_TASK_THRESHOLD_S = 120.0  # tasks older than this are considered stale
         self._background_tasks: list[asyncio.Task] = []
         self._session_locks: dict[str, asyncio.Lock] = {}
         # NANOBOT_MAX_CONCURRENT_REQUESTS: <=0 means unlimited; default 3.
@@ -299,7 +303,10 @@ class AgentLoop:
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(NotifyTool())
-        self.tools.register(SpawnTool(manager=self.subagents))
+        spawn_tool = SpawnTool(manager=self.subagents)
+        spawn_tool.set_bus(self.bus)
+        self.tools.register(spawn_tool)
+        self.tools.register(SpawnStatusTool(get_active_tasks=self.get_active_tasks))
         self.tools.register(
             RestartGatewayTool(
                 workspace=self.workspace,
@@ -352,6 +359,28 @@ class AgentLoop:
                     if name == "spawn" and message_thread_id is not None:
                         extra.append(message_thread_id)
                     tool.set_context(channel, chat_id, *extra)
+
+    def _record_last_active_session(
+        self,
+        *,
+        inbound_channel: str,
+        sender_id: str,
+        channel: str,
+        chat_id: str,
+        message_thread_id: str | int | None,
+    ) -> None:
+        """Persist the latest user-facing session for restart recovery."""
+        if inbound_channel == "system" and sender_id != "subagent":
+            return
+        try:
+            persist_last_active_session(
+                self.workspace,
+                channel=channel,
+                chat_id=chat_id,
+                message_thread_id=message_thread_id,
+            )
+        except Exception as exc:
+            logger.debug("Failed to persist last active session: {}", exc)
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
@@ -523,16 +552,18 @@ class AgentLoop:
                 continue
             task = asyncio.create_task(self._dispatch(msg))
             self._active_tasks.setdefault(msg.session_key, []).append(task)
-            logger.debug("_active_tasks DIAG: added task to session={}, now {} tasks total, session has {}", 
+            self._active_task_ts[id(task)] = time.monotonic()
+            logger.info("_active_tasks DIAG: added task to session={}, now {} tasks total, session has {}",
                          msg.session_key, sum(len(v) for v in self._active_tasks.values()), len(self._active_tasks[msg.session_key]))
             task.add_done_callback(
                 lambda t, k=msg.session_key: (
                     (lambda: (
-                        logger.debug("_active_tasks DIAG: done_callback fired for session={}, task done={}, cancelled={}",
+                        logger.info("_active_tasks DIAG: done_callback fired for session={}, task done={}, cancelled={}",
                                      k, t.done(), t.cancelled()),
+                        self._active_task_ts.pop(id(t), None),
                         (self._active_tasks.get(k, []) and self._active_tasks[k].remove(t)
                          if t in self._active_tasks.get(k, [])
-                         else logger.debug("_active_tasks DIAG: task NOT in list for session={}, list_len={}",
+                         else logger.info("_active_tasks DIAG: task NOT in list for session={}, list_len={}",
                                            k, len(self._active_tasks.get(k, []))))
                     ))()  # IIFE to ensure all expressions execute
                 )
@@ -670,6 +701,25 @@ class AgentLoop:
         self._running = False
         logger.info("Agent loop stopping")
 
+    def get_active_tasks(self) -> list[dict[str, Any]]:
+        """Return lightweight metadata for currently active foreground tasks."""
+        now = time.monotonic()
+        active: list[dict[str, Any]] = []
+        for session_key, tasks in self._active_tasks.items():
+            for task in tasks:
+                if task.done():
+                    continue
+                started_at = self._active_task_ts.get(id(task))
+                elapsed = max(0.0, now - started_at) if started_at is not None else 0.0
+                active.append(
+                    {
+                        "session_key": session_key,
+                        "elapsed_seconds": elapsed,
+                    }
+                )
+        active.sort(key=lambda item: item["elapsed_seconds"], reverse=True)
+        return active
+
     async def _process_message(
         self,
         msg: InboundMessage,
@@ -685,6 +735,13 @@ class AgentLoop:
                 msg.chat_id.split(":", 1) if ":" in msg.chat_id else ("cli", msg.chat_id)
             )
             logger.info("Processing system message from {}", msg.sender_id)
+            self._record_last_active_session(
+                inbound_channel=msg.channel,
+                sender_id=msg.sender_id,
+                channel=channel,
+                chat_id=chat_id,
+                message_thread_id=msg.metadata.get("message_thread_id"),
+            )
             key = f"{channel}:{chat_id}"
             session = self.sessions.get_or_create(key)
             await self.memory_consolidator.maybe_consolidate_by_tokens(session)
@@ -771,12 +828,23 @@ class AgentLoop:
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
 
         key = session_key or msg.session_key
+        self._record_last_active_session(
+            inbound_channel=msg.channel,
+            sender_id=msg.sender_id,
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            message_thread_id=msg.metadata.get("message_thread_id"),
+        )
         session = self.sessions.get_or_create(key)
 
-        # Slash commands
+        # Slash commands (priority first, then regular dispatch)
         raw = msg.content.strip()
         ctx = CommandContext(msg=msg, session=session, key=key, raw=raw, loop=self)
-        if result := await self.commands.dispatch(ctx):
+        if self.commands.is_priority(raw):
+            result = await self.commands.dispatch_priority(ctx)
+        else:
+            result = await self.commands.dispatch(ctx)
+        if result:
             return result
 
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)

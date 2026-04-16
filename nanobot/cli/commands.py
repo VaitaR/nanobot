@@ -1,6 +1,7 @@
 """CLI commands for nanobot."""
 
 import asyncio
+import json
 import os
 import select
 import signal
@@ -35,7 +36,12 @@ from nanobot import __logo__, __version__
 from nanobot.cli.stream import StreamRenderer, ThinkingSpinner
 from nanobot.config.paths import get_workspace_path, is_default_workspace
 from nanobot.config.schema import Config
-from nanobot.utils.helpers import sync_workspace_templates
+from nanobot.session.resume_state import (
+    load_last_active_session,
+    merge_resume_session,
+    persist_last_active_session,
+)
+from nanobot.utils.helpers import safe_filename, sync_workspace_templates
 
 app = typer.Typer(
     name="nanobot",
@@ -46,6 +52,11 @@ app = typer.Typer(
 
 console = Console()
 EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}
+RESUME_RECENT_MESSAGES_LIMIT = 5
+DEFAULT_RESTART_RESUME_PROMPT = (
+    "[System] Gateway restart complete. Continue from the previous conversation "
+    "and finish any interrupted work."
+)
 
 # ---------------------------------------------------------------------------
 # CLI input: prompt_toolkit for editing, paste, history, and display
@@ -121,6 +132,81 @@ def _init_prompt_session() -> None:
 
 def _make_console() -> Console:
     return Console(file=sys.stdout)
+
+
+def _get_session_jsonl_path(workspace: Path, session_key: str) -> Path:
+    """Return the workspace session log path for a session key."""
+    safe_key = safe_filename(session_key.replace(":", "_"))
+    return workspace / "sessions" / f"{safe_key}.jsonl"
+
+
+def _load_recent_resume_messages(workspace: Path, session_key: str) -> str:
+    """Load a short recent conversation summary for restart resume prompts."""
+    path = _get_session_jsonl_path(workspace, session_key)
+    if not path.exists():
+        return ""
+
+    recent: list[tuple[str, str]] = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+
+                data = json.loads(line)
+                role = data.get("role")
+                content = data.get("content")
+                if role not in {"user", "assistant"}:
+                    continue
+                if data.get("tool_calls"):
+                    continue
+                if not isinstance(content, str) or not content.strip():
+                    continue
+
+                recent.append((role, " ".join(content.split())))
+    except Exception:
+        return ""
+
+    if not recent:
+        return ""
+
+    lines = ["Recent conversation:"]
+    for role, content in recent[-RESUME_RECENT_MESSAGES_LIMIT:]:
+        speaker = "User" if role == "user" else "Assistant"
+        lines.append(f"{speaker}: {content}")
+    return "\n".join(lines)
+
+
+def _consume_restart_resume_payload(workspace: Path) -> dict[str, str | None] | None:
+    """Consume ``restart_pending.json`` and fill missing routing from the last active session."""
+    marker = workspace / "restart_pending.json"
+    marker_payload: dict[str, Any] | None = None
+    if marker.exists():
+        try:
+            marker_payload = json.loads(marker.read_text())
+        except Exception:
+            marker_payload = None
+        finally:
+            marker.unlink(missing_ok=True)
+
+    return merge_resume_session(
+        marker_payload,
+        load_last_active_session(workspace),
+        default_resume_prompt=DEFAULT_RESTART_RESUME_PROMPT,
+    )
+
+
+def _record_cli_last_active_session(workspace: Path, channel: str, chat_id: str) -> None:
+    """Persist the current CLI session as the restart fallback target."""
+    try:
+        persist_last_active_session(
+            workspace,
+            channel=channel,
+            chat_id=chat_id,
+        )
+    except Exception:
+        pass
 
 
 def _render_interactive_ansi(render_fn) -> str:
@@ -459,7 +545,7 @@ def _make_provider(config: Config):
     or_cfg = config.providers.openrouter
     # Fallback chain: try models in order until one works
     or_fallback_chain = [
-        (or_cfg.fallback_model if or_cfg else None) or "stepfun/step-3.5-flash:free",
+        (or_cfg.fallback_model if or_cfg else None) or "google/gemma-4-26b-a4b-it:free",
         "nvidia/nemotron-3-super-120b-a12b:free",
         "minimax/minimax-m2.5:free",
     ]
@@ -491,7 +577,7 @@ def _make_provider(config: Config):
         or_spec = _find("openrouter")
 
         # Create providers for each model in the chain
-        # Chain: step-3.5-flash → nemotron-3-super → minimax-m2.5
+        # Chain: gemma-4-26b → nemotron-3-super → minimax-m2.5
         or_backup1 = OpenAICompatProvider(
             api_key=or_cfg.api_key,
             default_model=or_fallback_chain[0],
@@ -752,8 +838,13 @@ def gateway(
 
     # Wire checkpoint resolver for Telegram inline keyboard callbacks (Phase 3)
     tg_channel = channels.get_channel("telegram")
-    if tg_channel is not None and hasattr(tg_channel, "_checkpoint_resolver"):
-        tg_channel._checkpoint_resolver = agent.subagents.resolve_checkpoint
+    if tg_channel is not None:
+        if hasattr(tg_channel, "_checkpoint_resolver"):
+            tg_channel._checkpoint_resolver = agent.subagents.resolve_checkpoint
+        if hasattr(tg_channel, "set_subagent_manager"):
+            tg_channel.set_subagent_manager(agent.subagents)
+        if hasattr(tg_channel, "set_agent_loop"):
+            tg_channel.set_agent_loop(agent)
 
     def _pick_heartbeat_target() -> tuple[str, str]:
         """Pick a routable channel/chat target for heartbeat-triggered messages.
@@ -800,6 +891,8 @@ def gateway(
         agent_loop=agent,
         subagent_manager=agent.subagents,
     )
+    resumed_task_ids = reload_checker.resume_from_checkpoint()
+    reload_checker.clear_markers()
 
     # Create heartbeat service
     async def on_heartbeat_execute(tasks: str) -> str:
@@ -888,20 +981,53 @@ def gateway(
             executor=executor,
         )
 
+    async def spawn_reviewer(task: str, label: str, executor: str) -> str:
+        """Spawn a reviewer subagent for tasks in 'review' status."""
+        return await agent.subagents.spawn(
+            task=task,
+            label=label,
+            origin_channel="system",
+            origin_chat_id="heartbeat",
+            session_key="heartbeat:reviewer",
+            executor=executor,
+        )
+
     heartbeat.set_spawn_callback(spawn_boredom_delegation)
+    heartbeat.set_spawn_reviewer_cb(spawn_reviewer)
     heartbeat.on_tick_report = on_heartbeat_tick_report
 
-    _SYSTEM_SESSION_PREFIXES = ("cron:", "heartbeat")
+    system_session_prefixes = ("cron:", "heartbeat")
 
     def is_user_active() -> bool:
-        """True if any non-system session has active tasks (real user interaction)."""
-        for key, tasks in agent._active_tasks.items():
-            if tasks and not key.startswith(_SYSTEM_SESSION_PREFIXES):
-                import loguru
-                loguru.logger.debug("is_user_active DIAG: returning True for session={}, tasks={}", key, len(tasks))
-                return True
+        """True if any non-system session has active tasks (real user interaction).
+        Tasks older than _STALE_TASK_THRESHOLD_S are pruned and ignored."""
+        import time as _time
+
         import loguru
-        loguru.logger.debug("is_user_active DIAG: returning False, all sessions idle")
+
+        now = _time.monotonic()
+        threshold = agent._STALE_TASK_THRESHOLD_S
+        pruned = 0
+
+        for key in list(agent._active_tasks.keys()):
+            if key.startswith(system_session_prefixes):
+                continue
+            tasks = agent._active_tasks[key]
+            # Prune stale tasks
+            stale = [t for t in tasks if now - agent._active_task_ts.get(id(t), 0) > threshold]
+            if stale:
+                for t in stale:
+                    tasks.remove(t)
+                    agent._active_task_ts.pop(id(t), None)
+                    pruned += 1
+            if tasks:
+                loguru.logger.info(
+                    "is_user_active DIAG: returning True for session={}, tasks={} (pruned {} stale)",
+                    key, len(tasks), pruned,
+                )
+                return True
+
+        loguru.logger.info("is_user_active DIAG: returning False, all sessions idle (pruned {} stale total)", pruned)
         return False
 
     heartbeat.is_user_active = is_user_active
@@ -938,7 +1064,6 @@ def gateway(
                 async def _send_startup_ping() -> None:
                     try:
                         await asyncio.sleep(8)  # Let channels connect first
-                        import json
                         from datetime import UTC, datetime
 
                         from nanobot import __version__
@@ -948,10 +1073,21 @@ def gateway(
                             channel: str,
                             chat_id: str,
                             resume_prompt: str | None,
+                            message_thread_id: str | None = None,
                         ) -> None:
                             prompt = (resume_prompt or "").strip()
                             if not prompt:
                                 return
+                            if message_thread_id:
+                                session_key = f"{channel}:{chat_id}:topic:{message_thread_id}"
+                            else:
+                                session_key = f"{channel}:{chat_id}"
+                            recent_summary = _load_recent_resume_messages(
+                                config.workspace_path,
+                                session_key,
+                            )
+                            if recent_summary:
+                                prompt = f"{recent_summary}\n\n{prompt}"
                             await asyncio.sleep(2)
                             await bus.publish_inbound(
                                 InboundMessage(
@@ -959,37 +1095,45 @@ def gateway(
                                     sender_id="system-restart",
                                     chat_id=chat_id,
                                     content=prompt,
-                                    metadata={"_resume_after_restart": True},
-                                    session_key_override=f"{channel}:{chat_id}",
+                                    metadata={
+                                        "_resume_after_restart": True,
+                                        "message_thread_id": message_thread_id,
+                                    },
+                                    session_key_override=session_key,
                                 )
                             )
 
                         # If /restart was used, confirm it to the originating chat.
-                        marker = config.workspace_path / "restart_pending.json"
-                        if marker.exists():
-                            try:
-                                data = json.loads(marker.read_text())
-                                marker.unlink()
-                                channel = str(data.get("channel") or "cli")
-                                chat_id = str(data.get("chat_id") or "direct")
-                                await bus.publish_outbound(
-                                    OutboundMessage(
-                                        channel=channel,
-                                        chat_id=chat_id,
-                                        content=f"✅ nanobot restarted (v{__version__})",
-                                    )
-                                )
-                                await _publish_resume_message(
+                        restart_resume = _consume_restart_resume_payload(config.workspace_path)
+                        if restart_resume is not None:
+                            channel = str(restart_resume["channel"] or "cli")
+                            chat_id = str(restart_resume["chat_id"] or "direct")
+                            message_thread_id = restart_resume.get("message_thread_id")
+                            await bus.publish_outbound(
+                                OutboundMessage(
                                     channel=channel,
                                     chat_id=chat_id,
-                                    resume_prompt=data.get("resume_prompt"),
+                                    content=f"✅ nanobot restarted (v{__version__})",
+                                    metadata={"message_thread_id": message_thread_id},
                                 )
-                                return
-                            except Exception:
-                                pass
+                            )
+                            await _publish_resume_message(
+                                channel=channel,
+                                chat_id=chat_id,
+                                resume_prompt=restart_resume.get("resume_prompt"),
+                                message_thread_id=message_thread_id,
+                            )
+                            return
+
+                        if resumed_task_ids:
+                            logger.info(
+                                "Gateway resumed after reload with checkpointed task IDs: %s",
+                                resumed_task_ids,
+                            )
 
                         # Clean up reload markers from previous cycle.
                         reloading_marker = config.workspace_path / ".reloading"
+
                         if reloading_marker.exists():
                             try:
                                 rdata = json.loads(reloading_marker.read_text())
@@ -1010,14 +1154,22 @@ def gateway(
                         tool_reason: str | None = None
                         tool_channel: str | None = None
                         tool_chat_id: str | None = None
+                        tool_message_thread_id: str | None = None
                         tool_resume_prompt: str | None = None
                         if tool_marker.exists():
                             try:
                                 td = json.loads(tool_marker.read_text())
                                 tool_reason = td.get("reason", "")
-                                tool_channel = str(td.get("channel") or "").strip() or None
-                                tool_chat_id = str(td.get("chat_id") or "").strip() or None
-                                tool_resume_prompt = str(td.get("resume_prompt") or "").strip() or None
+                                merged_resume = merge_resume_session(
+                                    td,
+                                    load_last_active_session(config.workspace_path),
+                                    default_resume_prompt=DEFAULT_RESTART_RESUME_PROMPT,
+                                )
+                                if merged_resume is not None:
+                                    tool_channel = merged_resume["channel"]
+                                    tool_chat_id = merged_resume["chat_id"]
+                                    tool_message_thread_id = merged_resume["message_thread_id"]
+                                    tool_resume_prompt = merged_resume["resume_prompt"]
                                 last_restart_marker.write_text(
                                     json.dumps(
                                         {
@@ -1052,13 +1204,19 @@ def gateway(
                         if model_name:
                             msg += f" ({model_name})"
                         await bus.publish_outbound(
-                            OutboundMessage(channel=ping_channel, chat_id=ping_chat_id, content=msg),
+                            OutboundMessage(
+                                channel=ping_channel,
+                                chat_id=ping_chat_id,
+                                content=msg,
+                                metadata={"message_thread_id": tool_message_thread_id},
+                            ),
                         )
                         if tool_channel and tool_chat_id:
                             await _publish_resume_message(
                                 channel=tool_channel,
                                 chat_id=tool_chat_id,
                                 resume_prompt=tool_resume_prompt,
+                                message_thread_id=tool_message_thread_id,
                             )
                     except Exception:
                         pass  # Fire-and-forget: never block startup
@@ -1296,6 +1454,11 @@ def agent(
                         turn_done.clear()
                         turn_response.clear()
                         renderer = StreamRenderer(render_markdown=markdown)
+                        _record_cli_last_active_session(
+                            config.workspace_path,
+                            cli_channel,
+                            cli_chat_id,
+                        )
 
                         await bus.publish_inbound(
                             InboundMessage(
