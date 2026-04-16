@@ -53,16 +53,10 @@ class SpawnTool(Tool):
         self._post_check_tasks.add(post_check)
         post_check.add_done_callback(self._post_check_tasks.discard)
 
-    # Short ID pattern: exactly 8 digits + T + exactly 6 digits (no suffix)
-    _TASK_ID_SHORT_RE = re.compile(r"\b(\d{8}T\d{6})\b")
-
-    def _extract_workspace_task_id(self, *, task: str, label: str | None) -> str | None:
-        """Return the workspace task ID referenced by the spawn request, if any."""
-        for candidate in (label or "", task):
-            task_id = extract_task_id(candidate)
-            if task_id:
-                return task_id
-        return None
+    def _extract_workspace_task_id(self, task: str) -> str | None:
+        """Return the short workspace task ID referenced by the spawn request, if any."""
+        match = re.search(r"\d{8}T\d{6}", task)
+        return match.group(0) if match else None
 
     @staticmethod
     def _load_task_file_body(task_id: str) -> str | None:
@@ -251,11 +245,10 @@ class SpawnTool(Tool):
         **kwargs: Any,
     ) -> str:
         """Spawn a subagent to execute the given task."""
-        # If task string contains a short task ID, try loading the .md file body
         resolved_task = task
-        short_match = self._TASK_ID_SHORT_RE.search(task)
-        if short_match:
-            file_body = self._load_task_file_body(short_match.group(1))
+        workspace_task_id = extract_task_id(task) or self._extract_workspace_task_id(task)
+        if workspace_task_id is not None:
+            file_body = self._load_task_file_body(workspace_task_id)
             if file_body is not None:
                 resolved_task = file_body + "\n\n" + task
         if not skip_validation:
@@ -291,7 +284,9 @@ class SpawnTool(Tool):
             if isinstance(exc, PeakHoursSpawnBlockedError):
                 return str(exc)
             raise
-        workspace_task_id = self._extract_workspace_task_id(task=task, label=label)
+        if workspace_task_id is None and label is not None:
+            label_task_id = extract_task_id(label)
+            workspace_task_id = label_task_id or self._extract_workspace_task_id(label)
         if workspace_task_id is not None:
             self._schedule_post_check(
                 task_id=workspace_task_id,
