@@ -17,7 +17,6 @@ from telegram import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    ReactionTypeEmoji,
     ReplyParameters,
     Update,
 )
@@ -244,6 +243,7 @@ class TelegramChannel(BaseChannel):
         self._agent_loop: Any | None = None
         self._processing_messages: dict[str, int] = {}
         self._status_reactions: dict[tuple[str, int], set[str]] = {}
+        self._last_bot_message_id: dict[str, int] = {}
 
     def set_subagent_manager(self, manager: Any) -> None:
         """Wire the subagent manager for direct status reporting."""
@@ -475,11 +475,23 @@ class TelegramChannel(BaseChannel):
 
         # Send text content
         if msg.content and msg.content != "[empty message]":
-            for chunk in split_message(msg.content, TELEGRAM_MAX_MESSAGE_LEN):
-                await self._send_text(
+            last_bot_msg_id = None
+            chunks = list(split_message(msg.content, TELEGRAM_MAX_MESSAGE_LEN))
+            for i, chunk in enumerate(chunks):
+                # Append ✅ to last chunk of final (non-progress) messages
+                if (
+                    not msg.metadata.get("_progress", False)
+                    and i == len(chunks) - 1
+                ):
+                    chunk = chunk.rstrip() + " ✅"
+                mid = await self._send_text(
                     chat_id, chunk, reply_params, thread_kwargs,
                     reply_markup=msg.reply_markup,
                 )
+                if mid:
+                    last_bot_msg_id = mid
+            if last_bot_msg_id:
+                self._last_bot_message_id[str(chat_id)] = last_bot_msg_id
 
         # Edit reply markup on an existing message (e.g. remove keyboard after resolve)
         if msg.edit_message_id is not None:
@@ -527,12 +539,13 @@ class TelegramChannel(BaseChannel):
         reply_params=None,
         thread_kwargs: dict | None = None,
         reply_markup: dict | None = None,
-    ) -> None:
-        """Send a plain text message with HTML fallback."""
+    ) -> int | None:
+        """Send a plain text message with HTML fallback. Returns message_id or None."""
         markup = self._build_inline_markup(reply_markup) if reply_markup else None
+        sent_msg = None
         try:
             html = _markdown_to_telegram_html(text)
-            await self._call_with_retry(
+            sent_msg = await self._call_with_retry(
                 self._app.bot.send_message,
                 chat_id=chat_id, text=html, parse_mode="HTML",
                 reply_parameters=reply_params,
@@ -542,7 +555,7 @@ class TelegramChannel(BaseChannel):
         except Exception as e:
             logger.warning("HTML parse failed, falling back to plain text: {}", e)
             try:
-                await self._call_with_retry(
+                sent_msg = await self._call_with_retry(
                     self._app.bot.send_message,
                     chat_id=chat_id,
                     text=text,
@@ -553,6 +566,7 @@ class TelegramChannel(BaseChannel):
             except Exception as e2:
                 logger.error("Error sending Telegram message: {}", e2)
                 raise
+        return sent_msg.message_id if sent_msg else None
 
     @staticmethod
     def _is_not_modified_error(exc: Exception) -> bool:
@@ -1060,7 +1074,7 @@ class TelegramChannel(BaseChannel):
             await self._app.bot.set_message_reaction(
                 chat_id=int(chat_id),
                 message_id=message_id,
-                reaction=[ReactionTypeEmoji(emoji=emoji) for emoji in sorted(emojis)],
+                reaction=list(sorted(emojis)),
             )
             self._status_reactions[(chat_id, message_id)] = set(emojis)
         except Exception as e:
@@ -1072,6 +1086,9 @@ class TelegramChannel(BaseChannel):
         current.discard("👀")
         current.discard("⏳")
         current.discard("✅")
+        current.discard("⏱️")
+        current.discard("👍")
+        current.discard("🔥")
         current.add(emoji)
         await self._set_reactions(chat_id, message_id, current)
 
@@ -1083,14 +1100,12 @@ class TelegramChannel(BaseChannel):
     async def mark_subagent_waiting(self, chat_id: str) -> None:
         """Mark the tracked inbound message as waiting on a subagent."""
         if message_id := self._processing_messages.get(chat_id):
-            await self._set_status_emoji(chat_id, message_id, "⏳")
+            await self._set_status_emoji(chat_id, message_id, "👀")
 
     async def _finalize_status_reaction(self, chat_id: str) -> None:
-        """Mark the tracked inbound message as completed."""
-        message_id = self._processing_messages.pop(chat_id, None)
-        if message_id is None:
-            return
-        await self._set_status_emoji(chat_id, message_id, "✅")
+        """No-op — completion indicator is now in message text."""
+        self._processing_messages.pop(chat_id, None)
+        self._last_bot_message_id.pop(chat_id, None)
 
     async def _typing_loop(self, chat_id: str) -> None:
         """Repeatedly send 'typing' action until cancelled."""
