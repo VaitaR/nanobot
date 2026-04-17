@@ -336,7 +336,7 @@ async def test_run_boredom_tick_calls_workspace_in_process(tmp_path, monkeypatch
     monkeypatch.setattr(
         HeartbeatService,
         "_load_boredom_hooks",
-        staticmethod(lambda: (_fake_boredom_tick, _fake_materialize, lambda cb: captured.setdefault("registered_spawner", cb), object())),
+        staticmethod(lambda: (_fake_boredom_tick, _fake_materialize, lambda cb: captured.setdefault("registered_spawner", cb), object(), object())),
     )
     service.set_spawn_callback(_fake_spawn)
 

@@ -237,6 +237,10 @@ def _write_subagent_telemetry(
     error: str | None,
     label: str,
     origin: dict[str, Any],
+    *,
+    usage: dict[str, int] | None = None,
+    spawn_id: str | None = None,
+    task_id: str | None = None,
 ) -> None:
     """Append LLM-based subagent telemetry to improvement-log.jsonl."""
     safe_tools = [str(tool) for tool in tools] if isinstance(tools, list) else []
@@ -249,6 +253,12 @@ def _write_subagent_telemetry(
         return
 
     session = origin.get("channel", "unknown")
+    safe_usage = usage or {}
+    prompt_tokens = int(safe_usage.get("prompt_tokens", 0) or 0)
+    completion_tokens = int(safe_usage.get("completion_tokens", 0) or 0)
+    total_tokens = int(safe_usage.get("total_tokens", prompt_tokens + completion_tokens) or 0)
+    if total_tokens <= 0:
+        total_tokens = prompt_tokens + completion_tokens
     entry = {
         "ts": datetime.now(UTC).isoformat(),
         "session": session,
@@ -257,10 +267,12 @@ def _write_subagent_telemetry(
         "model": model,
         "label": label,
         "request_id": None,
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0},
-        "total_tokens": 0,
-        "prompt_tokens": 0,
-        "completion_tokens": 0,
+        "spawn_id": spawn_id,
+        "task_id": task_id,
+        "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens},
+        "total_tokens": total_tokens,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
         "duration_ms": duration_ms,
         "stop_reason": stop_reason,
         "error": error,
@@ -606,7 +618,14 @@ class SubagentManager:
 
         started_at = datetime.now(UTC).isoformat()
 
-        result = await execute_acpx(acpx_agent, task, self.workspace, timeout_s=hard_cap)
+        result = await execute_acpx(
+            acpx_agent,
+            task,
+            self.workspace,
+            timeout_s=hard_cap,
+            spawn_id=task_id,
+            task_id=nb_task_id,
+        )
 
         finished_at = datetime.now(UTC).isoformat()
         logger.info("Subagent [{}]: CLI executor finished, success={}", task_id, result.success)
@@ -826,7 +845,14 @@ class SubagentManager:
             return None
 
         started_at = datetime.now(UTC).isoformat()
-        result = await execute_acpx(acpx_agent, task, self.workspace, timeout_s=hard_cap)
+        result = await execute_acpx(
+            acpx_agent,
+            task,
+            self.workspace,
+            timeout_s=hard_cap,
+            spawn_id=task_id,
+            task_id=nb_task_id,
+        )
 
         finished_at = datetime.now(UTC).isoformat()
         logger.info("Subagent [{}]: CLI executor '{}' finished, success={}", task_id, alias, result.success)
@@ -1329,6 +1355,9 @@ class SubagentManager:
                 result.error,
                 label,
                 origin,
+                usage=result.usage,
+                spawn_id=task_id,
+                task_id=nb_task_id,
             )
             await self._check_convergence(
                 runtime_task_id=task_id,
@@ -1525,6 +1554,8 @@ class SubagentManager:
                 msg,
                 label,
                 origin,
+                spawn_id=task_id,
+                task_id=nb_task_id,
             )
             await self._check_convergence(
                 runtime_task_id=task_id,
@@ -1577,6 +1608,8 @@ class SubagentManager:
                 str(e),
                 label,
                 origin,
+                spawn_id=task_id,
+                task_id=nb_task_id,
             )
             await self._check_convergence(
                 runtime_task_id=task_id,

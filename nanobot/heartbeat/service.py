@@ -488,7 +488,14 @@ class HeartbeatService:
             if not state_path.exists():
                 return False
             data = json.loads(state_path.read_text(encoding="utf-8"))
-            return bool(data.get("disabled", False))
+            if not isinstance(data, dict):
+                return False
+            if "disabled" in data:
+                return bool(data.get("disabled", False))
+            state = data.get("state")
+            if isinstance(state, dict):
+                return bool(state.get("disabled", False))
+            return False
         except Exception:
             return False
 
@@ -599,7 +606,12 @@ class HeartbeatService:
         return created
 
     async def _process_boredom_delegations(self) -> None:
-        """Apply completed boredom delegation outputs back into workspace state."""
+        """Apply completed boredom delegation outputs back into workspace state.
+
+        Recovery runs on every tick regardless of active delegation state,
+        so orphaned files from failed/timed-out delegations get picked up
+        promptly instead of waiting for a stale-reset window.
+        """
         try:
             (
                 _boredom_tick,
@@ -619,30 +631,35 @@ class HeartbeatService:
             return
 
         try:
+            # Always run orphan recovery first — catches files from failed delegations
+            # that never got processed because the state was stuck in BORED_DELEGATING.
+            try:
+                recovery = await asyncio.to_thread(
+                    recover_orphaned_delegations,
+                    workspace_root=self.workspace,
+                )
+                if recovery.files_unprocessed > 0:
+                    logger.info(
+                        "Boredom recovery: {} files scanned, {} unprocessed, {} candidates, {} tasks created, exhausted={}",
+                        recovery.files_scanned,
+                        recovery.files_unprocessed,
+                        recovery.candidates_after_filter,
+                        recovery.tasks_created,
+                        recovery.exhausted,
+                    )
+            except Exception as recovery_exc:
+                logger.debug("Boredom orphaned recovery failed: {}", recovery_exc)
+
+            # Then handle the active delegation (if any) to apply its result.
             orchestrator = BoredomOrchestrator(
                 store=BoredomStore(self._boredom_state_path(self.workspace))
             )
             state = await asyncio.to_thread(orchestrator.get_state)
             initiative = state.active_initiative
+
             if state.mode != BoredomMode.BORED_DELEGATING or initiative is None:
-                # No active delegation in-flight — recover any orphaned files.
-                try:
-                    recovery = await asyncio.to_thread(
-                        recover_orphaned_delegations,
-                        workspace_root=self.workspace,
-                    )
-                    if recovery.files_unprocessed > 0:
-                        logger.info(
-                            "Boredom recovery: {} files scanned, {} unprocessed, {} candidates, {} tasks created, exhausted={}",
-                            recovery.files_scanned,
-                            recovery.files_unprocessed,
-                            recovery.candidates_after_filter,
-                            recovery.tasks_created,
-                            recovery.exhausted,
-                        )
-                except Exception as recovery_exc:
-                    logger.debug("Boredom orphaned recovery failed: {}", recovery_exc)
                 return
+
             if not initiative.task_id:
                 return
 

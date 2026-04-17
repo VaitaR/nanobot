@@ -94,7 +94,14 @@ class DelegatedResult:
     stdout: str = ""  # Raw stdout (for fallback/debugging)
     stderr: str = ""  # Raw stderr (for fallback/debugging)
     error_type: str = ""  # config | timeout | exit_nonzero | exception
+    usage: dict[str, int] = None  # Token usage when provided by ACPX/underlying CLI
+    spawn_id: str | None = None  # Runtime subagent id, when invoked from spawn()
+    task_id: str | None = None  # Linked nanobot task id, when available
     _has_valid_json: bool = False  # Internal: whether valid JSON-RPC was found
+
+    def __post_init__(self) -> None:
+        if self.usage is None:
+            object.__setattr__(self, "usage", {})
 
     @property
     def summary(self) -> str:
@@ -243,6 +250,22 @@ def _detect_acpx_error_type(
     return ""
 
 
+def _normalize_usage(raw: Any) -> dict[str, int]:
+    """Normalize token usage payloads from ACPX/CLI events."""
+    if not isinstance(raw, dict):
+        return {}
+    prompt_tokens = int(raw.get("prompt_tokens", raw.get("input_tokens", 0)) or 0)
+    completion_tokens = int(raw.get("completion_tokens", raw.get("output_tokens", 0)) or 0)
+    total_tokens = int(raw.get("total_tokens", prompt_tokens + completion_tokens) or 0)
+    if total_tokens <= 0:
+        total_tokens = prompt_tokens + completion_tokens
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
 def _parse_acpx_json_output(stdout: str, stderr: str, duration: float) -> DelegatedResult:
     """Parse ACPX JSON-RPC output and extract structured data.
 
@@ -255,9 +278,10 @@ def _parse_acpx_json_output(stdout: str, stderr: str, duration: float) -> Delega
         DelegatedResult with parsed tool_calls, final_message, and error info.
     """
     final_message = ""
-    tool_calls: list[ToolCall] = []
+    tool_calls: dict[str, ToolCall] = {}
     error: str | None = None
     stop_reason = ""
+    usage: dict[str, int] = {}
     has_valid_json = False  # Track if we found any valid JSON-RPC messages
 
     try:
@@ -312,6 +336,9 @@ def _parse_acpx_json_output(stdout: str, stderr: str, duration: float) -> Delega
                     result = msg["result"]
                     if isinstance(result, dict):
                         stop_reason = result.get("stopReason", "")
+                        result_usage = _normalize_usage(result.get("usage"))
+                        if result_usage.get("total_tokens", 0) > 0:
+                            usage = result_usage
 
                 # Extract agent message chunks (build final message)
                 if msg.get("method") == "session/update":
@@ -319,9 +346,58 @@ def _parse_acpx_json_output(stdout: str, stderr: str, duration: float) -> Delega
                     if isinstance(params, dict):
                         update = params.get("update", {})
                         if isinstance(update, dict):
+                            update_usage = _normalize_usage(update.get("usage"))
+                            if update_usage.get("total_tokens", 0) > 0:
+                                usage = update_usage
                             content = update.get("content", {})
                             if isinstance(content, dict) and content.get("type") == "text":
                                 final_message += content.get("text", "")
+                            if content.get("type") == "tool_call":
+                                call_id = str(content.get("id") or content.get("toolCallId") or "")
+                                name = str(content.get("name") or content.get("toolName") or "")
+                                arguments = content.get("arguments") or {}
+                                if isinstance(arguments, str):
+                                    try:
+                                        arguments = json.loads(arguments)
+                                    except json.JSONDecodeError:
+                                        arguments = {"raw": arguments}
+                                status = str(content.get("status") or "running").lower()
+                                if status == "in_progress":
+                                    status = "running"
+                                if call_id or name:
+                                    tool_calls[call_id or name] = ToolCall(
+                                        name=name or call_id,
+                                        arguments=arguments if isinstance(arguments, dict) else {},
+                                        status=status,
+                                    )
+                            elif content.get("type") in {"tool_result", "tool_call_result"}:
+                                call_id = str(content.get("toolCallId") or content.get("id") or "")
+                                prior = tool_calls.get(call_id)
+                                raw_status = str(content.get("status") or "").lower()
+                                is_error = bool(content.get("isError") or content.get("error"))
+                                if raw_status in {"completed", "failed", "error"}:
+                                    status = raw_status
+                                else:
+                                    status = "error" if is_error else "completed"
+                                result_text = content.get("result") or content.get("text") or content.get("output")
+                                duration_ms = content.get("durationMs")
+                                if prior is not None:
+                                    tool_calls[call_id] = ToolCall(
+                                        name=prior.name,
+                                        arguments=prior.arguments,
+                                        status=status,
+                                        result=str(result_text) if result_text is not None else None,
+                                        duration_ms=int(duration_ms) if duration_ms is not None else prior.duration_ms,
+                                    )
+                                elif call_id:
+                                    fallback_name = str(content.get("name") or content.get("toolName") or call_id)
+                                    tool_calls[call_id] = ToolCall(
+                                        name=fallback_name,
+                                        arguments={},
+                                        status=status,
+                                        result=str(result_text) if result_text is not None else None,
+                                        duration_ms=int(duration_ms) if duration_ms is not None else None,
+                                    )
 
     except Exception as e:
         logger.warning("acpx.json_parse_failed", error=str(e))
@@ -341,12 +417,13 @@ def _parse_acpx_json_output(stdout: str, stderr: str, duration: float) -> Delega
     return DelegatedResult(
         success=success,
         final_message=final_message,
-        tool_calls=tuple(tool_calls),
+        tool_calls=tuple(tool_calls.values()),
         total_duration=duration,
         error=error,
         stdout=stdout,
         stderr=stderr,
         error_type="",  # Will be set by execute_acpx
+        usage=usage,
         _has_valid_json=has_valid_json,  # Internal flag for fallback detection
     )
 
@@ -357,6 +434,8 @@ async def execute_acpx(
     workspace: Path,
     *,
     timeout_s: int = _DEFAULT_TIMEOUT_S,
+    spawn_id: str | None = None,
+    task_id: str | None = None,
 ) -> DelegatedResult:
     """Execute a task via ACPX subprocess with structured JSON output.
 
@@ -382,6 +461,21 @@ async def execute_acpx(
     are visible in the dashboard.
     """
     result = await _execute_acpx_impl(agent, prompt, workspace, timeout_s=timeout_s)
+    result = DelegatedResult(
+        success=result.success,
+        final_message=result.final_message,
+        tool_calls=result.tool_calls,
+        total_duration=result.total_duration,
+        error=result.error,
+        exit_code=result.exit_code,
+        stdout=result.stdout,
+        stderr=result.stderr,
+        error_type=result.error_type,
+        usage=result.usage,
+        spawn_id=spawn_id,
+        task_id=task_id,
+        _has_valid_json=result._has_valid_json,
+    )
     _write_acpx_telemetry(workspace, agent, result)
     return result
 
@@ -615,6 +709,8 @@ def _write_acpx_telemetry(
     duration_ms = int(result.total_duration * 1000) if result.total_duration else 0
     stop_reason = "completed" if result.success else "error"
     tools = [tc.name for tc in result.tool_calls] if result.tool_calls else []
+    tool_statuses = {tc.name: tc.status for tc in result.tool_calls} if result.tool_calls else {}
+    usage = _normalize_usage(result.usage)
 
     entry = {
         "ts": datetime.now(UTC).isoformat(),
@@ -623,15 +719,21 @@ def _write_acpx_telemetry(
         "chat_id": None,
         "model": agent,
         "request_id": None,
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0},
-        "total_tokens": 0,
-        "prompt_tokens": 0,
-        "completion_tokens": 0,
+        "spawn_id": result.spawn_id,
+        "task_id": result.task_id,
+        "usage": {
+            "prompt_tokens": usage.get("prompt_tokens", 0),
+            "completion_tokens": usage.get("completion_tokens", 0),
+        },
+        "total_tokens": usage.get("total_tokens", 0),
+        "prompt_tokens": usage.get("prompt_tokens", 0),
+        "completion_tokens": usage.get("completion_tokens", 0),
         "duration_ms": duration_ms,
         "stop_reason": stop_reason,
         "error": result.error,
         "error_category": result.error_type or None,
         "tools": tools,
+        "tool_statuses": tool_statuses,
         "skills": [],
         "files_touched": [],
     }
