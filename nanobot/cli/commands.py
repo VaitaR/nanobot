@@ -7,6 +7,7 @@ import select
 import signal
 import sys
 from contextlib import nullcontext
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -190,11 +191,81 @@ def _consume_restart_resume_payload(workspace: Path) -> dict[str, str | None] | 
         finally:
             marker.unlink(missing_ok=True)
 
+    _write_last_restart_marker(
+        workspace,
+        (
+            str(marker_payload.get("reason") or "").strip()
+            if isinstance(marker_payload, dict)
+            else None
+        ),
+    )
+
     return merge_resume_session(
         marker_payload,
         load_last_active_session(workspace),
         default_resume_prompt=DEFAULT_RESTART_RESUME_PROMPT,
     )
+
+
+def _write_last_restart_marker(workspace: Path, reason: str | None = None) -> None:
+    """Persist the most recent process start using the current time."""
+    payload = {
+        "reason": (reason or "").strip() or "process_start",
+        "timestamp": datetime.now(UTC).isoformat(),
+    }
+    (workspace / ".last-restart").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _consume_startup_restart_metadata(workspace: Path) -> dict[str, str | None]:
+    """Consume startup restart markers and refresh ``.last-restart``."""
+    startup_reason = "process_start"
+    reloading_marker = workspace / ".reloading"
+
+    if reloading_marker.exists():
+        try:
+            rdata = json.loads(reloading_marker.read_text())
+            startup_reason = str(rdata.get("reason") or "").strip() or startup_reason
+        except Exception:
+            pass
+        reloading_marker.unlink(missing_ok=True)
+
+    pending_reload = workspace / ".pending-reload"
+    if pending_reload.exists():
+        pending_reload.unlink(missing_ok=True)
+
+    tool_marker = workspace / ".restart-pending"
+    tool_reason: str | None = None
+    tool_channel: str | None = None
+    tool_chat_id: str | None = None
+    tool_message_thread_id: str | None = None
+    tool_resume_prompt: str | None = None
+    if tool_marker.exists():
+        try:
+            td = json.loads(tool_marker.read_text())
+            tool_reason = str(td.get("reason") or "").strip() or None
+            merged_resume = merge_resume_session(
+                td,
+                load_last_active_session(workspace),
+                default_resume_prompt=DEFAULT_RESTART_RESUME_PROMPT,
+            )
+            if merged_resume is not None:
+                tool_channel = merged_resume["channel"]
+                tool_chat_id = merged_resume["chat_id"]
+                tool_message_thread_id = merged_resume["message_thread_id"]
+                tool_resume_prompt = merged_resume["resume_prompt"]
+        except Exception:
+            pass
+        finally:
+            tool_marker.unlink(missing_ok=True)
+
+    _write_last_restart_marker(workspace, tool_reason or startup_reason)
+    return {
+        "tool_reason": tool_reason,
+        "tool_channel": tool_channel,
+        "tool_chat_id": tool_chat_id,
+        "tool_message_thread_id": tool_message_thread_id,
+        "tool_resume_prompt": tool_resume_prompt,
+    }
 
 
 def _record_cli_last_active_session(workspace: Path, channel: str, chat_id: str) -> None:
@@ -1027,11 +1098,16 @@ def gateway(
             if tasks:
                 loguru.logger.info(
                     "is_user_active DIAG: returning True for session={}, tasks={} (pruned {} stale)",
-                    key, len(tasks), pruned,
+                    key,
+                    len(tasks),
+                    pruned,
                 )
                 return True
 
-        loguru.logger.info("is_user_active DIAG: returning False, all sessions idle (pruned {} stale total)", pruned)
+        loguru.logger.info(
+            "is_user_active DIAG: returning False, all sessions idle (pruned {} stale total)",
+            pruned,
+        )
         return False
 
     heartbeat.is_user_active = is_user_active
@@ -1068,8 +1144,6 @@ def gateway(
                 async def _send_startup_ping() -> None:
                     try:
                         await asyncio.sleep(8)  # Let channels connect first
-                        from datetime import UTC, datetime
-
                         from nanobot import __version__
                         from nanobot.bus.events import InboundMessage, OutboundMessage
 
@@ -1135,66 +1209,13 @@ def gateway(
                                 resumed_task_ids,
                             )
 
-                        # Clean up reload markers from previous cycle.
-                        reloading_marker = config.workspace_path / ".reloading"
-
-                        if reloading_marker.exists():
-                            try:
-                                rdata = json.loads(reloading_marker.read_text())
-                                logger.info(
-                                    "Gateway recovered from reload: %s",
-                                    rdata.get("reason", "unknown"),
-                                )
-                            except Exception:
-                                pass
-                            reloading_marker.unlink(missing_ok=True)
-                        pending_reload = config.workspace_path / ".pending-reload"
-                        if pending_reload.exists():
-                            pending_reload.unlink(missing_ok=True)
-
-                        # If restart_gateway tool was used, show reason in startup ping.
-                        tool_marker = config.workspace_path / ".restart-pending"
-                        last_restart_marker = config.workspace_path / ".last-restart"
-                        tool_reason: str | None = None
-                        tool_channel: str | None = None
-                        tool_chat_id: str | None = None
-                        tool_message_thread_id: str | None = None
-                        tool_resume_prompt: str | None = None
-                        if tool_marker.exists():
-                            try:
-                                td = json.loads(tool_marker.read_text())
-                                tool_reason = td.get("reason", "")
-                                merged_resume = merge_resume_session(
-                                    td,
-                                    load_last_active_session(config.workspace_path),
-                                    default_resume_prompt=DEFAULT_RESTART_RESUME_PROMPT,
-                                )
-                                if merged_resume is not None:
-                                    tool_channel = merged_resume["channel"]
-                                    tool_chat_id = merged_resume["chat_id"]
-                                    tool_message_thread_id = merged_resume["message_thread_id"]
-                                    tool_resume_prompt = merged_resume["resume_prompt"]
-                                last_restart_marker.write_text(
-                                    json.dumps(
-                                        {
-                                            "reason": tool_reason or "tool",
-                                            "timestamp": datetime.now(UTC).isoformat(),
-                                        }
-                                    )
-                                )
-                                tool_marker.unlink()
-                            except Exception:
-                                pass
-                        else:
-                            # Always record last restart time, even for manual/launchd restarts.
-                            last_restart_marker.write_text(
-                                json.dumps(
-                                    {
-                                        "reason": "manual",
-                                        "timestamp": datetime.now(UTC).isoformat(),
-                                    }
-                                )
-                            )
+                        # Clean up restart markers from previous cycle and refresh .last-restart.
+                        restart_metadata = _consume_startup_restart_metadata(config.workspace_path)
+                        tool_reason = restart_metadata["tool_reason"]
+                        tool_channel = restart_metadata["tool_channel"]
+                        tool_chat_id = restart_metadata["tool_chat_id"]
+                        tool_message_thread_id = restart_metadata["tool_message_thread_id"]
+                        tool_resume_prompt = restart_metadata["tool_resume_prompt"]
 
                         channel, chat_id = _pick_heartbeat_target()
                         ping_channel = tool_channel or channel

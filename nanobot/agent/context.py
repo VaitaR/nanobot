@@ -124,7 +124,9 @@ class ContextBuilder:
 
         # Truncate memory if still over budget (identity is never touched)
         if total_chars // _CHARS_PER_TOKEN > budget:
-            mem_idx = next((i for i, (part_label, _) in enumerate(result) if part_label == "memory"), None)
+            mem_idx = next(
+                (i for i, (part_label, _) in enumerate(result) if part_label == "memory"), None
+            )
             if mem_idx is not None:
                 remaining = budget * _CHARS_PER_TOKEN
                 remaining -= sum(
@@ -132,7 +134,7 @@ class ContextBuilder:
                 )
                 remaining -= _SEPARATOR.__len__() * max(0, len(result) - 1)
                 # TODO: smart memory truncation (LLM summarization) instead of raw character cutoff
-                result[mem_idx] = ("memory", result[mem_idx][1][:max(0, remaining)])
+                result[mem_idx] = ("memory", result[mem_idx][1][: max(0, remaining)])
                 logger.warning("System prompt budget: truncated memory section")
 
         return result
@@ -195,6 +197,7 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         if self._skill_router is None:
             try:
                 from nanobot_workspace.proactive.skill_router import SkillRouter  # noqa: WPS433
+
                 self._skill_router = SkillRouter(
                     skills_base_path=self.workspace / "skills",
                     description_loader=self.skills._get_skill_description,
@@ -242,11 +245,13 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
                 except Exception:
                     pass
         if session_stats:
-            lines.extend([
-                "Session Stats:",
-                f"session_message_count: {session_stats['session_message_count']}",
-                f"session_age_minutes: {session_stats['session_age_minutes']}",
-            ])
+            lines.extend(
+                [
+                    "Session Stats:",
+                    f"session_message_count: {session_stats['session_message_count']}",
+                    f"session_age_minutes: {session_stats['session_age_minutes']}",
+                ]
+            )
             estimated_token_count = session_stats.get("estimated_token_count")
             if estimated_token_count is not None:
                 lines.append(f"estimated_token_count: {estimated_token_count}")
@@ -437,36 +442,46 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
             if not mime or not mime.startswith("image/"):
                 continue
             b64 = base64.b64encode(raw).decode()
-            images.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:{mime};base64,{b64}"},
-                "_meta": {"path": str(p)},
-            })
+            images.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{b64}"},
+                    "_meta": {"path": str(p)},
+                }
+            )
 
         if not images:
             return text
         return images + [{"type": "text", "text": text}]
 
     def add_tool_result(
-        self, messages: list[dict[str, Any]],
-        tool_call_id: str, tool_name: str, result: Any,
+        self,
+        messages: list[dict[str, Any]],
+        tool_call_id: str,
+        tool_name: str,
+        result: Any,
     ) -> list[dict[str, Any]]:
         """Add a tool result to the message list."""
-        messages.append({"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": result})
+        messages.append(
+            {"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": result}
+        )
         return messages
 
     def add_assistant_message(
-        self, messages: list[dict[str, Any]],
+        self,
+        messages: list[dict[str, Any]],
         content: str | None,
         tool_calls: list[dict[str, Any]] | None = None,
         reasoning_content: str | None = None,
         thinking_blocks: list[dict] | None = None,
     ) -> list[dict[str, Any]]:
         """Add an assistant message to the message list."""
-        messages.append(build_assistant_message(
-            content,
-            tool_calls=tool_calls,
-            reasoning_content=reasoning_content,
-            thinking_blocks=thinking_blocks,
-        ))
+        messages.append(
+            build_assistant_message(
+                content,
+                tool_calls=tool_calls,
+                reasoning_content=reasoning_content,
+                thinking_blocks=thinking_blocks,
+            )
+        )
         return messages

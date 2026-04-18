@@ -77,6 +77,30 @@ async def test_restart_tool_defers_when_subagents_running(workspace: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_restart_tool_logs_pending_reload_write_failure(workspace: Path) -> None:
+    """Deferred restart logs .pending-reload write failures and still writes .restart-pending."""
+    mock_manager = MagicMock()
+    mock_manager.get_running_count.return_value = 1
+    tool = RestartGatewayTool(workspace=workspace, subagent_manager=mock_manager)
+
+    original_write_text = Path.write_text
+
+    def fail_pending_reload(self: Path, data: str, *args, **kwargs) -> int:
+        if self.name == ".pending-reload":
+            raise OSError("disk full")
+        return original_write_text(self, data, *args, **kwargs)
+
+    with patch("pathlib.Path.write_text", autospec=True, side_effect=fail_pending_reload):
+        with patch("nanobot.agent.tools.restart.logger.exception") as mock_log:
+            result = await tool.execute(reason="deferred write failure")
+
+    assert "отложен" in result
+    assert not (workspace / ".pending-reload").exists()
+    assert (workspace / ".restart-pending").exists()
+    mock_log.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_restart_tool_proceeds_when_no_subagents(workspace: Path) -> None:
     """No active subagents → restart proceeds normally via os.execv."""
     mock_manager = MagicMock()

@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import resource
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -354,7 +355,7 @@ def _parse_acpx_json_output(stdout: str, stderr: str, duration: float) -> Delega
                             content = update.get("content", {})
                             if isinstance(content, dict) and content.get("type") == "text":
                                 final_message += content.get("text", "")
-                            if content.get("type") == "tool_call":
+                            elif isinstance(content, dict) and content.get("type") == "tool_call":
                                 call_id = str(content.get("id") or content.get("toolCallId") or "")
                                 name = str(content.get("name") or content.get("toolName") or "")
                                 arguments = content.get("arguments") or {}
@@ -372,7 +373,7 @@ def _parse_acpx_json_output(stdout: str, stderr: str, duration: float) -> Delega
                                         arguments=arguments if isinstance(arguments, dict) else {},
                                         status=status,
                                     )
-                            elif content.get("type") in {"tool_result", "tool_call_result"}:
+                            elif isinstance(content, dict) and content.get("type") in {"tool_result", "tool_call_result"}:
                                 call_id = str(content.get("toolCallId") or content.get("id") or "")
                                 prior = tool_calls.get(call_id)
                                 raw_status = str(content.get("status") or "").lower()
@@ -569,6 +570,11 @@ async def _execute_acpx_impl(
     logger.info("acpx.start", agent=agent)
     start_time = time.time()
 
+    def _limit_child_memory() -> None:
+        """Cap child process virtual memory to prevent OOM on host (ADR-015)."""
+        limit = 3_584 * 1024 * 1024  # 3.5 GB
+        resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+
     try:
         env = {**os.environ, "ACPX_CWD": str(runtime_cwd)} if agent == "claude" else None
         process = await asyncio.create_subprocess_exec(
@@ -577,6 +583,7 @@ async def _execute_acpx_impl(
             stderr=asyncio.subprocess.PIPE,
             cwd=str(runtime_cwd),
             env=env,
+            preexec_fn=_limit_child_memory,
         )
 
         try:

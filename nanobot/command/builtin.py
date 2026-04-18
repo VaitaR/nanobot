@@ -79,6 +79,7 @@ async def cmd_restart(ctx: CommandContext):
                 marker.write_text(
                     json.dumps(
                         {
+                            "reason": "slash_command_restart",
                             "channel": msg.channel,
                             "chat_id": msg.chat_id,
                             "message_thread_id": (msg.metadata or {}).get("message_thread_id"),
@@ -107,6 +108,7 @@ async def cmd_status(ctx: CommandContext):
         ctx_est = loop._last_usage.get("prompt_tokens", 0)
 
     usage_snapshot: str | None = None
+    executor_results: list[dict] | None = None
     try:
         from nanobot_workspace.observability.usage_tracker import (
             format_snapshot,
@@ -116,6 +118,7 @@ async def cmd_status(ctx: CommandContext):
         results = await asyncio.to_thread(load_latest_snapshot)
         if results:
             usage_snapshot = format_snapshot(results)
+            executor_results = results
     except Exception:
         pass
 
@@ -124,13 +127,16 @@ async def cmd_status(ctx: CommandContext):
     if workspace:
         try:
             from nanobot_workspace.observability import build_current_state
+
             await asyncio.to_thread(build_current_state, workspace)
         except Exception:
             pass
 
     content = build_status_content(
-        version=__version__, model=loop.model,
-        start_time=loop._start_time, last_usage=loop._last_usage,
+        version=__version__,
+        model=loop.model,
+        start_time=loop._start_time,
+        last_usage=loop._last_usage,
         context_window_tokens=loop.context_window_tokens,
         session_msg_count=len(session.get_history(max_messages=0)),
         context_tokens_estimate=ctx_est,
@@ -141,21 +147,32 @@ async def cmd_status(ctx: CommandContext):
         content = f"{content}\n{health_summary}"
 
     # Executor health
-    workspace = getattr(loop, "workspace", None)
-    if workspace:
-        try:
-            from nanobot.agent.execution import get_executor_status
-            ex_status = get_executor_status(workspace)
-            if ex_status:
-                icons = {"ok": "✅", "unauthorized": "❌", "rate_limited": "⏳", "error": "⚠️"}
-                labels = {"ok": "", "unauthorized": "auth", "rate_limited": "quota", "error": ""}
-                parts = [
-                    f"{icons.get(v, '❓')} {k}" + (f" ({labels[v]})" if labels.get(v) else "")
-                    for k, v in ex_status.items()
-                ]
-                content = f"{content}\n🤖 Executors: {' | '.join(parts)}"
-        except Exception:
-            pass
+    if executor_results:
+        icons = {
+            "ok": "✅",
+            "unauthorized": "❌",
+            "rate_limited": "⏳",
+            "error": "⚠️",
+            "unavailable": "⚠️",
+        }
+        labels = {
+            "ok": "",
+            "unauthorized": "auth",
+            "rate_limited": "quota",
+            "error": "",
+            "unavailable": "",
+        }
+        parts = []
+        for r in executor_results:
+            provider = r.get("provider", "")
+            if provider not in ("codex", "claude"):
+                continue
+            status = r.get("status", "")
+            icon = icons.get(status, "❓")
+            label = labels.get(status, "")
+            parts.append(f"{icon} {provider}" + (f" ({label})" if label else ""))
+        if parts:
+            content = f"{content}\n🤖 Executors: {' | '.join(parts)}"
 
     return ctx.outbound(content, render_as="text")
 
@@ -164,7 +181,7 @@ async def cmd_new(ctx: CommandContext):
     """Start a fresh session."""
     loop = ctx.loop
     session = ctx.session or loop.sessions.get_or_create(ctx.key)
-    snapshot = session.messages[session.last_consolidated:]
+    snapshot = session.messages[session.last_consolidated :]
     session.clear()
     loop.sessions.save(session)
     loop.sessions.invalidate(session.key)
@@ -191,8 +208,11 @@ async def cmd_help(ctx: CommandContext):
 async def cmd_tasks(ctx: CommandContext):
     """List workspace tasks, optionally filtered by status."""
     status_map = {
-        "open": "📋", "in_progress": "🔄",
-        "blocked": "🚫", "review": "👁️", "done": "✅",
+        "open": "📋",
+        "in_progress": "🔄",
+        "blocked": "🚫",
+        "review": "👁️",
+        "done": "✅",
     }
     arg = ctx.args.strip().lower()
     if arg in ("open", "in_progress", "blocked", "review", "done"):
@@ -204,6 +224,7 @@ async def cmd_tasks(ctx: CommandContext):
 
     try:
         from nanobot_workspace.tasks import TaskStore
+
         tasks = TaskStore().list_tasks(status_filter)
     except Exception as exc:
         return ctx.outbound(f"Error loading tasks: {exc}")

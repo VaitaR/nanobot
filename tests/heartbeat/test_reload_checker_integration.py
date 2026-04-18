@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
+from nanobot.agent.reload import ReloadChecker
 from nanobot.heartbeat.service import HeartbeatService
 from nanobot.providers.base import LLMProvider, LLMResponse
 
@@ -133,6 +135,61 @@ async def test_reload_checker_true_skips_rest_of_tick(tmp_path, monkeypatch) -> 
 
     assert stale_called is False
     assert heartbeat_read is False
+
+
+@pytest.mark.asyncio
+async def test_reload_checker_uses_restart_pending_fallback_when_pending_reload_missing(
+    tmp_path,
+) -> None:
+    """Fallback marker alone should still trigger a deferred restart once safe."""
+    from datetime import UTC, datetime
+    restart_pending = tmp_path / ".restart-pending"
+    restart_pending.write_text(
+        json.dumps({"reason": "manual_restart", "timestamp": datetime.now(UTC).isoformat()}),
+        encoding="utf-8",
+    )
+
+    agent_loop = MagicMock()
+    agent_loop._active_tasks = {}
+    subagents = MagicMock()
+    subagents.get_running_count.return_value = 0
+
+    checker = ReloadChecker(tmp_path, agent_loop=agent_loop, subagent_manager=subagents)
+    executed: list[str] = []
+    checkpoint_calls: list[list[str]] = []
+    checker.execute_reload = lambda state: executed.append(state.reason)
+    checker.write_checkpoint = lambda task_ids: checkpoint_calls.append(task_ids)
+
+    result = checker.check()
+
+    assert result is True
+    assert executed == ["manual_restart"]
+    assert checkpoint_calls == [[]]
+    assert (tmp_path / ".reloading").exists()
+    assert not (tmp_path / ".pending-reload").exists()
+
+
+@pytest.mark.asyncio
+async def test_reload_checker_falls_back_to_restart_pending_when_pending_reload_invalid(
+    tmp_path,
+) -> None:
+    """Invalid .pending-reload must not block fallback to .restart-pending."""
+    (tmp_path / ".pending-reload").write_text("not-json", encoding="utf-8")
+    (tmp_path / ".restart-pending").write_text(
+        '{"reason": "manual_restart", "timestamp": "2026-04-18T12:00:00+00:00"}',
+        encoding="utf-8",
+    )
+
+    checker = ReloadChecker(tmp_path, agent_loop=MagicMock(_active_tasks={}), subagent_manager=None)
+
+    state = checker.read_pending()
+
+    assert state is not None
+    assert state.reason == "manual_restart"
+    assert state.subagent_id is None
+    assert state.task_id is None
+    assert state.files_modified == []
+    assert state.verification == {}
 
 
 @pytest.mark.asyncio

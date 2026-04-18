@@ -8,7 +8,12 @@ import pytest
 from typer.testing import CliRunner
 
 from nanobot.bus.events import OutboundMessage
-from nanobot.cli.commands import _consume_restart_resume_payload, _make_provider, app
+from nanobot.cli.commands import (
+    _consume_restart_resume_payload,
+    _consume_startup_restart_metadata,
+    _make_provider,
+    app,
+)
 from nanobot.config.schema import Config
 from nanobot.providers.openai_codex_provider import _strip_model_prefix
 from nanobot.providers.registry import find_by_name
@@ -199,6 +204,82 @@ def test_consume_restart_resume_payload_ignores_reload_checkpoint(tmp_path):
     payload = _consume_restart_resume_payload(tmp_path)
 
     assert payload is None
+    last_restart = json.loads((tmp_path / ".last-restart").read_text(encoding="utf-8"))
+    assert last_restart["reason"] == "process_start"
+
+
+def test_consume_restart_resume_payload_records_restart_reason(tmp_path):
+    (tmp_path / "restart_pending.json").write_text(
+        json.dumps(
+            {
+                "reason": "slash_command_restart",
+                "channel": "telegram",
+                "chat_id": "chat-1",
+                "message_thread_id": "7",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payload = _consume_restart_resume_payload(tmp_path)
+
+    assert payload is not None
+    last_restart = json.loads((tmp_path / ".last-restart").read_text(encoding="utf-8"))
+    assert last_restart["reason"] == "slash_command_restart"
+
+
+def test_consume_startup_restart_metadata_records_tool_restart_reason(tmp_path):
+    (tmp_path / ".restart-pending").write_text(
+        json.dumps(
+            {
+                "reason": "tool_restart",
+                "channel": "telegram",
+                "chat_id": "chat-9",
+                "message_thread_id": "77",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    metadata = _consume_startup_restart_metadata(tmp_path)
+
+    assert metadata["tool_reason"] == "tool_restart"
+    assert metadata["tool_channel"] == "telegram"
+    assert metadata["tool_chat_id"] == "chat-9"
+    assert metadata["tool_message_thread_id"] == "77"
+    assert not (tmp_path / ".restart-pending").exists()
+    last_restart = json.loads((tmp_path / ".last-restart").read_text(encoding="utf-8"))
+    assert last_restart["reason"] == "tool_restart"
+
+
+def test_consume_startup_restart_metadata_uses_reload_reason(tmp_path):
+    (tmp_path / ".reloading").write_text(
+        json.dumps({"reason": "heartbeat_reload"}),
+        encoding="utf-8",
+    )
+    (tmp_path / ".pending-reload").write_text(
+        json.dumps({"reason": "stale"}),
+        encoding="utf-8",
+    )
+
+    metadata = _consume_startup_restart_metadata(tmp_path)
+
+    assert metadata["tool_reason"] is None
+    assert not (tmp_path / ".reloading").exists()
+    assert not (tmp_path / ".pending-reload").exists()
+    last_restart = json.loads((tmp_path / ".last-restart").read_text(encoding="utf-8"))
+    assert last_restart["reason"] == "heartbeat_reload"
+
+
+def test_consume_startup_restart_metadata_defaults_to_process_start_on_corrupt_tool_marker(tmp_path):
+    (tmp_path / ".restart-pending").write_text("{not json", encoding="utf-8")
+
+    metadata = _consume_startup_restart_metadata(tmp_path)
+
+    assert metadata["tool_reason"] is None
+    assert not (tmp_path / ".restart-pending").exists()
+    last_restart = json.loads((tmp_path / ".last-restart").read_text(encoding="utf-8"))
+    assert last_restart["reason"] == "process_start"
 
 
 def test_config_matches_github_copilot_codex_with_hyphen_prefix():

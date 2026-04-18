@@ -50,27 +50,41 @@ class ReloadChecker:
         self._agent = agent_loop
         self._subagents = subagent_manager
         self.pending_reload = workspace / ".pending-reload"
+        self.restart_pending = workspace / ".restart-pending"
         self.reloading = workspace / ".reloading"
         self.checkpoint = workspace / ".reload-checkpoint.json"
 
     # ── Public API ────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _state_from_payload(data: dict, default_reason: str = "deferred_restart") -> ReloadState:
+        """Build ReloadState from a marker payload, filling missing reload-only fields."""
+        return ReloadState(
+            reason=data.get("reason", default_reason),
+            subagent_id=data.get("subagent_id"),
+            task_id=data.get("task_id"),
+            files_modified=data.get("files_modified", []),
+            verification=data.get("verification", {}),
+            timestamp=data.get("timestamp", ""),
+        )
+
     def read_pending(self) -> ReloadState | None:
-        """Read .pending-reload marker. Returns None if missing or invalid JSON."""
-        if not self.pending_reload.exists():
+        """Read .pending-reload, falling back to .restart-pending if needed."""
+        if self.pending_reload.exists():
+            try:
+                data = json.loads(self.pending_reload.read_text())
+                return self._state_from_payload(data, default_reason="unknown")
+            except Exception:
+                logger.warning("reload: could not parse .pending-reload")
+
+        if not self.restart_pending.exists():
             return None
         try:
-            data = json.loads(self.pending_reload.read_text())
-            return ReloadState(
-                reason=data.get("reason", "unknown"),
-                subagent_id=data.get("subagent_id"),
-                task_id=data.get("task_id"),
-                files_modified=data.get("files_modified", []),
-                verification=data.get("verification", {}),
-                timestamp=data.get("timestamp", ""),
-            )
+            data = json.loads(self.restart_pending.read_text())
+            logger.info("reload: using .restart-pending fallback for deferred restart")
+            return self._state_from_payload(data)
         except Exception:
-            logger.warning("reload: could not parse .pending-reload")
+            logger.warning("reload: could not parse .restart-pending fallback")
             return None
 
     def is_reload_safe(self, running_tasks_count: int, active_tasks_count: int) -> bool:
@@ -85,6 +99,13 @@ class ReloadChecker:
 
     def prepare_reload(self, state: ReloadState) -> bool:
         """Rename .pending-reload → .reloading atomically. Returns False on failure."""
+        if not self.pending_reload.exists():
+            try:
+                self.reloading.write_text(json.dumps(state.__dict__), encoding="utf-8")
+                return True
+            except Exception:
+                logger.warning("reload: could not write .reloading from fallback marker")
+                return False
         try:
             os.replace(self.pending_reload, self.reloading)
             return True
@@ -207,6 +228,7 @@ def check_and_reload(running_tasks_count: int, active_tasks_count: int) -> bool:
     checker._agent = None  # type: ignore[assignment]
     checker._subagents = None
     checker.pending_reload = workspace / ".pending-reload"
+    checker.restart_pending = workspace / ".restart-pending"
     checker.reloading = workspace / ".reloading"
     checker.checkpoint = workspace / ".reload-checkpoint.json"
 

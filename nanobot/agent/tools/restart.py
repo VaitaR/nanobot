@@ -46,10 +46,13 @@ def _detect_supervisor() -> str | None:
         # Also check via launchctl
         if shutil.which("launchctl"):
             import subprocess
+
             try:
                 result = subprocess.run(
                     ["launchctl", "list"],
-                    capture_output=True, text=True, timeout=5,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
                 )
                 # If we can query launchctl, it's likely managing us
                 if result.returncode == 0 and "nanobot" in result.stdout:
@@ -185,7 +188,7 @@ class RestartGatewayTool(Tool):
             try:
                 pending_reload.write_text(json.dumps(reload_payload, indent=2))
             except Exception:
-                pass
+                logger.exception("Restart deferred: failed to write %s", pending_reload.name)
 
             pending = self._workspace / self._PENDING_FILE
             payload = {

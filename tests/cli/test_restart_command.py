@@ -88,6 +88,7 @@ class TestRestartCommand:
             await asyncio.sleep(1.5)
 
         payload = json.loads((tmp_path / "restart_pending.json").read_text())
+        assert payload["reason"] == "slash_command_restart"
         assert payload["channel"] == "telegram"
         assert payload["chat_id"] == "chat-1"
         assert payload["message_thread_id"] == "42"

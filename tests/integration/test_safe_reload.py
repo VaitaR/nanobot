@@ -39,6 +39,21 @@ def _make_marker(
     return marker
 
 
+def _make_restart_pending(
+    workspace: Path,
+    *,
+    reason: str = "test deploy",
+    timestamp: str | None = None,
+    **extra,
+) -> Path:
+    """Write .restart-pending marker without a matching .pending-reload."""
+    ts = timestamp or datetime.now(UTC).isoformat()
+    data = {"reason": reason, "timestamp": ts, **extra}
+    marker = workspace / ".restart-pending"
+    marker.write_text(json.dumps(data), encoding="utf-8")
+    return marker
+
+
 def _make_checker(
     workspace: Path,
     *,
@@ -411,6 +426,20 @@ class TestNormalFlow:
         checker = _make_checker(tmp_path)
         assert checker.read_pending() is None
 
+    def test_read_pending_falls_back_to_restart_pending(self, tmp_path: Path) -> None:
+        """.restart-pending is used when .pending-reload is missing."""
+        ts = datetime.now(UTC).isoformat()
+        _make_restart_pending(tmp_path, reason="restart fallback", timestamp=ts)
+        checker = _make_checker(tmp_path)
+
+        state = checker.read_pending()
+
+        assert state is not None
+        assert state.reason == "restart fallback"
+        assert state.timestamp == ts
+        assert state.files_modified == []
+        assert state.verification == {}
+
     def test_read_pending_returns_state_with_all_fields(self, tmp_path: Path) -> None:
         """read_pending() correctly deserialises all ReloadState fields."""
         ts = datetime.now(UTC).isoformat()
@@ -434,3 +463,23 @@ class TestNormalFlow:
         assert state.files_modified == ["a.py", "b.py"]
         assert state.verification == {"linted": True}
         assert state.timestamp == ts
+
+    def test_check_uses_restart_pending_fallback_when_pending_reload_missing(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Only .restart-pending present still triggers a deferred restart."""
+        _make_restart_pending(tmp_path, reason="fallback deploy")
+        checker = _make_checker(tmp_path, running=0, active=0)
+
+        with patch.object(checker, "execute_reload") as mock_exec:
+            result = checker.check()
+
+        assert result is True
+        mock_exec.assert_called_once()
+        state: ReloadState = mock_exec.call_args[0][0]
+        assert state.reason == "fallback deploy"
+        assert state.files_modified == []
+        assert checker.reloading.exists()
+        reloading_data = json.loads(checker.reloading.read_text(encoding="utf-8"))
+        assert reloading_data["reason"] == "fallback deploy"
