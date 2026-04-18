@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from loguru import logger
+from nanobot_workspace.observability import get_correlation_id
 
 from nanobot.agent.dynamic_slots import resolve_dynamic_slots
 from nanobot.agent.memory import MemoryStore
@@ -225,6 +226,9 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
     ) -> str:
         """Build untrusted runtime metadata block for injection before the user message."""
         lines = [f"Current Time: {current_time_str(timezone)}"]
+        correlation_id = get_correlation_id()
+        if correlation_id:
+            lines.append(f"Correlation ID: {correlation_id}")
         if channel and chat_id:
             lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
         if workspace is not None:

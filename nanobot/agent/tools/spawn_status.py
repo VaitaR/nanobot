@@ -35,5 +35,7 @@ class SpawnStatusTool(Tool):
         for task in tasks:
             session_key = task.get("session_key", "unknown")
             elapsed = task.get("elapsed_seconds", 0.0)
-            lines.append(f"  - {session_key}  elapsed={elapsed:.1f}s")
+            workspace_task_id = task.get("workspace_task_id", "")
+            suffix = f"  task={workspace_task_id}" if workspace_task_id else ""
+            lines.append(f"  - {session_key}  elapsed={elapsed:.1f}s{suffix}")
         return "\n".join(lines)

@@ -178,7 +178,7 @@ def get_executor_status(workspace: Path) -> dict[str, str]:
         if model in status:
             continue  # already have latest
         # Parse timestamp; skip stale entries older than 1 hour
-        ts_str = obj.get("checked_at") or obj.get("timestamp") or obj.get("created_at")
+        ts_str = obj.get("ts") or obj.get("checked_at") or obj.get("timestamp") or obj.get("created_at")
         if ts_str:
             try:
                 ts = datetime.fromisoformat(ts_str)
@@ -199,9 +199,7 @@ def get_executor_status(workspace: Path) -> dict[str, str]:
     return status
 
 
-def _detect_acpx_error_type(
-    stdout: str, stderr: str, returncode: int
-) -> str:
+def _detect_acpx_error_type(stdout: str, stderr: str, returncode: int) -> str:
     """Classify ACPX execution errors into semantic types for fallback routing.
 
     Returns one of: 'unauthorized', 'rate_limited', 'config', 'timeout', 'exit_nonzero', '' (success).
@@ -295,6 +293,10 @@ def _parse_acpx_json_output(stdout: str, stderr: str, duration: float) -> Delega
             except json.JSONDecodeError:
                 continue
 
+            # ACPX may emit JSON arrays or non-dict values; skip them
+            if not isinstance(msg, dict):
+                continue
+
             msg_type = msg.get("type", "")
 
             # Handle Codex CLI format: {"type": "error", "message": "..."}
@@ -379,24 +381,38 @@ def _parse_acpx_json_output(stdout: str, stderr: str, duration: float) -> Delega
                                     status = raw_status
                                 else:
                                     status = "error" if is_error else "completed"
-                                result_text = content.get("result") or content.get("text") or content.get("output")
+                                result_text = (
+                                    content.get("result")
+                                    or content.get("text")
+                                    or content.get("output")
+                                )
                                 duration_ms = content.get("durationMs")
                                 if prior is not None:
                                     tool_calls[call_id] = ToolCall(
                                         name=prior.name,
                                         arguments=prior.arguments,
                                         status=status,
-                                        result=str(result_text) if result_text is not None else None,
-                                        duration_ms=int(duration_ms) if duration_ms is not None else prior.duration_ms,
+                                        result=str(result_text)
+                                        if result_text is not None
+                                        else None,
+                                        duration_ms=int(duration_ms)
+                                        if duration_ms is not None
+                                        else prior.duration_ms,
                                     )
                                 elif call_id:
-                                    fallback_name = str(content.get("name") or content.get("toolName") or call_id)
+                                    fallback_name = str(
+                                        content.get("name") or content.get("toolName") or call_id
+                                    )
                                     tool_calls[call_id] = ToolCall(
                                         name=fallback_name,
                                         arguments={},
                                         status=status,
-                                        result=str(result_text) if result_text is not None else None,
-                                        duration_ms=int(duration_ms) if duration_ms is not None else None,
+                                        result=str(result_text)
+                                        if result_text is not None
+                                        else None,
+                                        duration_ms=int(duration_ms)
+                                        if duration_ms is not None
+                                        else None,
                                     )
 
     except Exception as e:
@@ -488,10 +504,24 @@ async def _execute_acpx_impl(
     timeout_s: int = _DEFAULT_TIMEOUT_S,
 ) -> DelegatedResult:
     """Internal implementation — see :func:`execute_acpx` for public API."""
+    import tempfile as _tf
+
     acpx_claude_sh = workspace / "acpx_claude.sh"
 
     # Use /root as cwd so subagents can access both runtime and workspace repos.
     runtime_cwd = Path("/root")
+
+    # Write prompt to a temp file — avoids CLI arg length limits and
+    # prevents content starting with dashes from being parsed as flags.
+    with _tf.NamedTemporaryFile(
+        mode="w",
+        suffix=".txt",
+        prefix="acpx_prompt_",
+        delete=False,
+        encoding="utf-8",
+    ) as tmpf:
+        tmpf.write(prompt)
+        temp_prompt_path = tmpf.name
 
     # Build command with --format json for structured output
     if agent == "codex":
@@ -506,10 +536,15 @@ async def _execute_acpx_impl(
             "--approve-all",
             "codex",
             "exec",
-            prompt,
+            "--file",
+            temp_prompt_path,
         ]
     elif agent == "claude":
         if not acpx_claude_sh.exists():
+            try:
+                os.unlink(temp_prompt_path)
+            except OSError:
+                pass
             return DelegatedResult(
                 success=False,
                 final_message=f"acpx_claude.sh not found at {acpx_claude_sh}",
@@ -517,8 +552,12 @@ async def _execute_acpx_impl(
                 error_type="config",
                 _has_valid_json=False,
             )
-        cmd = [str(acpx_claude_sh), "--format", "json", "exec", prompt]
+        cmd = [str(acpx_claude_sh), "--format", "json", "exec", "--file", temp_prompt_path]
     else:
+        try:
+            os.unlink(temp_prompt_path)
+        except OSError:
+            pass
         return DelegatedResult(
             success=False,
             final_message=f"Unknown agent: {agent}",
@@ -641,6 +680,12 @@ async def _execute_acpx_impl(
             total_duration=duration,
             error_type="exception",
         )
+    finally:
+        if temp_prompt_path is not None:
+            try:
+                os.unlink(temp_prompt_path)
+            except OSError:
+                pass
 
 
 def _write_acpx_raw_log(
@@ -666,9 +711,9 @@ def _write_acpx_raw_log(
 
     duration_ms = int(duration * 1000)
     separator = (
-        f"\n{'='*60}\n"
+        f"\n{'=' * 60}\n"
         f"[{datetime.now(UTC).isoformat()}] agent={agent} duration={duration_ms}ms\n"
-        f"{'='*60}\n"
+        f"{'=' * 60}\n"
     )
 
     try:

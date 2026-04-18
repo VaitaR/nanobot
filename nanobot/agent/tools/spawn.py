@@ -6,6 +6,8 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from nanobot_workspace.observability import get_correlation_id
+
 from nanobot.agent.task_lifecycle import extract_task_id, mark_task_delegation_success
 from nanobot.agent.tools.base import Tool
 from nanobot.bus.events import OutboundMessage
@@ -266,6 +268,7 @@ class SpawnTool(Tool):
             origin_channel=self._origin_channel,
             origin_chat_id=self._origin_chat_id,
             session_key=self._session_key,
+            metadata={"correlation_id": get_correlation_id()} if get_correlation_id() else {},
         )
         if self._message_thread_id is not None:
             spawn_kwargs["message_thread_id"] = self._message_thread_id
@@ -298,6 +301,9 @@ class SpawnTool(Tool):
             display_label = label or task[:30] + ("..." if len(task) > 30 else "")
             exec_label = executor or "auto"
             metadata: dict[str, Any] = {"_progress": True, "_subagent_spawned": True}
+            correlation_id = get_correlation_id()
+            if correlation_id:
+                metadata["correlation_id"] = correlation_id
             if self._message_thread_id is not None:
                 metadata["message_thread_id"] = self._message_thread_id
             await self._bus.publish_outbound(

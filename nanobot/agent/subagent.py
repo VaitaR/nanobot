@@ -21,6 +21,12 @@ if TYPE_CHECKING:
 from loguru import logger
 from nanobot_workspace.agent.exec_tier_gate import DEFAULT_SUBAGENT_MAX_TIER
 from nanobot_workspace.core.peak_hours import is_claude_peak, is_zai_peak
+from nanobot_workspace.observability import (
+    CostTracker,
+    bind_correlation_id,
+    get_correlation_id,
+    unbind_correlation_id,
+)
 from nanobot_workspace.tasks.concurrency import ConcurrencyGuard, FileConflictError
 
 from nanobot.agent.hook import AgentHook, AgentHookContext
@@ -136,9 +142,9 @@ class _SubagentWatchdogState:
             effective_timeout += idle_timeout * _HIGH_ITERATION_EXTENSION_FACTOR
             extension_reasons.append("high_iteration_rate")
 
-        if self.last_long_running_tool is not None and (
-            now - self.last_long_running_tool
-        ) <= max(idle_timeout + _LONG_RUNNING_EXTENSION, _LOW_ITERATION_WINDOW):
+        if self.last_long_running_tool is not None and (now - self.last_long_running_tool) <= max(
+            idle_timeout + _LONG_RUNNING_EXTENSION, _LOW_ITERATION_WINDOW
+        ):
             effective_timeout += _LONG_RUNNING_EXTENSION
             extension_reasons.append("long_running_tool")
 
@@ -337,6 +343,7 @@ class SubagentManager:
             logger.debug("Workspace convergence detector available")
         except Exception as exc:
             logger.debug("Workspace convergence detector unavailable: {}", exc)
+        self._cost_tracker = CostTracker()
 
     @staticmethod
     def _is_boredom_subagent(label: str, origin: dict[str, Any]) -> bool:
@@ -480,6 +487,7 @@ class SubagentManager:
         origin_channel: str = "cli",
         origin_chat_id: str = "direct",
         session_key: str | None = None,
+        metadata: dict[str, Any] | None = None,
         message_thread_id: str | int | None = None,
         max_iterations: int | None = None,
         hard_cap: int = _SUBAGENT_HARD_CAP,
@@ -531,10 +539,15 @@ class SubagentManager:
 
         task_id = str(uuid.uuid4())[:8]
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
+        origin_metadata = dict(metadata or {})
+        correlation_id = str(origin_metadata.get("correlation_id") or get_correlation_id() or task_id)
+        origin_metadata["correlation_id"] = correlation_id
         origin: dict[str, Any] = {
             "channel": origin_channel,
             "chat_id": origin_chat_id,
             "message_thread_id": message_thread_id,
+            "correlation_id": correlation_id,
+            "metadata": origin_metadata,
         }
 
         bg_task = asyncio.create_task(
@@ -558,6 +571,7 @@ class SubagentManager:
             "session_key": session_key,
             "origin": origin,
             "announced": False,  # idempotency guard for _announce_result
+            "workspace_task_id": extract_task_id(label),
         }
         if session_key:
             self._session_tasks.setdefault(session_key, set()).add(task_id)
@@ -629,6 +643,22 @@ class SubagentManager:
 
         finished_at = datetime.now(UTC).isoformat()
         logger.info("Subagent [{}]: CLI executor finished, success={}", task_id, result.success)
+
+        # ── Cost tracking ───────────────────────────────────────────────────
+        try:
+            usage = result.usage or {}
+            if usage.get("prompt_tokens", 0) or usage.get("completion_tokens", 0):
+                self._cost_tracker.record(
+                    tokens_in=int(usage.get("prompt_tokens", 0)),
+                    tokens_out=int(usage.get("completion_tokens", 0)),
+                    model=ex_info.model,
+                    task_id=nb_task_id or "",
+                    correlation_id=get_correlation_id(),
+                    spawn_id=task_id,
+                )
+        except Exception:
+            logger.warning("Subagent [{}]: failed to record spawn cost", task_id)
+
         await self._check_convergence(
             runtime_task_id=task_id,
             task=task,
@@ -680,7 +710,11 @@ class SubagentManager:
             try:
                 from nanobot_workspace.agent.verification import verify_delegation
 
-                outcome = verify_delegation(result, self.workspace, correlation_id=task_id)
+                outcome = verify_delegation(
+                    result,
+                    self.workspace,
+                    correlation_id=get_correlation_id() or task_id,
+                )
                 if not outcome.passed and not outcome.timed_out and not outcome.skipped:
                     verified = False
                     error_summary = (
@@ -693,10 +727,17 @@ class SubagentManager:
                 logger.exception("Subagent [{}]: verification check failed", task_id)
 
         status = "ok" if verified and result.success else "error"
-        summary = result.final_message or result.summary if hasattr(result, "summary") else result.final_message or ""
+        summary = (
+            result.final_message or result.summary
+            if hasattr(result, "summary")
+            else result.final_message or ""
+        )
         error = "" if verified and result.success else (result.error or summary)
         envelope = self._build_envelope(
-            summary, status, stop_reason="completed" if result.success else "error", error=error if not (verified and result.success) else None
+            summary,
+            status,
+            stop_reason="completed" if result.success else "error",
+            error=error if not (verified and result.success) else None,
         )
         await self._announce_result(task_id, label, task, envelope, origin)
         self._schedule_boredom_completion_callback(
@@ -704,7 +745,9 @@ class SubagentManager:
             label=label,
             origin=origin,
             succeeded=result.success and verified,
-            reason=None if result.success and verified else (result.error_type or error or "cli_executor_failed"),
+            reason=None
+            if result.success and verified
+            else (result.error_type or error or "cli_executor_failed"),
         )
 
     async def _run_cli_executor_with_fallback(
@@ -730,8 +773,14 @@ class SubagentManager:
 
         # Try primary executor first
         result = await self._try_cli_executor(
-            task_id, task, label, origin, primary_ex_info,
-            max_iterations=max_iterations, hard_cap=hard_cap, idle_timeout=idle_timeout,
+            task_id,
+            task,
+            label,
+            origin,
+            primary_ex_info,
+            max_iterations=max_iterations,
+            hard_cap=hard_cap,
+            idle_timeout=idle_timeout,
         )
         if result is None or result.success:
             return  # Primary succeeded or was handled internally
@@ -743,7 +792,9 @@ class SubagentManager:
 
         logger.warning(
             "Subagent [{}]: executor '{}' failed with '{}', trying fallback chain: {}",
-            task_id, primary_ex_info.alias, error_type,
+            task_id,
+            primary_ex_info.alias,
+            error_type,
             _EXECUTOR_FALLBACK_CHAIN,
         )
 
@@ -753,27 +804,41 @@ class SubagentManager:
             if fallback_alias == primary_ex_info.alias:
                 continue
             if fallback_alias == "claude-zai" and is_zai_peak():
-                logger.info("Subagent [{}]: fallback '{}' blocked by peak hours", task_id, fallback_alias)
+                logger.info(
+                    "Subagent [{}]: fallback '{}' blocked by peak hours", task_id, fallback_alias
+                )
                 continue
             if fallback_alias == "claude-native" and is_claude_peak():
-                logger.info("Subagent [{}]: fallback '{}' blocked by peak hours", task_id, fallback_alias)
+                logger.info(
+                    "Subagent [{}]: fallback '{}' blocked by peak hours", task_id, fallback_alias
+                )
                 continue
 
             try:
                 fallback_info = resolve_executor(fallback_alias, cfg)
             except Exception as exc:
-                logger.debug("Subagent [{}]: fallback '{}' not resolvable: {}", task_id, fallback_alias, exc)
+                logger.debug(
+                    "Subagent [{}]: fallback '{}' not resolvable: {}", task_id, fallback_alias, exc
+                )
                 continue
 
             if not fallback_info.is_cli and fallback_info.provider is not None:
                 # API-based fallback — run via AgentRunner instead
                 logger.info(
                     "Subagent [{}]: trying API-based fallback '{}' (model={})",
-                    task_id, fallback_alias, fallback_info.model,
+                    task_id,
+                    fallback_alias,
+                    fallback_info.model,
                 )
                 await self._run_api_fallback(
-                    task_id, task, label, origin, fallback_info,
-                    max_iterations=max_iterations, hard_cap=hard_cap, idle_timeout=idle_timeout,
+                    task_id,
+                    task,
+                    label,
+                    origin,
+                    fallback_info,
+                    max_iterations=max_iterations,
+                    hard_cap=hard_cap,
+                    idle_timeout=idle_timeout,
                 )
                 self._task_info[task_id]["executor"] = fallback_alias
                 return
@@ -781,11 +846,19 @@ class SubagentManager:
             if fallback_info.is_cli:
                 logger.info(
                     "Subagent [{}]: trying CLI fallback '{}' (acpx_agent={})",
-                    task_id, fallback_alias, fallback_info.acpx_agent,
+                    task_id,
+                    fallback_alias,
+                    fallback_info.acpx_agent,
                 )
                 fb_result = await self._try_cli_executor(
-                    task_id, task, label, origin, fallback_info,
-                    max_iterations=max_iterations, hard_cap=hard_cap, idle_timeout=idle_timeout,
+                    task_id,
+                    task,
+                    label,
+                    origin,
+                    fallback_info,
+                    max_iterations=max_iterations,
+                    hard_cap=hard_cap,
+                    idle_timeout=idle_timeout,
                 )
                 if fb_result is not None and fb_result.success:
                     self._task_info[task_id]["executor"] = fallback_alias
@@ -794,7 +867,9 @@ class SubagentManager:
 
         logger.error(
             "Subagent [{}]: all executors exhausted. Primary: {}, fallbacks tried from: {}",
-            task_id, primary_ex_info.alias, _EXECUTOR_FALLBACK_CHAIN,
+            task_id,
+            primary_ex_info.alias,
+            _EXECUTOR_FALLBACK_CHAIN,
         )
         # Final error envelope — all executors failed
         envelope = self._build_envelope(
@@ -805,8 +880,11 @@ class SubagentManager:
         )
         await self._announce_result(task_id, label, task, envelope, origin)
         self._schedule_boredom_completion_callback(
-            task_id=task_id, label=label, origin=origin,
-            succeeded=False, reason="all_executors_failed",
+            task_id=task_id,
+            label=label,
+            origin=origin,
+            succeeded=False,
+            reason="all_executors_failed",
         )
 
     async def _try_cli_executor(
@@ -839,8 +917,11 @@ class SubagentManager:
             )
             await self._announce_result(task_id, label, task, envelope, origin)
             self._schedule_boredom_completion_callback(
-                task_id=task_id, label=label, origin=origin,
-                succeeded=False, reason="config_error",
+                task_id=task_id,
+                label=label,
+                origin=origin,
+                succeeded=False,
+                reason="config_error",
             )
             return None
 
@@ -855,12 +936,34 @@ class SubagentManager:
         )
 
         finished_at = datetime.now(UTC).isoformat()
-        logger.info("Subagent [{}]: CLI executor '{}' finished, success={}", task_id, alias, result.success)
+        logger.info(
+            "Subagent [{}]: CLI executor '{}' finished, success={}", task_id, alias, result.success
+        )
+
+        # ── Cost tracking ───────────────────────────────────────────────────
+        try:
+            usage = result.usage or {}
+            if usage.get("prompt_tokens", 0) or usage.get("completion_tokens", 0):
+                self._cost_tracker.record(
+                    tokens_in=int(usage.get("prompt_tokens", 0)),
+                    tokens_out=int(usage.get("completion_tokens", 0)),
+                    model=ex_info.model,
+                    task_id=nb_task_id or "",
+                    correlation_id=get_correlation_id(),
+                    spawn_id=task_id,
+                )
+        except Exception:
+            logger.warning("Subagent [{}]: failed to record spawn cost", task_id)
+
         await self._check_convergence(
-            runtime_task_id=task_id, task=task, label=label, origin=origin,
+            runtime_task_id=task_id,
+            task=task,
+            label=label,
+            origin=origin,
             nb_task_id=nb_task_id,
             decision="completed" if result.success else (result.error_type or "error"),
-            completed=result.success, timed_out=result.error_type == "timeout",
+            completed=result.success,
+            timed_out=result.error_type == "timeout",
             fallback_created_at=started_at,
         )
 
@@ -881,11 +984,17 @@ class SubagentManager:
             write_delivery_record(
                 self.workspace,
                 DeliveryRecord(
-                    task_id=task_id, agent=alias, attempt=1,
-                    started_at=started_at, finished_at=finished_at,
-                    success=result.success, transient=is_transient_failure(result),
-                    exit_code=result.exit_code, error_type=result.error_type or "",
-                    summary=summary, stderr_tail=stderr_tail,
+                    task_id=task_id,
+                    agent=alias,
+                    attempt=1,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    success=result.success,
+                    transient=is_transient_failure(result),
+                    exit_code=result.exit_code,
+                    error_type=result.error_type or "",
+                    summary=summary,
+                    stderr_tail=stderr_tail,
                 ),
             )
         except Exception:
@@ -897,7 +1006,11 @@ class SubagentManager:
             try:
                 from nanobot_workspace.agent.verification import verify_delegation
 
-                outcome = verify_delegation(result, self.workspace, correlation_id=task_id)
+                outcome = verify_delegation(
+                    result,
+                    self.workspace,
+                    correlation_id=get_correlation_id() or task_id,
+                )
                 if not outcome.passed and not outcome.timed_out and not outcome.skipped:
                     verified = False
                     error_summary = (
@@ -910,18 +1023,25 @@ class SubagentManager:
                 logger.exception("Subagent [{}]: verification check failed", task_id)
 
         status = "ok" if verified and result.success else "error"
-        summary_text = result.final_message or (result.summary if hasattr(result, "summary") else "")
+        summary_text = result.final_message or (
+            result.summary if hasattr(result, "summary") else ""
+        )
         error = "" if verified and result.success else (result.error or summary_text)
         envelope = self._build_envelope(
-            summary_text, status,
+            summary_text,
+            status,
             stop_reason="completed" if result.success else "error",
             error=error if not (verified and result.success) else None,
         )
         await self._announce_result(task_id, label, task, envelope, origin)
         self._schedule_boredom_completion_callback(
-            task_id=task_id, label=label, origin=origin,
+            task_id=task_id,
+            label=label,
+            origin=origin,
             succeeded=result.success and verified,
-            reason=None if result.success and verified else (result.error_type or error or "cli_executor_failed"),
+            reason=None
+            if result.success and verified
+            else (result.error_type or error or "cli_executor_failed"),
         )
         return result
 
@@ -939,7 +1059,10 @@ class SubagentManager:
     ) -> None:
         """Run an API-based executor fallback via AgentRunner."""
         logger.info(
-            "Subagent [{}]: API fallback executor '{}', model={}", task_id, ex_info.alias, ex_info.model
+            "Subagent [{}]: API fallback executor '{}', model={}",
+            task_id,
+            ex_info.alias,
+            ex_info.model,
         )
         # Reuse the existing API-based subagent path
         nb_task_id = extract_task_id(label)
@@ -989,6 +1112,9 @@ class SubagentManager:
         executor: str | None = None,
     ) -> None:
         """Execute the subagent task and announce the result."""
+        previous_correlation_id = get_correlation_id()
+        correlation_id = str(origin.get("correlation_id") or task_id)
+        bind_correlation_id(correlation_id)
         logger.info("Subagent [{}] starting task: {}", task_id, label)
 
         try:
@@ -1020,6 +1146,11 @@ class SubagentManager:
                 succeeded=False,
                 reason=f"file_conflict: {e}",
             )
+        finally:
+            if previous_correlation_id:
+                bind_correlation_id(previous_correlation_id)
+            else:
+                unbind_correlation_id()
 
     async def _run_subagent_inner(
         self,
@@ -1209,7 +1340,9 @@ class SubagentManager:
                             )
 
                     async def after_iteration(self, context: AgentHookContext) -> None:
-                        watchdog_state.record_iteration_result(context.tool_events, time.monotonic())
+                        watchdog_state.record_iteration_result(
+                            context.tool_events, time.monotonic()
+                        )
 
                 run_hook = _SubagentHook()
 
@@ -1248,7 +1381,10 @@ class SubagentManager:
                     now = time.monotonic()
                     snapshot = watchdog_state.snapshot(now, idle_timeout)
 
-                    if snapshot.extension_reasons and snapshot.extension_reasons != last_extension_reasons:
+                    if (
+                        snapshot.extension_reasons
+                        and snapshot.extension_reasons != last_extension_reasons
+                    ):
                         logger.debug(
                             "Subagent [{}] watchdog extending timeout to {}s ({})",
                             task_id,
@@ -1708,7 +1844,9 @@ class SubagentManager:
             )
         self._force_transition(
             state_machine,
-            state_machine.current_state if state_machine.current_state == run_state.FAIL else run_state.PLAN,
+            state_machine.current_state
+            if state_machine.current_state == run_state.FAIL
+            else run_state.PLAN,
             run_state.EXECUTE,
             decision,
         )
@@ -1821,6 +1959,9 @@ class SubagentManager:
         thread_id = origin.get("message_thread_id")
         if thread_id is not None:
             metadata["message_thread_id"] = thread_id
+        correlation_id = origin.get("correlation_id")
+        if correlation_id:
+            metadata["correlation_id"] = correlation_id
         await self.bus.publish_outbound(
             OutboundMessage(
                 channel=origin.get("channel", "cli"),
@@ -1997,21 +2138,22 @@ class SubagentManager:
         # ── Idempotency guard ───────────────────────────────────────────
         info = self._task_info.get(task_id)
         if info and info.get("announced"):
-            logger.debug(
-                "Subagent [{}] skipping duplicate announce (already announced)", task_id
-            )
+            logger.debug("Subagent [{}] skipping duplicate announce (already announced)", task_id)
             return
         if info is not None:
             info["announced"] = True
 
         # Verify claimed artifacts exist on disk (detect illusion of execution)
-        envelope = verify_envelope(envelope, correlation_id=task_id)
+        envelope = verify_envelope(envelope, correlation_id=get_correlation_id() or task_id)
 
         # Build metadata — propagate message_thread_id for topic routing
         metadata: dict[str, Any] = {}
         thread_id = origin.get("message_thread_id")
         if thread_id is not None:
             metadata["message_thread_id"] = thread_id
+        correlation_id = origin.get("correlation_id")
+        if correlation_id:
+            metadata["correlation_id"] = correlation_id
 
         # Direct-publish path: short, successful results bypass the main agent
         if envelope.status == "ok" and len(envelope.summary) < 200 and envelope.error is None:
@@ -2167,6 +2309,7 @@ Repo root: /root/Projects/nanobot""")
                     "session_key": info.get("session_key"),
                     "origin": info.get("origin"),
                     "elapsed_seconds": elapsed,
+                    "workspace_task_id": info.get("workspace_task_id"),
                 }
             )
         active.sort(key=lambda item: item["elapsed_seconds"], reverse=True)

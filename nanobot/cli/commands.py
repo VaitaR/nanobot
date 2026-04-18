@@ -968,7 +968,10 @@ def gateway(
         interval_s=hb_cfg.interval_s,
         enabled=hb_cfg.enabled,
         timezone=config.agents.defaults.timezone,
+        subagent_manager=agent.subagents,
+        agent_loop=agent,
     )
+    heartbeat.set_reload_checker(reload_checker)
 
     async def spawn_boredom_delegation(task: str, label: str, executor: str) -> str:
         """Spawn a boredom delegation with the requested executor."""
@@ -994,6 +997,7 @@ def gateway(
 
     heartbeat.set_spawn_callback(spawn_boredom_delegation)
     heartbeat.set_spawn_reviewer_cb(spawn_reviewer)
+    heartbeat.set_reload_checker(reload_checker)
     heartbeat.on_tick_report = on_heartbeat_tick_report
 
     system_session_prefixes = ("cron:", "heartbeat")

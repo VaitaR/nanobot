@@ -9,7 +9,14 @@ from typing import TYPE_CHECKING, Any, Callable, Coroutine
 
 from loguru import logger
 from nanobot_workspace.core.peak_hours import is_zai_peak
+from nanobot_workspace.observability import (
+    bind_correlation_id,
+    generate_correlation_id,
+    get_correlation_id,
+    unbind_correlation_id,
+)
 
+from nanobot.agent.reload import ReloadChecker
 from nanobot.heartbeat.boredom_prompt_context import build_boredom_prompt_context
 from nanobot.heartbeat.drain import (
     HEARTBEAT_SYSTEM_PROMPT,
@@ -19,6 +26,7 @@ from nanobot.heartbeat.drain import (
 )
 
 if TYPE_CHECKING:
+    from nanobot.agent.loop import AgentLoop
     from nanobot.providers.base import LLMProvider
 
 
@@ -29,6 +37,22 @@ _ZAI_PEAK_HEARTBEAT_INSTRUCTION = (
     "\n\nZAI peak hours active — model is unstable, minimize tool calls, "
     "do not spawn claude-zai subagents"
 )
+
+
+def _bind_task_correlation(correlation_id: str | None = None) -> tuple[str, str]:
+    """Bind a correlation ID for the current task and return (active, previous)."""
+    previous = get_correlation_id()
+    active = correlation_id or previous or generate_correlation_id()
+    bind_correlation_id(active)
+    return active, previous
+
+
+def _restore_task_correlation(previous: str) -> None:
+    """Restore the previous correlation ID after task execution."""
+    if previous:
+        bind_correlation_id(previous)
+    else:
+        unbind_correlation_id()
 
 
 def _emit_heartbeat_event(event_type: str, data: dict[str, Any] | None = None) -> None:
@@ -85,6 +109,8 @@ class HeartbeatService:
         interval_s: int = 30 * 60,
         enabled: bool = True,
         timezone: str | None = None,
+        subagent_manager: Any | None = None,
+        agent_loop: AgentLoop | None = None,
     ):
         self.workspace = workspace
         self.provider = provider
@@ -97,6 +123,16 @@ class HeartbeatService:
         self.interval_s = interval_s
         self.enabled = enabled
         self.timezone = timezone
+        self.subagent_manager = subagent_manager
+        self._reload_checker = (
+            ReloadChecker(
+                workspace=workspace,
+                agent_loop=agent_loop,
+                subagent_manager=subagent_manager,
+            )
+            if agent_loop is not None
+            else None
+        )
         self._running = False
         self._task: asyncio.Task | None = None
         self._tick_count: int = 0
@@ -108,9 +144,17 @@ class HeartbeatService:
         self._spawn_reviewer_cb: Callable[[str, str, str], Coroutine[Any, Any, str]] | None = None
         self._active_review_task_ids: set[str] = set()  # tasks with reviewer currently running
 
+    def set_reload_checker(self, checker: ReloadChecker | None) -> None:
+        """Override the reload checker used at tick start.
+
+        Primarily intended for wiring from gateway startup and for tests.
+        """
+        self._reload_checker = checker
+
     @property
     def heartbeat_file(self) -> Path:
         return self.workspace / "HEARTBEAT.md"
+
 
     def _read_heartbeat_file(self) -> str | None:
         if self.heartbeat_file.exists():
@@ -403,6 +447,53 @@ class HeartbeatService:
         """Set the reviewer subagent spawn callback."""
         self._spawn_reviewer_cb = cb
 
+    def _detect_stale_in_progress(self) -> int:
+        """Recover tasks marked in_progress when no active spawn exists."""
+        try:
+            from nanobot_workspace.tasks.store import TaskStore
+
+            fixed = 0
+            store = TaskStore(self.workspace)
+            active_workspace_task_ids: set[str] = set()
+
+            if self.subagent_manager is not None:
+                for info in self.subagent_manager.get_active_tasks():
+                    workspace_task_id = info.get("workspace_task_id")
+                    if workspace_task_id:
+                        active_workspace_task_ids.add(workspace_task_id)
+
+            for task in store.list_tasks("active"):
+                if task.status != "in_progress":
+                    continue
+                if task.id in active_workspace_task_ids:
+                    continue
+
+                validation_note = (getattr(task, "validation_note", "") or "").strip()
+                if validation_note:
+                    store.update_status(task.id, "review")
+                    logger.info(
+                        "Heartbeat: stale in_progress -> review for {} (validation note present)",
+                        task.id,
+                    )
+                else:
+                    store.update_status(
+                        task.id,
+                        "open",
+                        reason="stale: no active spawn found, auto-recovered",
+                    )
+                    logger.info(
+                        "Heartbeat: stale in_progress -> open for {} (no active spawn)",
+                        task.id,
+                    )
+                fixed += 1
+
+            if fixed:
+                logger.info("Heartbeat: auto-recovered {} stale in_progress task(s)", fixed)
+            return fixed
+        except Exception:
+            logger.exception("Heartbeat: stale in_progress detection failed")
+            return 0
+
     @staticmethod
     def _serialize_boredom_result(result: Any) -> dict[str, Any]:
         data = {
@@ -450,6 +541,11 @@ class HeartbeatService:
 
     async def _spawn_boredom_delegation(self, task: str, label: str, executors: list[str]) -> str:
         """Spawn the boredom idea-generation delegation using the configured fallback chain."""
+        # NUCLEAR GUARD: Boredom engine permanently disabled until pipeline is fixed.
+        # See MEMORY.md "Boredom Engine" section. Remove only after delivery pipeline修复.
+        if self._is_boredom_disabled():
+            logger.info("boredom_delegation_blocked: engine is disabled")
+            raise RuntimeError("boredom engine is disabled")
         from nanobot.agent.subagent import PeakHoursSpawnBlockedError
 
         if self._spawn_boredom_delegation_cb is None:
@@ -626,8 +722,8 @@ class HeartbeatService:
             from nanobot_workspace.proactive.boredom.models import BoredomMode
             from nanobot_workspace.proactive.boredom.orchestrator import BoredomOrchestrator
             from nanobot_workspace.proactive.boredom.store import BoredomStore
-        except (ImportError, ModuleNotFoundError) as exc:
-            logger.debug("Boredom delegation check skipped: {}", exc)
+        except (ImportError, ModuleNotFoundError, SyntaxError) as exc:
+            logger.warning("boredom_hooks_load_failed: {} — workspace module has syntax/import error", exc)
             return
 
         try:
@@ -820,6 +916,9 @@ class HeartbeatService:
                 "action_taken": "delegated",
             },
         )
+        _, previous_correlation_id = _bind_task_correlation(
+            initiative.get("correlation_id") or initiative.get("task_id")
+        )
         try:
             await asyncio.wait_for(self.on_execute(prompt), timeout=600)
             try:
@@ -857,22 +956,35 @@ class HeartbeatService:
                     await self.on_notify(f"🧩 Boredom: delegation '{title}' failed — {e}")
                 except Exception:
                     pass
+        finally:
+            _restore_task_correlation(previous_correlation_id)
 
     async def _run_tick(self, *, force: bool = False) -> dict[str, Any]:
         from nanobot.utils.evaluator import evaluate_response
+
+        # --- Reload check: execute deferred restart if marker exists ---
+        if self._reload_checker is not None and self._reload_checker.check():
+            logger.info("Heartbeat: reload triggered, skipping tick")
+            return {
+                "action": "skip",
+                "tasks": "",
+                "result": "reload triggered",
+                "review_decisions": [],
+            }
 
         # --- Maintenance: incremental memory reindex ---
         # Reindexing is handled by nanobot-reindex.timer (systemd) as a
         # separate process — do not run it here to avoid blocking the event loop.
         self._tick_count += 1
+        self._detect_stale_in_progress()
 
         # --- Boredom engine tick (runs independently of LLM decision) ---
-        # CRITICAL: Permanently disabled via state flag - check before any boredom logic runs
-        # See: /root/.nanobot/workspace/data/boredom_state.json -> "disabled": true
+        # Recovery always runs (converts existing ideas into tasks), even when
+        # generation is disabled. Only _run_boredom_tick() is gated by disabled.
+        await self._process_boredom_delegations()
         if self._is_boredom_disabled():
-            logger.debug("Boredom engine DISABLED - skipping all boredom logic")
+            logger.debug("Boredom generation DISABLED - skipping idea generation")
         else:
-            await self._process_boredom_delegations()
             await self._run_boredom_tick()
         health_state = await asyncio.to_thread(_refresh_health_state, self.workspace)
 
@@ -901,24 +1013,34 @@ class HeartbeatService:
                 [t["id"] for t in incomplete],
             )
         if actionable:
+            correlation_id, previous_correlation_id = _bind_task_correlation()
             logger.info("Heartbeat: {} actionable tasks found, delegating...", len(actionable))
-            _emit_heartbeat_event("heartbeat.executing", {"tasks_preview": str(actionable)[:200]})
-            tasks_str = (
-                content + _health_tick_context(health_state) + self._peak_hours_instruction()
-            )
-            if self.on_execute:
-                try:
-                    response = await asyncio.wait_for(self.on_execute(tasks_str), timeout=600)
-                except asyncio.TimeoutError:
-                    logger.error("Heartbeat: on_execute timed out")
-                    response = None
-                if response:
-                    should_notify = await evaluate_response(
-                        response, tasks_str, self.provider, self.model
-                    )
-                    if should_notify and self.on_notify:
-                        await self.on_notify(response)
-            return {"action": "run", "tasks": str(actionable), "result": "", "review_decisions": []}
+            try:
+                _emit_heartbeat_event(
+                    "heartbeat.executing",
+                    {
+                        "tasks_preview": str(actionable)[:200],
+                        "correlation_id": correlation_id,
+                    },
+                )
+                tasks_str = (
+                    content + _health_tick_context(health_state) + self._peak_hours_instruction()
+                )
+                if self.on_execute:
+                    try:
+                        response = await asyncio.wait_for(self.on_execute(tasks_str), timeout=600)
+                    except asyncio.TimeoutError:
+                        logger.error("Heartbeat: on_execute timed out")
+                        response = None
+                    if response:
+                        should_notify = await evaluate_response(
+                            response, tasks_str, self.provider, self.model
+                        )
+                        if should_notify and self.on_notify:
+                            await self.on_notify(response)
+                return {"action": "run", "tasks": str(actionable), "result": "", "review_decisions": []}
+            finally:
+                _restore_task_correlation(previous_correlation_id)
 
         # --- Review gate: spawn reviewer for tasks awaiting independent verification ---
         # Done AFTER any LLM call to avoid rate-limit contention on shared executor.

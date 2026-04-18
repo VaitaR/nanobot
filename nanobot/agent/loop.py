@@ -15,6 +15,13 @@ from loguru import logger
 
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.cost_guard import CostGuard
+from nanobot_workspace.observability import (
+    CostTracker,
+    bind_correlation_id,
+    generate_correlation_id,
+    get_correlation_id,
+    unbind_correlation_id,
+)
 from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.agent.memory import MemoryConsolidator
 from nanobot.agent.runner import AgentRunner, AgentRunSpec
@@ -108,6 +115,7 @@ class AgentLoop:
         self._cost_guard: CostGuard | None = (
             CostGuard.from_config(cost_policy) if cost_policy else None
         )
+        self._cost_tracker = CostTracker()
 
         self.context = ContextBuilder(
             workspace,
@@ -574,6 +582,17 @@ class AgentLoop:
         lock = self._session_locks.setdefault(msg.session_key, asyncio.Lock())
         gate = self._concurrency_gate or nullcontext()
         async with lock, gate:
+            previous_correlation_id = get_correlation_id()
+            correlation_id = str(
+                (msg.metadata or {}).get("correlation_id")
+                or msg.request_id
+                or generate_correlation_id()
+            )
+            bind_correlation_id(correlation_id)
+            if "correlation_id" not in msg.metadata:
+                msg.metadata["correlation_id"] = correlation_id
+            if msg.request_id is None:
+                msg.request_id = correlation_id
             try:
                 on_stream = on_stream_end = None
                 if msg.metadata.get("_wants_stream"):
@@ -677,6 +696,11 @@ class AgentLoop:
                         metadata=msg.metadata or {},
                     )
                 )
+            finally:
+                if previous_correlation_id:
+                    bind_correlation_id(previous_correlation_id)
+                else:
+                    unbind_correlation_id()
 
     async def close_mcp(self) -> None:
         """Drain pending background archives, then close MCP connections."""
@@ -808,6 +832,17 @@ class AgentLoop:
                 skills=skills,
                 files_touched=files_touched,
             )
+            # --- Cost tracking ---
+            try:
+                if usage.get("prompt_tokens", 0) or usage.get("completion_tokens", 0):
+                    self._cost_tracker.record(
+                        tokens_in=int(usage.get("prompt_tokens", 0)),
+                        tokens_out=int(usage.get("completion_tokens", 0)),
+                        model=self.model,
+                        task_id=get_correlation_id() or "",
+                    )
+            except Exception:
+                logger.warning("Failed to record main agent cost (system turn)")
             # --- Workspace feedback loop: diagnose failures ---
             if run_error and self._diagnose_failure is not None:
                 try:
@@ -926,6 +961,17 @@ class AgentLoop:
             skills=skills,
             files_touched=files_touched,
         )
+        # --- Cost tracking ---
+        try:
+            if usage.get("prompt_tokens", 0) or usage.get("completion_tokens", 0):
+                self._cost_tracker.record(
+                    tokens_in=int(usage.get("prompt_tokens", 0)),
+                    tokens_out=int(usage.get("completion_tokens", 0)),
+                    model=self.model,
+                    task_id=get_correlation_id() or "",
+                )
+        except Exception:
+            logger.warning("Failed to record main agent cost")
         # --- Workspace feedback loop: diagnose failures ---
         if run_error and self._diagnose_failure is not None:
             try:
