@@ -2,6 +2,7 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+from nanobot_workspace.tasks.store import TaskStore
 
 from nanobot.heartbeat.service import HeartbeatService
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
@@ -115,6 +116,59 @@ async def test_check_actionable_tasks_finds_open_unblocked(tmp_path, monkeypatch
     assert len(incomplete) == 0
     assert actionable[0]["id"] == "t1"
     assert actionable[1]["id"] == "t3"
+
+
+def test_check_actionable_tasks_repairs_legacy_boredom_body(tmp_path) -> None:
+    task_store = TaskStore(tmp_path)
+    task = task_store.add(
+        "Legacy boredom task",
+        body=(
+            "Category: tests\n"
+            "Targets: src/foo.py, tests/test_foo.py\n"
+            "Checks: pytest tests/test_foo.py -q, uv run ruff check src/foo.py\n"
+            "Description"
+        ),
+        source="boredom",
+    )
+
+    service = HeartbeatService(workspace=tmp_path, provider=DummyProvider([]), model="test-model")
+    actionable, incomplete = service._check_actionable_tasks()
+
+    assert actionable == [{"id": task.id, "title": "Legacy boredom task"}]
+    assert incomplete == []
+
+    repaired = task_store.load(task.id)
+    assert repaired is not None
+    assert "## Files\nsrc/foo.py\ntests/test_foo.py" in repaired.body
+    assert (
+        "## Acceptance Criteria\n- [ ] pytest tests/test_foo.py -q\n- [ ] uv run ruff check src/foo.py"
+        in repaired.body
+    )
+
+
+def test_check_actionable_tasks_does_not_repair_non_boredom_body(tmp_path) -> None:
+    task_store = TaskStore(tmp_path)
+    task = task_store.add(
+        "Legacy user task",
+        body=(
+            "Category: tests\n"
+            "Targets: src/foo.py\n"
+            "Checks: pytest tests/test_foo.py -q\n"
+            "Description"
+        ),
+        source="user",
+    )
+
+    service = HeartbeatService(workspace=tmp_path, provider=DummyProvider([]), model="test-model")
+    actionable, incomplete = service._check_actionable_tasks()
+
+    assert actionable == []
+    assert incomplete == [{"id": task.id, "title": "Legacy user task"}]
+
+    untouched = task_store.load(task.id)
+    assert untouched is not None
+    assert "## Files" not in untouched.body
+    assert "## Acceptance Criteria" not in untouched.body
 
 
 @pytest.mark.asyncio
@@ -269,6 +323,57 @@ async def test_check_actionable_tasks_returns_empty_when_no_tasks(tmp_path, monk
     )
 
     assert service._check_actionable_tasks() == ([], [])
+
+
+@pytest.mark.asyncio
+async def test_check_actionable_tasks_repairs_legacy_boredom_task(tmp_path) -> None:
+    store = TaskStore(tmp_path)
+    task = store.add(
+        "Repair boredom body",
+        body=(
+            "Category: tests | "
+            "Targets: nanobot/heartbeat/service.py, tests/agent/test_heartbeat_service.py | "
+            "Checks: pytest tests/agent/test_heartbeat_service.py -q, ruff check nanobot/heartbeat/service.py | "
+            "Existing description"
+        ),
+        source="boredom",
+    )
+
+    service = HeartbeatService(workspace=tmp_path, provider=DummyProvider([]), model="test-model")
+    actionable, incomplete = service._check_actionable_tasks()
+
+    assert actionable == [{"id": task.id, "title": "Repair boredom body"}]
+    assert incomplete == []
+
+    repaired = store.load(task.id)
+    assert "## Files\nnanobot/heartbeat/service.py\ntests/agent/test_heartbeat_service.py" in repaired.body
+    assert (
+        "## Acceptance Criteria\n"
+        "- [ ] pytest tests/agent/test_heartbeat_service.py -q\n"
+        "- [ ] ruff check nanobot/heartbeat/service.py"
+    ) in repaired.body
+    assert "Targets: nanobot/heartbeat/service.py, tests/agent/test_heartbeat_service.py" in repaired.body
+    assert "Checks: pytest tests/agent/test_heartbeat_service.py -q, ruff check nanobot/heartbeat/service.py" in repaired.body
+
+
+@pytest.mark.asyncio
+async def test_check_actionable_tasks_does_not_repair_non_boredom_task(tmp_path) -> None:
+    store = TaskStore(tmp_path)
+    task = store.add(
+        "User task with legacy metadata",
+        body="Targets: foo.py | Checks: pytest -q | Existing description",
+        source="user",
+    )
+
+    service = HeartbeatService(workspace=tmp_path, provider=DummyProvider([]), model="test-model")
+    actionable, incomplete = service._check_actionable_tasks()
+
+    assert actionable == []
+    assert incomplete == [{"id": task.id, "title": "User task with legacy metadata"}]
+
+    unchanged = store.load(task.id)
+    assert "## Files" not in unchanged.body
+    assert "## Acceptance Criteria" not in unchanged.body
 
 
 @pytest.mark.asyncio

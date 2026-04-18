@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Coroutine
 
@@ -90,6 +91,44 @@ def _health_tick_context(state: dict[str, Any] | None) -> str:
         f"- l1: heartbeat={l1.get('last_heartbeat_at')} queue={l1.get('task_queue_depth')} last_error={(l1.get('last_error') or {}).get('category', 'none')}",
     ]
     return "\n\n" + "\n".join(lines)
+
+
+def _extract_boredom_metadata_items(body: str, label: str) -> list[str]:
+    """Extract comma-delimited items from legacy boredom metadata."""
+    match = re.search(rf"{label}:\s*([^\n|]+)", body, flags=re.IGNORECASE)
+    if not match:
+        return []
+    return [item.strip() for item in match.group(1).split(",") if item.strip()]
+
+
+def _repair_boredom_task_body(task_store: Any, task: Any) -> Any:
+    """Backfill formal sections onto legacy boredom tasks when metadata exists."""
+    if getattr(task, "source", "") != "boredom":
+        return task
+
+    body = task.body or ""
+    body_lower = body.lower()
+    has_files = "## files" in body_lower
+    has_acceptance = "## acceptance" in body_lower
+    if has_files and has_acceptance:
+        return task
+
+    sections: list[str] = []
+    if not has_files:
+        targets = _extract_boredom_metadata_items(body, "Targets")
+        if targets:
+            sections.append("## Files\n" + "\n".join(targets))
+    if not has_acceptance:
+        checks = _extract_boredom_metadata_items(body, "Checks")
+        if checks:
+            sections.append("## Acceptance Criteria\n" + "\n".join(f"- [ ] {check}" for check in checks))
+
+    if not sections:
+        return task
+
+    task.body = body.rstrip() + "\n\n" + "\n\n".join(sections)
+    task_store.save(task)
+    return task
 
 
 class HeartbeatService:
@@ -283,10 +322,12 @@ class HeartbeatService:
         try:
             from nanobot_workspace.tasks.store import TaskStore
 
+            task_store = TaskStore(self.workspace)
             actionable_tasks: list = []
             incomplete: list[dict[str, str]] = []
-            for t in TaskStore(self.workspace).list_tasks("active"):
+            for t in task_store.list_tasks("active"):
                 if t.status == "open" and not t.blocked_reason:
+                    t = _repair_boredom_task_body(task_store, t)
                     body_lower = t.body.lower() if t.body else ""
                     has_files = "## files" in body_lower
                     has_acceptance = "## acceptance" in body_lower
@@ -586,8 +627,10 @@ class HeartbeatService:
             data = json.loads(state_path.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 return False
-            if "disabled" in data:
-                return bool(data.get("disabled", False))
+            # State is nested under "state" key
+            state_data = data.get("state", {})
+            if isinstance(state_data, dict) and "disabled" in state_data:
+                return bool(state_data.get("disabled", False))
             state = data.get("state")
             if isinstance(state, dict):
                 return bool(state.get("disabled", False))

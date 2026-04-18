@@ -22,7 +22,9 @@ def build_boredom_prompt_context(workspace: Path, *, now: datetime | None = None
     try:
         if state_path.exists():
             data = json.loads(state_path.read_text(encoding="utf-8"))
-            if data.get("disabled", False):
+            # State is nested under "state" key
+            state_data = data.get("state", {})
+            if isinstance(state_data, dict) and state_data.get("disabled", False):
                 return ""
     except Exception:
         pass
